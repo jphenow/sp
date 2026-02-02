@@ -24,8 +24,8 @@ A command-line tool for managing Fly.io sprites with GitHub repositories. Automa
 
 ```bash
 # Clone this repository
-git clone <repo-url>
-cd sprite-repo
+git clone https://github.com/jphenow/sp.git
+cd sp
 
 # Make executable
 chmod +x sp

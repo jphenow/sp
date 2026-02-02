@@ -324,18 +324,18 @@ sync_local_dir() {
 
     info "Syncing local directory to sprite..."
 
-    # Create a temporary tar file excluding git objects, node_modules, etc.
+    # Create a temporary tar file excluding git, node_modules, etc.
+    # COPYFILE_DISABLE prevents macOS from creating ._* resource fork files
     local temp_tar="/tmp/sprite-sync-$$.tar.gz"
-    tar -czf "$temp_tar" \
+    COPYFILE_DISABLE=1 tar -czf "$temp_tar" \
         --no-xattrs \
-        --exclude='.git/objects' \
-        --exclude='.git/refs' \
-        --exclude='.git/logs' \
+        --exclude='.git' \
         --exclude='node_modules' \
         --exclude='.next' \
         --exclude='dist' \
         --exclude='build' \
         --exclude='.DS_Store' \
+        --exclude='._*' \
         -C "$(dirname "$current_dir")" \
         "$(basename "$current_dir")" 2>/dev/null || error "Failed to create archive"
 
@@ -346,10 +346,6 @@ sync_local_dir() {
 
     # Clean up
     rm -f "$temp_tar"
-
-    # Ensure git directory is intact
-    sprite exec -s "$sprite_name" -dir "$target_dir" \
-        sh -c "if [ -d .git ]; then git reset --hard HEAD 2>/dev/null || true; fi"
 
     info "Directory synced to $target_dir"
 }
