@@ -1,14 +1,16 @@
 # sp - Sprite Repository Manager
 
-A command-line tool for managing Fly.io sprites with GitHub repositories. Automatically handles authentication, repository syncing, and Claude Code CLI sessions.
+A command-line tool for managing Fly.io sprites with GitHub repositories or local directories. Automatically handles authentication, repository syncing, and Claude Code CLI sessions.
 
 ## Features
 
 - Automatically creates or connects to sprites based on GitHub repository names
+- Works with any local directory, even without a GitHub repository
 - Copies Claude authentication tokens and SSH keys to sprites
 - Syncs repositories with `git pull --recurse-submodules`
 - Opens Claude Code CLI sessions in the repository directory
 - Supports working with local repository changes via directory sync
+- **NEW:** Bidirectional file syncing with Mutagen (optional `--sync` flag)
 
 ## Prerequisites
 
@@ -17,6 +19,7 @@ A command-line tool for managing Fly.io sprites with GitHub repositories. Automa
 - Claude Code CLI (required for opening Claude sessions)
 - SSH key at `~/.ssh/id_ed25519` (for GitHub authentication)
 - Claude Code OAuth token (will be generated automatically on first run via `claude setup-token`)
+- [Mutagen](https://mutagen.io/) (optional, required only for `--sync` flag): `brew install mutagen`
 
 ## Installation
 
@@ -64,25 +67,78 @@ sp superfly/flyctl
 ### Work with Current Directory
 
 ```bash
-cd /path/to/your/repo
+cd /path/to/your/project
 sp .
 ```
 
 This will:
-1. Detect the GitHub repository from the current directory's git remote
-2. Create or connect to the appropriate sprite
-3. Sync your local directory contents to the sprite (excluding `.git/objects`, `node_modules`, etc.)
-4. Open a Claude Code CLI session in the synced directory
+1. Detect the GitHub repository from the current directory's git remote (if available)
+2. If no GitHub repo is found, use the directory name with a `local-` prefix
+3. Create or connect to the appropriate sprite
+4. Sync your local directory contents to the sprite (excluding `.git/objects`, `node_modules`, etc.)
+5. Open a Claude Code CLI session in the synced directory
 
-Note: This syncs your local changes to the sprite, allowing you to work with uncommitted changes in Claude.
+Works with any directory -- no GitHub repository required.
+
+### Bidirectional File Syncing (NEW)
+
+```bash
+cd /path/to/your/repo
+sp . --sync
+```
+
+Enable real-time bidirectional file syncing using Mutagen. This mode:
+1. Performs initial directory sync to sprite
+2. Sets up SSH server inside the sprite
+3. Starts Mutagen sync session with two-way sync
+4. Watches for changes on both local machine and sprite
+5. Automatically syncs changes in both directions while Claude session is active
+
+**Prerequisites for --sync:**
+- Mutagen installed locally: `brew install mutagen`
+- SSH key at `~/.ssh/id_ed25519` (used for SSH authentication to sprite)
+
+**How it works:**
+- Changes you make locally are automatically synced to the sprite
+- Changes Claude makes in the sprite are automatically synced back to your machine
+- Sync session is active while `sp` is running
+- Automatic cleanup when you exit the Claude session
+
+**What gets synced:**
+All files except:
+- `.git` (version control)
+- `node_modules` (dependencies)
+- `.next`, `dist`, `build` (build artifacts)
+- `.DS_Store`, `._*` (system files)
+
+**Use cases:**
+- Real-time collaboration between local tools and Claude
+- Keep your local editor in sync with Claude's changes
+- Work simultaneously in multiple environments
+- No need to manually pull changes from sprite
+
+**Example workflow:**
+```bash
+# Start sprite with sync enabled
+cd ~/projects/my-app
+sp . --sync
+
+# Claude makes changes in sprite → automatically appear in your local files
+# You make changes locally → automatically appear in sprite for Claude
+# Exit Claude session → sync automatically stops and cleans up
+```
 
 ## Sprite Naming Convention
 
-Sprites are automatically named using the pattern: `gh-owner--repo`
+Sprites are automatically named based on the source:
 
-Examples:
-- `superfly/flyctl` → sprite name: `gh-superfly--flyctl`
-- `anthropics/claude-code` → sprite name: `gh-anthropics--claude-code`
+**GitHub repositories** use the pattern `gh-owner--repo`:
+- `superfly/flyctl` → `gh-superfly--flyctl`
+- `anthropics/claude-code` → `gh-anthropics--claude-code`
+
+**Local directories** (no GitHub repo) use the pattern `local-<dirname>`:
+- `~/projects/my-app` → `local-my-app`
+- `~/scratch/experiment` → `local-experiment`
 
 ## Authentication
 
@@ -136,12 +192,6 @@ chmod 600 ~/.claude-token
 ### "sprite: command not found"
 Install the Fly.io sprite CLI: https://fly.io/docs/reference/sprites/
 
-### "Not a git repository or no origin remote"
-Make sure you're in a git repository with a GitHub remote configured:
-```bash
-git remote -v
-```
-
 ### SSH authentication issues
 Ensure your SSH key is added to your GitHub account:
 ```bash
@@ -156,6 +206,10 @@ sp superfly/flyctl
 
 # Work on your local changes before committing
 cd ~/projects/my-app
+sp .
+
+# Work on a directory without a GitHub repo
+cd ~/scratch/prototype
 sp .
 
 # Quick access to any public GitHub repo

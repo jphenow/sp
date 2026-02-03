@@ -2,15 +2,29 @@
 
 set -euo pipefail
 
-# sp - Sprite environment manager for GitHub repositories
+# sp - Sprite environment manager for GitHub repositories and local directories
 # Usage:
-#   sp owner/repo    - Create or access sprite for a GitHub repository
-#   sp .             - Create or access sprite for current directory's repo
+#   sp owner/repo [--sync]    - Create or access sprite for a GitHub repository
+#   sp . [--sync]             - Create or access sprite for current directory
+#                               Uses GitHub repo name if available, otherwise directory name
+#
+# Sprite naming:
+#   GitHub repos:     gh-owner--repo      (e.g., gh-acme--widgets)
+#   Local directories: local-<dirname>    (e.g., local-my-project)
+#
+# Options:
+#   --sync    Enable bidirectional file syncing with Mutagen (requires: brew install mutagen)
 
 # Configuration
 CLAUDE_CONFIG_DIR="${HOME}/.claude"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 SSH_PUB_KEY="${HOME}/.ssh/id_ed25519.pub"
+
+# Sync configuration
+SYNC_ENABLED=false
+PROXY_PID=""
+SYNC_SESSION_NAME=""
+SSH_PORT=2222
 
 # Check for required commands
 check_requirements() {
@@ -24,6 +38,346 @@ check_requirements() {
     fi
 }
 
+# Check if Mutagen is installed
+check_mutagen() {
+    if ! command -v mutagen >/dev/null 2>&1; then
+        error "Mutagen is not installed. Please install it with: brew install mutagen-io/mutagen/mutagen"
+    fi
+}
+
+# Setup SSH server in sprite
+# Installs OpenSSH server, configures it for key-based auth, and adds local public key
+setup_ssh_server() {
+    local sprite_name="$1"
+
+    info "Setting up SSH server in sprite..."
+
+    # Check if SSH server is already installed
+    if sprite exec -s "$sprite_name" command -v sshd >/dev/null 2>&1; then
+        info "SSH server already installed"
+    else
+        info "Installing OpenSSH server..."
+        sprite exec -s "$sprite_name" sh -c '
+            export DEBIAN_FRONTEND=noninteractive
+            sudo apt-get update -qq >/dev/null 2>&1
+            sudo apt-get install -y -qq openssh-server >/dev/null 2>&1
+        ' || error "Failed to install SSH server"
+    fi
+
+    # Configure SSH for security
+    info "Configuring SSH server..."
+    sprite exec -s "$sprite_name" sh -c '
+        sudo tee /etc/ssh/sshd_config.d/sprite.conf >/dev/null <<EOF
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitRootLogin no
+EOF
+    ' || warn "Could not configure SSH server"
+
+    # Ensure SSH host keys are generated
+    info "Ensuring SSH host keys exist..."
+    sprite exec -s "$sprite_name" sh -c 'sudo ssh-keygen -A 2>/dev/null' || true
+
+    # Fix home directory ownership (SSH StrictModes requires this)
+    info "Fixing directory permissions..."
+    sprite exec -s "$sprite_name" sh -c 'sudo chown sprite:sprite /home/sprite 2>/dev/null' || true
+
+    # Ensure .ssh directory exists with correct permissions and ownership
+    sprite exec -s "$sprite_name" sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && sudo chown -R sprite:sprite ~/.ssh 2>/dev/null' || true
+
+    # Add local public key to authorized_keys if not already present
+    if [[ -f "$SSH_PUB_KEY" ]]; then
+        info "Adding public key to authorized_keys..."
+        # Read the public key content
+        local pubkey_content
+        pubkey_content=$(cat "$SSH_PUB_KEY")
+
+        # Add to authorized_keys using a safer method
+        sprite exec -s "$sprite_name" sh -c "
+            touch ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+            if ! grep -qF '$pubkey_content' ~/.ssh/authorized_keys 2>/dev/null; then
+                echo '$pubkey_content' >> ~/.ssh/authorized_keys
+            fi
+        " || warn "Could not add public key to authorized_keys"
+    fi
+
+    info "SSH server setup complete"
+}
+
+# Ensure SSH server is running in sprite
+# Restarts sshd if already running to pick up config changes, starts it otherwise
+ensure_ssh_server_running() {
+    local sprite_name="$1"
+
+    # Always restart sshd to ensure it picks up any config changes from setup_ssh_server.
+    # A stale sshd process (from a previous session or auto-started by apt) may have
+    # outdated config or host keys, causing "Connection reset by peer" errors.
+    if sprite exec -s "$sprite_name" pgrep -x sshd >/dev/null 2>&1; then
+        info "Restarting SSH server to pick up config changes..."
+        sprite exec -s "$sprite_name" sh -c 'sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo killall sshd 2>/dev/null' || true
+        sleep 2
+    fi
+
+    info "Starting SSH server..."
+
+    # Try to start SSH service using systemd/init.d first (preferred method)
+    if sprite exec -s "$sprite_name" sh -c 'sudo systemctl start ssh 2>/dev/null || sudo service ssh start 2>/dev/null'; then
+        info "SSH service started via system service manager"
+        sleep 2
+    else
+        # Fallback: start sshd manually in background
+        info "Starting sshd manually..."
+        # Use sprite exec with a backgrounded command that will persist
+        sprite exec -s "$sprite_name" sh -c 'nohup sudo /usr/sbin/sshd -D >/tmp/sshd.log 2>&1 </dev/null & echo $! > /tmp/sshd.pid' 2>/dev/null || {
+            warn "Failed to start sshd, checking configuration..."
+            sprite exec -s "$sprite_name" sudo /usr/sbin/sshd -t 2>&1 || true
+        }
+        sleep 3
+    fi
+
+    # Verify sshd is running
+    if ! sprite exec -s "$sprite_name" pgrep -x sshd >/dev/null 2>&1; then
+        # Try to get diagnostic info
+        warn "SSH server not detected, gathering diagnostics..."
+        info "Checking SSH configuration:"
+        sprite exec -s "$sprite_name" sudo /usr/sbin/sshd -t 2>&1 || true
+        info "Checking SSH service status:"
+        sprite exec -s "$sprite_name" sh -c 'sudo systemctl status ssh 2>&1 || sudo service ssh status 2>&1 || cat /tmp/sshd.log 2>&1' || true
+        error "SSH server did not start successfully"
+    fi
+
+    info "SSH server started successfully"
+}
+
+# Start sprite proxy for SSH port forwarding
+# Launches proxy in background and stores PID
+start_sprite_proxy() {
+    local sprite_name="$1"
+
+    # Check if port is already in use and try to clean it up
+    if lsof -i ":${SSH_PORT}" >/dev/null 2>&1; then
+        warn "Port ${SSH_PORT} is already in use. Attempting to free it..."
+        lsof -ti ":${SSH_PORT}" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+
+    info "Starting port forwarding (localhost:${SSH_PORT} -> sprite:22)..."
+
+    # Create a temporary log file for proxy output
+    local proxy_log="/tmp/sprite-proxy-$$.log"
+
+    # Start proxy in background with logging
+    sprite proxy -s "$sprite_name" "${SSH_PORT}:22" >"$proxy_log" 2>&1 &
+    PROXY_PID=$!
+
+    # Wait for proxy to be ready
+    local attempts=0
+    local max_attempts=30
+    while [[ $attempts -lt $max_attempts ]]; do
+        # Check if the process is still running
+        if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+            # Process died, show the log
+            warn "Proxy process died unexpectedly. Log:"
+            cat "$proxy_log" >&2
+            rm -f "$proxy_log"
+            error "Port forwarding failed to start"
+        fi
+
+        # Check if port is actually listening using lsof
+        if lsof -i ":${SSH_PORT}" >/dev/null 2>&1; then
+            info "Port forwarding ready"
+            rm -f "$proxy_log"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.5
+    done
+
+    # If we get here, show the log
+    warn "Proxy did not become ready. Log:"
+    cat "$proxy_log" >&2
+    rm -f "$proxy_log"
+    error "Port forwarding failed to start"
+}
+
+# Test SSH connectivity through the proxy
+test_ssh_connection() {
+    info "Testing SSH connection..."
+
+    # First check if proxy is still running
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+        echo "ERROR: Proxy process (PID $PROXY_PID) died before SSH test could begin" >&2
+        return 1
+    fi
+
+    # Check if port is actually listening
+    if ! lsof -i ":${SSH_PORT}" >/dev/null 2>&1; then
+        echo "ERROR: Port ${SSH_PORT} is not listening" >&2
+        echo "Proxy status:" >&2
+        ps -p "$PROXY_PID" >&2 || echo "Proxy process not found" >&2
+        return 1
+    fi
+
+    # Remove any stale host key for localhost:SSH_PORT from known_hosts.
+    # Each sprite has a different host key, and they all share this port via proxy,
+    # so old entries will always cause "REMOTE HOST IDENTIFICATION HAS CHANGED" errors.
+    ssh-keygen -R "[localhost]:${SSH_PORT}" 2>/dev/null || true
+
+    local attempts=0
+    local max_attempts=10
+    while [[ $attempts -lt $max_attempts ]]; do
+        # Try with verbose output to see what's failing
+        # StrictHostKeyChecking=no is safe here — this is a local proxy to a sprite, not a real remote host
+        local ssh_output
+        ssh_output=$(ssh -p "$SSH_PORT" -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes sprite@localhost echo "ready" 2>&1)
+        local ssh_exit=$?
+
+        if [[ $ssh_exit -eq 0 ]]; then
+            info "SSH connection successful"
+            return 0
+        fi
+
+        # Show error on first and every 3rd attempt
+        if [[ $attempts -eq 0 ]] || [[ $((attempts % 3)) -eq 0 ]]; then
+            echo "WARNING: SSH connection attempt $((attempts + 1)) failed: $(echo "$ssh_output" | tail -1)" >&2
+        fi
+
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+
+    echo "ERROR: SSH connection test failed after $max_attempts attempts" >&2
+    echo "Last error: $ssh_output" >&2
+    return 1
+}
+
+# Start Mutagen sync session
+# Creates bidirectional sync between local and remote directory
+start_mutagen_sync() {
+    local sprite_name="$1"
+    local local_dir="$2"
+    local remote_dir="$3"
+
+    SYNC_SESSION_NAME="sprite-${sprite_name}"
+    local ssh_config_marker="# mutagen-sprite-temp-${sprite_name}"
+
+    info "Initializing Mutagen sync..."
+    info "Local: $local_dir"
+    info "Remote: sprite@localhost:$remote_dir"
+
+    # Check if session already exists
+    if mutagen sync list 2>/dev/null | grep -q "^${SYNC_SESSION_NAME}$"; then
+        warn "Sync session already exists, terminating old session..."
+        mutagen sync terminate "$SYNC_SESSION_NAME" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Add temporary SSH config entry to user's ~/.ssh/config
+    info "Configuring SSH for Mutagen..."
+    mkdir -p ~/.ssh
+    touch ~/.ssh/config
+
+    # Remove any existing entry for this sprite
+    sed -i.bak "/${ssh_config_marker}/,+7d" ~/.ssh/config 2>/dev/null || true
+
+    # Add new entry
+    cat >> ~/.ssh/config <<EOF
+
+${ssh_config_marker}
+Host sprite-mutagen-${sprite_name}
+    HostName localhost
+    Port ${SSH_PORT}
+    User sprite
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    IdentityFile ~/.ssh/id_ed25519
+EOF
+
+    # Create sync session
+    mutagen sync create \
+        --name "$SYNC_SESSION_NAME" \
+        --sync-mode two-way-resolved \
+        --ignore-vcs \
+        --ignore "node_modules" \
+        --ignore ".next" \
+        --ignore "dist" \
+        --ignore "build" \
+        --ignore ".DS_Store" \
+        --ignore "._*" \
+        "$local_dir" \
+        "sprite-mutagen-${sprite_name}:${remote_dir}" || {
+        error "Failed to create Mutagen sync session"
+    }
+
+    info "Waiting for initial sync to complete..."
+
+    # Monitor sync status until initial sync completes
+    local attempts=0
+    local max_attempts=120  # 2 minutes max
+    while [[ $attempts -lt $max_attempts ]]; do
+        # Check sync status - look for "Status: Watching for changes" which indicates sync is ready
+        local status
+        status=$(mutagen sync list "$SYNC_SESSION_NAME" 2>/dev/null || echo "")
+
+        # Check if sync is watching for changes (ready state)
+        if echo "$status" | grep -q "Status: Watching for changes"; then
+            info "Initial sync complete - watching for changes"
+            return 0
+        fi
+
+        # Check for errors
+        if echo "$status" | grep -qi "error"; then
+            error "Sync encountered an error: $status"
+        fi
+
+        # Show progress every 5 seconds
+        if [[ $((attempts % 10)) -eq 0 ]] && [[ $attempts -gt 0 ]]; then
+            info "Syncing... (${attempts}s)"
+        fi
+
+        attempts=$((attempts + 1))
+        sleep 0.5
+    done
+
+    warn "Initial sync did not complete in expected time, but continuing..."
+}
+
+# Stop Mutagen sync session
+stop_mutagen_sync() {
+    if [[ -n "$SYNC_SESSION_NAME" ]]; then
+        info "Stopping Mutagen sync..."
+        mutagen sync terminate "$SYNC_SESSION_NAME" 2>/dev/null || true
+
+        # Clean up SSH config entry
+        local ssh_config_marker="# mutagen-sprite-temp-"
+        if [[ -f ~/.ssh/config ]]; then
+            sed -i.bak "/${ssh_config_marker}/,+7d" ~/.ssh/config 2>/dev/null || true
+        fi
+
+        SYNC_SESSION_NAME=""
+    fi
+}
+
+# Stop sprite proxy
+stop_sprite_proxy() {
+    if [[ -n "$PROXY_PID" ]]; then
+        info "Stopping port forwarding..."
+        kill "$PROXY_PID" 2>/dev/null || true
+        PROXY_PID=""
+    fi
+}
+
+# Cleanup function called on exit
+cleanup_sync_session() {
+    if [[ "$SYNC_ENABLED" == "true" ]]; then
+        echo ""  # Newline for cleaner output
+        info "Cleaning up sync session..."
+        stop_mutagen_sync
+        stop_sprite_proxy
+    fi
+}
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,6 +387,8 @@ NC='\033[0m' # No Color
 # Print error message and exit
 error() {
     echo -e "${RED}Error: $1${NC}" >&2
+    # Ensure the message is flushed before exit
+    sleep 0.1
     exit 1
 }
 
@@ -82,9 +438,10 @@ wait_for_sprite() {
 
 
 # Get GitHub remote URL and extract owner/repo
+# Returns empty string if not a git repo or no GitHub remote found
 get_github_repo() {
     local remote_url
-    remote_url=$(git config --get remote.origin.url 2>/dev/null) || error "Not a git repository or no origin remote"
+    remote_url=$(git config --get remote.origin.url 2>/dev/null) || return 0
 
     # Handle both SSH and HTTPS URLs
     # SSH: git@github.com:owner/repo.git
@@ -94,15 +451,31 @@ get_github_repo() {
         local repo="${BASH_REMATCH[2]}"
         repo="${repo%.git}"  # Remove .git suffix if present
         echo "${owner}/${repo}"
-    else
-        error "Could not parse GitHub repository from remote: $remote_url"
     fi
+    # Returns empty if remote URL doesn't match GitHub pattern
 }
 
 # Convert owner/repo to sprite name
 repo_to_sprite_name() {
     local repo="$1"
     echo "gh-${repo//\//--}"
+}
+
+# Convert directory name to sprite name (for non-GitHub directories)
+dir_to_sprite_name() {
+    local dir_name="$1"
+    # Sanitize: lowercase, replace spaces/special chars with dashes
+    local sanitized
+    sanitized=$(echo "$dir_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+    echo "local-${sanitized}"
+}
+
+# Get the sprite name from .sprite in the current directory, if set.
+# Prints the sprite value or nothing; used to avoid redundant 'sprite use'.
+get_current_dir_sprite() {
+    if [[ -f .sprite ]]; then
+        tr -d '\n' < .sprite 2>/dev/null | sed -n 's/.*"sprite"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+    fi
 }
 
 # Get or create Claude OAuth token
@@ -315,12 +688,12 @@ setup_git_config() {
 }
 
 # Sync current directory to sprite
+# Args: sprite_name, target_dir_name (basename for /home/sprite/<name>), source_dir
 sync_local_dir() {
     local sprite_name="$1"
-    local repo="$2"
+    local target_dir_name="$2"
     local current_dir="$3"
-    local repo_dir=$(basename "$repo")
-    local target_dir="/home/sprite/$repo_dir"
+    local target_dir="/home/sprite/$target_dir_name"
 
     info "Syncing local directory to sprite..."
 
@@ -329,7 +702,6 @@ sync_local_dir() {
     local temp_tar="/tmp/sprite-sync-$$.tar.gz"
     COPYFILE_DISABLE=1 tar -czf "$temp_tar" \
         --no-xattrs \
-        --exclude='.git' \
         --exclude='node_modules' \
         --exclude='.next' \
         --exclude='dist' \
@@ -354,16 +726,28 @@ sync_local_dir() {
 handle_current_dir_mode() {
     local current_dir
     current_dir=$(pwd)
+    local dir_name
+    dir_name=$(basename "$current_dir")
 
-    # Get GitHub repo info
+    # Try to detect GitHub repo, but don't require it
     local repo
     repo=$(get_github_repo)
 
-    info "Detected GitHub repository: $repo"
-    info "Working directory: $current_dir"
-
     local sprite_name
-    sprite_name=$(repo_to_sprite_name "$repo")
+    local target_dir_name
+
+    if [[ -n "$repo" ]]; then
+        info "Detected GitHub repository: $repo"
+        sprite_name=$(repo_to_sprite_name "$repo")
+        target_dir_name=$(basename "$repo")
+    else
+        info "No GitHub repository detected, using directory name: $dir_name"
+        sprite_name=$(dir_to_sprite_name "$dir_name")
+        target_dir_name="$dir_name"
+    fi
+
+    info "Working directory: $current_dir"
+    info "Sprite name: $sprite_name"
 
     # Create sprite if it doesn't exist
     local is_new=false
@@ -376,35 +760,91 @@ handle_current_dir_mode() {
         info "Using existing sprite: $sprite_name"
     fi
 
+    # Set this directory's default sprite so 'sprite' commands without -s use it
+    local current_dir_sprite
+    current_dir_sprite=$(get_current_dir_sprite)
+    if [[ "$current_dir_sprite" != "$sprite_name" ]]; then
+        info "Setting default sprite for this directory: $sprite_name"
+        sprite use "$sprite_name"
+    fi
+
     # Check if SSH key exists in sprite, set up auth if missing
     if [[ "$is_new" == "true" ]] || ! sprite exec -s "$sprite_name" test -f /home/sprite/.ssh/id_ed25519 2>/dev/null; then
         setup_sprite_auth "$sprite_name"
         setup_git_config "$sprite_name"
     fi
 
-    # Sync local directory to sprite
-    sync_local_dir "$sprite_name" "$repo" "$current_dir"
+    # Sync local directory to sprite (initial one-way sync)
+    sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
+
+    # Setup bidirectional sync if enabled
+    if [[ "$SYNC_ENABLED" == "true" ]]; then
+        info "Setting up bidirectional sync..."
+
+        # Setup SSH server in sprite
+        setup_ssh_server "$sprite_name"
+
+        # Ensure SSH server is running
+        ensure_ssh_server_running "$sprite_name"
+
+        # Start sprite proxy for SSH port forwarding
+        start_sprite_proxy "$sprite_name"
+
+        # Test SSH connection
+        if ! test_ssh_connection; then
+            error "Failed to establish SSH connection to sprite. Cannot start Mutagen sync."
+        fi
+
+        # Start Mutagen sync
+        start_mutagen_sync "$sprite_name" "$current_dir" "/home/sprite/$target_dir_name"
+
+        info ""
+        info "✓ Sync is active - changes will be bidirectional"
+        info ""
+    fi
 
     # Open Claude session in the synced directory
-    local repo_dir=$(basename "$repo")
-    info "Opening Claude Code session in $repo_dir..."
+    info "Opening Claude Code session in $target_dir_name..."
 
     # Get the token to pass as env var
     local claude_token
     claude_token=$(get_claude_token)
 
-    sprite exec -s "$sprite_name" -dir "/home/sprite/$repo_dir" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty claude
+    sprite exec -s "$sprite_name" -dir "/home/sprite/$target_dir_name" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty claude
 }
+
+# Set up cleanup trap
+trap cleanup_sync_session EXIT INT TERM
 
 # Main entry point
 main() {
     check_requirements
 
     if [[ $# -eq 0 ]]; then
-        error "Usage: sp owner/repo OR sp ."
+        error "Usage: sp owner/repo [--sync] OR sp . [--sync]"
     fi
 
+    # Parse arguments
     local arg="$1"
+    shift  # Remove first argument
+
+    # Check for --sync flag
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --sync)
+                SYNC_ENABLED=true
+                shift
+                ;;
+            *)
+                error "Unknown flag: $1"
+                ;;
+        esac
+    done
+
+    # Check Mutagen if sync is enabled
+    if [[ "$SYNC_ENABLED" == "true" ]]; then
+        check_mutagen
+    fi
 
     case "$arg" in
         .)
