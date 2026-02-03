@@ -24,7 +24,8 @@ SSH_PUB_KEY="${HOME}/.ssh/id_ed25519.pub"
 SYNC_ENABLED=false
 PROXY_PID=""
 SYNC_SESSION_NAME=""
-SSH_PORT=2222
+SYNC_SPRITE_NAME=""
+SSH_PORT=""
 
 # Check for required commands
 check_requirements() {
@@ -151,16 +152,42 @@ ensure_ssh_server_running() {
 }
 
 # Start sprite proxy for SSH port forwarding
-# Launches proxy in background and stores PID
+# Resolves port collisions by scanning nearby ports when the deterministic port
+# is occupied. Writes a lock file so stale sessions can be detected.
 start_sprite_proxy() {
     local sprite_name="$1"
+    local base_port="$SSH_PORT"
+    local port="$base_port"
+    local lock_dir="/tmp"
+    local lock_file="${lock_dir}/sprite-sync-${sprite_name}.port"
 
-    # Check if port is already in use and try to clean it up
-    if lsof -i ":${SSH_PORT}" >/dev/null 2>&1; then
-        warn "Port ${SSH_PORT} is already in use. Attempting to free it..."
-        lsof -ti ":${SSH_PORT}" | xargs kill -9 2>/dev/null || true
-        sleep 1
+    # If a lock file exists from a previous run of this sprite, check if it's stale
+    if [[ -f "$lock_file" ]]; then
+        local old_port old_pid
+        read -r old_port old_pid < "$lock_file" 2>/dev/null || true
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            error "Another sync session for sprite '${sprite_name}' is already running (PID ${old_pid}, port ${old_port})."
+        fi
+        # Previous owner is dead — stale lock. Clean up and continue.
+        rm -f "$lock_file"
     fi
+
+    # Find an available port, starting from the deterministic base.
+    # Tries up to 20 consecutive ports to handle hash collisions.
+    local max_offset=20
+    local offset=0
+    while lsof -i ":${port}" >/dev/null 2>&1; do
+        offset=$((offset + 1))
+        if [[ $offset -ge $max_offset ]]; then
+            error "Could not find an available port in range ${base_port}-$((base_port + max_offset - 1)) for sprite '${sprite_name}'."
+        fi
+        port=$((base_port + offset))
+    done
+
+    if [[ "$port" -ne "$base_port" ]]; then
+        warn "Deterministic port ${base_port} was in use, using ${port} instead"
+    fi
+    SSH_PORT="$port"
 
     info "Starting port forwarding (localhost:${SSH_PORT} -> sprite:22)..."
 
@@ -186,6 +213,8 @@ start_sprite_proxy() {
 
         # Check if port is actually listening using lsof
         if lsof -i ":${SSH_PORT}" >/dev/null 2>&1; then
+            # Write lock file: port and PID so other sessions can detect us
+            echo "${SSH_PORT} $$" > "$lock_file"
             info "Port forwarding ready"
             rm -f "$proxy_log"
             return 0
@@ -359,12 +388,17 @@ stop_mutagen_sync() {
     fi
 }
 
-# Stop sprite proxy
+# Stop sprite proxy and remove its lock file
 stop_sprite_proxy() {
     if [[ -n "$PROXY_PID" ]]; then
         info "Stopping port forwarding..."
         kill "$PROXY_PID" 2>/dev/null || true
         PROXY_PID=""
+    fi
+    # Remove the port lock file so other sessions don't see us as alive
+    if [[ -n "$SYNC_SPRITE_NAME" ]]; then
+        rm -f "/tmp/sprite-sync-${SYNC_SPRITE_NAME}.port"
+        SYNC_SPRITE_NAME=""
     fi
 }
 
@@ -468,6 +502,16 @@ dir_to_sprite_name() {
     local sanitized
     sanitized=$(echo "$dir_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
     echo "local-${sanitized}"
+}
+
+# Derive a deterministic SSH port from the sprite name.
+# Hashes into range 10000-60000 so each sprite gets its own port,
+# allowing concurrent sync sessions without port conflicts.
+sprite_ssh_port() {
+    local sprite_name="$1"
+    local hash
+    hash=$(echo -n "$sprite_name" | cksum | cut -d' ' -f1)
+    echo $(( (hash % 50001) + 10000 ))
 }
 
 # Get the sprite name from .sprite in the current directory, if set.
@@ -779,7 +823,10 @@ handle_current_dir_mode() {
 
     # Setup bidirectional sync if enabled
     if [[ "$SYNC_ENABLED" == "true" ]]; then
-        info "Setting up bidirectional sync..."
+        # Derive a per-sprite SSH port so concurrent sync sessions don't collide
+        SSH_PORT=$(sprite_ssh_port "$sprite_name")
+        SYNC_SPRITE_NAME="$sprite_name"
+        info "Setting up bidirectional sync (port ${SSH_PORT})..."
 
         # Setup SSH server in sprite
         setup_ssh_server "$sprite_name"
