@@ -50,14 +50,14 @@ alias sp='/path/to/sprite-repo/sp'
 ### Work with a GitHub Repository
 
 ```bash
-sp owner/repo
+sp owner/repo [--sync] [--cmd CMD] [--name NAME]
 ```
 
 This will:
 1. Create a sprite named `gh-owner--repo` (if it doesn't exist)
 2. Copy your Claude config and SSH keys to the sprite
 3. Clone the repository (or pull latest changes if already cloned)
-4. Open a Claude Code CLI session in the repository directory
+4. Open a tmux session running the command (default: `claude`) in the repository directory
 
 Example:
 ```bash
@@ -68,7 +68,7 @@ sp superfly/flyctl
 
 ```bash
 cd /path/to/your/project
-sp .
+sp . [--sync] [--cmd CMD] [--name NAME]
 ```
 
 This will:
@@ -76,9 +76,62 @@ This will:
 2. If no GitHub repo is found, use the directory name with a `local-` prefix
 3. Create or connect to the appropriate sprite
 4. Sync your local directory contents to the sprite (excluding `.git/objects`, `node_modules`, etc.)
-5. Open a Claude Code CLI session in the synced directory
+5. Open a tmux session running the command (default: `claude`) in the synced directory
 
 Works with any directory -- no GitHub repository required.
+
+### Custom Commands (`--cmd`)
+
+By default, `sp` launches `claude` inside the sprite. Use `--cmd` to run a different command:
+
+```bash
+# Open a bash shell instead of claude
+sp . --cmd bash
+
+# Run a specific tool
+sp owner/repo --cmd vim
+```
+
+### Custom Session Names (`--name`)
+
+By default, the tmux session is named after the command (e.g., `claude`). Use `--name` to set a custom session name:
+
+```bash
+# Launch claude in a session named "feature"
+sp . --name feature
+
+# Launch bash in a session named "debug"
+sp . --cmd bash --name debug
+```
+
+### tmux Session Behavior
+
+Each `sp` invocation runs its command inside a persistent tmux session within the sprite. This provides:
+
+- **Persistence** — if you disconnect or your terminal closes, the session keeps running. Reconnecting with the same `sp` command reattaches to the existing session.
+- **Detach/reattach** — press `Ctrl-b d` inside tmux to detach without stopping the session. Run `sp` again to reattach.
+- **Multiple sessions** — use `--name` to run multiple independent sessions in the same sprite (e.g., `claude` + `bash` side by side).
+
+### Sprite Info (`sp info`)
+
+Inspect sprite metadata without connecting:
+
+```bash
+sp info .
+sp info owner/repo
+sp info owner/repo --cmd bash --name debug
+```
+
+Prints sprite name, existence, repository, target directory, command, and session name.
+
+### List Sessions (`sp sessions`)
+
+List active tmux sessions in a sprite:
+
+```bash
+sp sessions .
+sp sessions owner/repo
+```
 
 ### Bidirectional File Syncing (NEW)
 
@@ -214,6 +267,22 @@ sp .
 
 # Quick access to any public GitHub repo
 sp torvalds/linux
+
+# Open a bash shell in a sprite
+sp . --cmd bash
+
+# Run claude and bash simultaneously in the same sprite
+sp . --name claude-session        # Terminal 1
+sp . --cmd bash --name debug      # Terminal 2
+
+# Check sprite info before connecting
+sp info owner/repo
+
+# List active tmux sessions
+sp sessions .
+
+# Sync + custom session name
+sp . --sync --cmd claude --name feature
 ```
 
 ## License
