@@ -4,16 +4,25 @@ set -euo pipefail
 
 # sp - Sprite environment manager for GitHub repositories and local directories
 # Usage:
-#   sp owner/repo [--sync]    - Create or access sprite for a GitHub repository
-#   sp . [--sync]             - Create or access sprite for current directory
-#                               Uses GitHub repo name if available, otherwise directory name
+#   sp owner/repo [--sync] [--cmd CMD] [--name NAME]
+#   sp . [--sync] [--cmd CMD] [--name NAME]
+#   sp info owner/repo [--cmd CMD] [--name NAME]
+#   sp info .
+#   sp sessions owner/repo
+#   sp sessions .
 #
 # Sprite naming:
 #   GitHub repos:     gh-owner--repo      (e.g., gh-acme--widgets)
 #   Local directories: local-<dirname>    (e.g., local-my-project)
 #
 # Options:
-#   --sync    Enable bidirectional file syncing with Mutagen (requires: brew install mutagen)
+#   --sync        Enable bidirectional file syncing with Mutagen (requires: brew install mutagen)
+#   --cmd CMD     Command to run instead of 'claude' (default: claude)
+#   --name NAME   tmux session name (default: derived from command name)
+#
+# Subcommands:
+#   info       Show sprite info (name, existence, target dir, command, session) without connecting
+#   sessions   List active tmux sessions in a sprite
 
 # Configuration
 CLAUDE_CONFIG_DIR="${HOME}/.claude"
@@ -26,6 +35,51 @@ PROXY_PID=""
 SYNC_SESSION_NAME=""
 SYNC_SPRITE_NAME=""
 SSH_PORT=""
+
+# Command and session configuration
+EXEC_CMD="claude"
+SESSION_NAME=""
+RESOLVED_SPRITE_NAME=""
+RESOLVED_TARGET_DIR=""
+RESOLVED_REPO=""
+
+# Print usage information and exit
+usage() {
+    cat <<'EOF'
+sp - Sprite environment manager for GitHub repositories and local directories
+
+Usage:
+  sp owner/repo [--sync] [--cmd CMD] [--name NAME]
+  sp . [--sync] [--cmd CMD] [--name NAME]
+  sp info owner/repo|. [--cmd CMD] [--name NAME]
+  sp sessions owner/repo|.
+
+Subcommands:
+  info       Show sprite metadata (name, existence, target dir, command, session)
+             without connecting
+  sessions   List active tmux sessions in a sprite
+
+Options:
+  --sync        Enable bidirectional file syncing with Mutagen
+  --cmd CMD     Command to run instead of 'claude' (default: claude)
+  --name NAME   tmux session name (default: derived from command name)
+  --help, -h    Show this help message
+
+Sprite naming (in priority order):
+  1. .sprite file   Read from local .sprite JSON file if present
+  2. GitHub remote   gh-owner--repo      (e.g., gh-acme--widgets)
+  3. Directory name  local-<dirname>     (e.g., local-my-project)
+
+Examples:
+  sp superfly/flyctl                  # Work on a GitHub repo
+  sp .                                # Work on current directory
+  sp . --cmd bash --name debug        # Open bash in a named tmux session
+  sp . --sync                         # Enable bidirectional file sync
+  sp info .                           # Show sprite info without connecting
+  sp sessions owner/repo              # List tmux sessions in a sprite
+EOF
+    exit 0
+}
 
 # Check for required commands
 check_requirements() {
@@ -504,6 +558,116 @@ dir_to_sprite_name() {
     echo "local-${sanitized}"
 }
 
+# Replace characters that are invalid in tmux session names (. and :) with dashes
+sanitize_session_name() {
+    local name="$1"
+    echo "$name" | sed 's/[.:]/-/g'
+}
+
+# Return the tmux session name to use.
+# Uses SESSION_NAME if explicitly set, otherwise derives from EXEC_CMD.
+derive_session_name() {
+    if [[ -n "$SESSION_NAME" ]]; then
+        sanitize_session_name "$SESSION_NAME"
+    else
+        sanitize_session_name "$EXEC_CMD"
+    fi
+}
+
+# Compute sprite name, target dir, and repo from a target (. or owner/repo)
+# without creating anything. Sets RESOLVED_SPRITE_NAME, RESOLVED_TARGET_DIR,
+# and RESOLVED_REPO globals.
+resolve_sprite_info() {
+    local target="$1"
+
+    if [[ "$target" == "." ]]; then
+        local current_dir
+        current_dir=$(pwd)
+        local dir_name
+        dir_name=$(basename "$current_dir")
+
+        local repo
+        repo=$(get_github_repo)
+
+        # Prefer .sprite file over computed naming
+        local sprite_from_file
+        sprite_from_file=$(get_current_dir_sprite)
+
+        if [[ -n "$sprite_from_file" ]]; then
+            RESOLVED_SPRITE_NAME="$sprite_from_file"
+            RESOLVED_REPO="${repo:-}"
+            if [[ -n "$repo" ]]; then
+                RESOLVED_TARGET_DIR="/home/sprite/$(basename "$repo")"
+            else
+                RESOLVED_TARGET_DIR="/home/sprite/$dir_name"
+            fi
+        elif [[ -n "$repo" ]]; then
+            RESOLVED_REPO="$repo"
+            RESOLVED_SPRITE_NAME=$(repo_to_sprite_name "$repo")
+            RESOLVED_TARGET_DIR="/home/sprite/$(basename "$repo")"
+        else
+            RESOLVED_REPO=""
+            RESOLVED_SPRITE_NAME=$(dir_to_sprite_name "$dir_name")
+            RESOLVED_TARGET_DIR="/home/sprite/$dir_name"
+        fi
+    elif [[ "$target" == */* ]]; then
+        RESOLVED_REPO="$target"
+        RESOLVED_SPRITE_NAME=$(repo_to_sprite_name "$target")
+        RESOLVED_TARGET_DIR="/home/sprite/$(basename "$target")"
+    else
+        error "Invalid target. Use 'owner/repo' format or '.' for current directory"
+    fi
+}
+
+# Execute EXEC_CMD inside a tmux session within the sprite.
+# Uses tmux new-session -A to attach to an existing session or create a new one.
+exec_in_sprite() {
+    local sprite_name="$1"
+    local work_dir="$2"
+    local claude_token="$3"
+
+    local session_name
+    session_name=$(derive_session_name)
+
+    sprite exec -s "$sprite_name" -dir "$work_dir" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty \
+        tmux new-session -A -s "$session_name" "$EXEC_CMD"
+}
+
+# Print sprite metadata without connecting or creating anything.
+handle_info() {
+    local target="$1"
+    resolve_sprite_info "$target"
+
+    local exists="no"
+    if sprite_exists "$RESOLVED_SPRITE_NAME"; then
+        exists="yes"
+    fi
+
+    local session_name
+    session_name=$(derive_session_name)
+
+    echo "Sprite:    $RESOLVED_SPRITE_NAME"
+    echo "Exists:    $exists"
+    if [[ -n "$RESOLVED_REPO" ]]; then
+        echo "Repo:      $RESOLVED_REPO"
+    fi
+    echo "Target:    $RESOLVED_TARGET_DIR"
+    echo "Command:   $EXEC_CMD"
+    echo "Session:   $session_name"
+}
+
+# List active tmux sessions in a sprite.
+handle_sessions() {
+    local target="$1"
+    resolve_sprite_info "$target"
+
+    if ! sprite_exists "$RESOLVED_SPRITE_NAME"; then
+        error "Sprite '$RESOLVED_SPRITE_NAME' does not exist"
+    fi
+
+    sprite exec -s "$RESOLVED_SPRITE_NAME" tmux list-sessions 2>/dev/null || echo "No active tmux sessions"
+}
+
 # Derive a deterministic SSH port from the sprite name.
 # Hashes into range 10000-60000 so each sprite gets its own port,
 # allowing concurrent sync sessions without port conflicts.
@@ -705,15 +869,17 @@ handle_repo_mode() {
     # Sync repository
     sync_repo "$sprite_name" "$repo"
 
-    # Open Claude session
+    # Open session in the repo directory
     local repo_dir=$(basename "$repo")
-    info "Opening Claude Code session in $repo_dir..."
+    local session_name
+    session_name=$(derive_session_name)
+    info "Opening ${EXEC_CMD} session in $repo_dir (tmux session: $session_name)..."
 
     # Get the token to pass as env var
     local claude_token
     claude_token=$(get_claude_token)
 
-    sprite exec -s "$sprite_name" -dir "/home/sprite/$repo_dir" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty claude
+    exec_in_sprite "$sprite_name" "/home/sprite/$repo_dir" "$claude_token"
 }
 
 # Ensure git config is set in sprite
@@ -780,7 +946,19 @@ handle_current_dir_mode() {
     local sprite_name
     local target_dir_name
 
-    if [[ -n "$repo" ]]; then
+    # Prefer .sprite file over computed naming
+    local sprite_from_file
+    sprite_from_file=$(get_current_dir_sprite)
+
+    if [[ -n "$sprite_from_file" ]]; then
+        sprite_name="$sprite_from_file"
+        if [[ -n "$repo" ]]; then
+            target_dir_name=$(basename "$repo")
+        else
+            target_dir_name="$dir_name"
+        fi
+        info "Using sprite from .sprite file: $sprite_name"
+    elif [[ -n "$repo" ]]; then
         info "Detected GitHub repository: $repo"
         sprite_name=$(repo_to_sprite_name "$repo")
         target_dir_name=$(basename "$repo")
@@ -850,14 +1028,16 @@ handle_current_dir_mode() {
         info ""
     fi
 
-    # Open Claude session in the synced directory
-    info "Opening Claude Code session in $target_dir_name..."
+    # Open session in the synced directory
+    local session_name
+    session_name=$(derive_session_name)
+    info "Opening ${EXEC_CMD} session in $target_dir_name (tmux session: $session_name)..."
 
     # Get the token to pass as env var
     local claude_token
     claude_token=$(get_claude_token)
 
-    sprite exec -s "$sprite_name" -dir "/home/sprite/$target_dir_name" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty claude
+    exec_in_sprite "$sprite_name" "/home/sprite/$target_dir_name" "$claude_token"
 }
 
 # Set up cleanup trap
@@ -868,19 +1048,55 @@ main() {
     check_requirements
 
     if [[ $# -eq 0 ]]; then
-        error "Usage: sp owner/repo [--sync] OR sp . [--sync]"
+        usage
     fi
 
-    # Parse arguments
-    local arg="$1"
-    shift  # Remove first argument
+    local subcommand=""
+    local target=""
 
-    # Check for --sync flag
+    # Check for help flag or subcommands
+    case "$1" in
+        --help|-h|help)
+            usage
+            ;;
+        info|sessions)
+            subcommand="$1"
+            shift
+            if [[ $# -eq 0 ]]; then
+                error "Usage: sp $subcommand owner/repo|."
+            fi
+            target="$1"
+            shift
+            ;;
+        *)
+            target="$1"
+            shift
+            ;;
+    esac
+
+    # Parse flags
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --help|-h)
+                usage
+                ;;
             --sync)
                 SYNC_ENABLED=true
                 shift
+                ;;
+            --cmd)
+                if [[ $# -lt 2 ]]; then
+                    error "--cmd requires an argument"
+                fi
+                EXEC_CMD="$2"
+                shift 2
+                ;;
+            --name)
+                if [[ $# -lt 2 ]]; then
+                    error "--name requires an argument"
+                fi
+                SESSION_NAME="$2"
+                shift 2
                 ;;
             *)
                 error "Unknown flag: $1"
@@ -893,15 +1109,27 @@ main() {
         check_mutagen
     fi
 
-    case "$arg" in
-        .)
-            handle_current_dir_mode
+    # Dispatch subcommands
+    case "$subcommand" in
+        info)
+            handle_info "$target"
             ;;
-        */*)
-            handle_repo_mode "$arg"
+        sessions)
+            handle_sessions "$target"
             ;;
-        *)
-            error "Invalid argument. Use 'owner/repo' format or '.' for current directory"
+        "")
+            # No subcommand — launch mode
+            case "$target" in
+                .)
+                    handle_current_dir_mode
+                    ;;
+                */*)
+                    handle_repo_mode "$target"
+                    ;;
+                *)
+                    error "Invalid argument. Use 'owner/repo' format or '.' for current directory"
+                    ;;
+            esac
             ;;
     esac
 }
