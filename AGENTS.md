@@ -147,6 +147,57 @@ When a sprite becomes cluttered:
 - The `sp` tool makes this trivial
 - Fresh clones ensure clean state
 
+## tmux Session Workflows
+
+### Detach and Reattach
+
+Each `sp` invocation runs its command inside a persistent tmux session. You can detach and reattach freely:
+
+```bash
+# Connect to a sprite (starts tmux session "claude")
+sp owner/repo
+
+# Inside the sprite, press Ctrl-b d to detach from tmux
+# You'll return to your local terminal
+
+# Reconnect later — reattaches to the same running session
+sp owner/repo
+```
+
+The Claude Code process keeps running inside the tmux session even while you're detached. This is useful for long-running tasks — detach, come back later, and pick up where you left off.
+
+### Multiple Sessions in One Sprite
+
+Run multiple independent commands in the same sprite simultaneously:
+
+```bash
+# Terminal 1: run claude
+sp owner/repo --name claude-main
+
+# Terminal 2: open a bash shell for manual debugging
+sp owner/repo --cmd bash --name debug
+
+# Terminal 3: run tests in a loop
+sp owner/repo --cmd bash --name tests
+```
+
+Each `--name` creates a separate tmux session. Use `sp sessions owner/repo` to list them all.
+
+### Custom Commands
+
+Use `--cmd` to run something other than `claude`:
+
+```bash
+# Drop into a shell
+sp . --cmd bash
+
+# Open an editor
+sp owner/repo --cmd vim
+
+# Run any command
+sp . --cmd "htop"
+```
+
 ## Common Workflows
 
 ### Contributing to Open Source
