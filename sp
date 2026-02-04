@@ -558,10 +558,11 @@ dir_to_sprite_name() {
     echo "local-${sanitized}"
 }
 
-# Replace characters that are invalid in tmux session names (. and :) with dashes
+# Replace characters that are invalid or problematic in tmux session names
+# (spaces, periods, colons) with dashes
 sanitize_session_name() {
     local name="$1"
-    echo "$name" | sed 's/[.:]/-/g'
+    echo "$name" | sed 's/[.: ]/-/g'
 }
 
 # Return the tmux session name to use.
