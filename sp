@@ -622,6 +622,9 @@ resolve_sprite_info() {
 
 # Execute EXEC_CMD inside a tmux session within the sprite.
 # Uses tmux new-session -A to attach to an existing session or create a new one.
+# Wrapped in sh -c so sprite exec doesn't consume tmux's -s flag as its own.
+# EXEC_CMD is left unquoted inside the sh -c string so multi-word commands
+# (e.g. "claude -c") are properly word-split into command + arguments.
 exec_in_sprite() {
     local sprite_name="$1"
     local work_dir="$2"
@@ -630,8 +633,11 @@ exec_in_sprite() {
     local session_name
     session_name=$(derive_session_name)
 
+    local shell_cmd
+    shell_cmd=$(printf "exec tmux new-session -A -s '%s' %s" "$session_name" "$EXEC_CMD")
+
     sprite exec -s "$sprite_name" -dir "$work_dir" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty \
-        tmux new-session -A -s "$session_name" "$EXEC_CMD"
+        sh -c "$shell_cmd"
 }
 
 # Print sprite metadata without connecting or creating anything.
