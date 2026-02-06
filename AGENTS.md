@@ -181,6 +181,8 @@ sp owner/repo
 
 The Claude Code process keeps running inside the tmux session even while you're detached. This is useful for long-running tasks — detach, come back later, and pick up where you left off.
 
+**Note:** The session persists as long as the command inside it is running. If the command exits (e.g., `claude -c` with no conversation to continue), the session ends. Use interactive commands like `bash` or `claude` (without `-c`) for persistent sessions.
+
 ### Multiple Sessions in One Sprite
 
 Run multiple independent commands in the same sprite simultaneously:
