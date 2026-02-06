@@ -107,16 +107,29 @@ setup_ssh_server() {
 
     info "Setting up SSH server in sprite..."
 
-    # Check if SSH server is already installed
-    if sprite exec -s "$sprite_name" command -v sshd >/dev/null 2>&1; then
+    # Check if SSH server is already installed.
+    # Use test -x on the standard path since /usr/sbin may not be in PATH.
+    if sprite exec -s "$sprite_name" test -x /usr/sbin/sshd 2>/dev/null; then
         info "SSH server already installed"
     else
         info "Installing OpenSSH server..."
-        sprite exec -s "$sprite_name" sh -c '
-            export DEBIAN_FRONTEND=noninteractive
-            sudo apt-get update -qq >/dev/null 2>&1
-            sudo apt-get install -y -qq openssh-server >/dev/null 2>&1
-        ' || error "Failed to install SSH server"
+        local install_attempts=0
+        local max_install_attempts=3
+        while [[ $install_attempts -lt $max_install_attempts ]]; do
+            if sprite exec -s "$sprite_name" sh -c '
+                export DEBIAN_FRONTEND=noninteractive
+                sudo apt-get update -qq >/dev/null 2>&1
+                sudo apt-get install -y -qq openssh-server >/dev/null 2>&1
+            '; then
+                break
+            fi
+            install_attempts=$((install_attempts + 1))
+            if [[ $install_attempts -ge $max_install_attempts ]]; then
+                error "Failed to install SSH server after $max_install_attempts attempts"
+            fi
+            warn "SSH server install attempt $install_attempts failed, retrying..."
+            sleep 2
+        done
     fi
 
     # Configure SSH for security
