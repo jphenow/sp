@@ -147,6 +147,21 @@ When a sprite becomes cluttered:
 - The `sp` tool makes this trivial
 - Fresh clones ensure clean state
 
+### 6. Use `.sprite` Files for Consistency
+If you run `sprite use <name>` in a directory, it creates a `.sprite` file that `sp` will respect:
+```bash
+# Set a specific sprite for this directory
+sprite use my-custom-sprite
+
+# Now sp will always use that sprite, regardless of git remote or directory name
+sp .
+```
+
+This is useful when:
+- You want a custom sprite name
+- Multiple directories should share the same sprite
+- The auto-detected name isn't what you want
+
 ## tmux Session Workflows
 
 ### Detach and Reattach
