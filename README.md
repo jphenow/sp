@@ -193,13 +193,30 @@ sp . --sync
 
 ## Sprite Naming Convention
 
-Sprites are automatically named based on the source:
+Sprites are named using the following priority order:
 
-**GitHub repositories** use the pattern `gh-owner--repo`:
+### 1. `.sprite` file (highest priority)
+
+If a `.sprite` file exists in the current directory, `sp` reads the sprite name from it:
+
+```json
+{
+  "organization": "your-org",
+  "sprite": "gh-owner--repo"
+}
+```
+
+This is useful when you want to use a specific sprite that differs from the auto-detected name, or when working with `sprite use` to set a default.
+
+### 2. GitHub remote
+
+If the current directory is a git repo with a GitHub remote, the sprite is named `gh-owner--repo`:
 - `superfly/flyctl` → `gh-superfly--flyctl`
 - `anthropics/claude-code` → `gh-anthropics--claude-code`
 
-**Local directories** (no GitHub repo) use the pattern `local-<dirname>`:
+### 3. Directory name (fallback)
+
+If no `.sprite` file exists and no GitHub remote is detected, the directory name is used with a `local-` prefix:
 - `~/projects/my-app` → `local-my-app`
 - `~/scratch/experiment` → `local-experiment`
 
