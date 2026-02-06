@@ -111,6 +111,16 @@ Each `sp` invocation runs its command inside a persistent tmux session within th
 - **Persistence** — if you disconnect or your terminal closes, the session keeps running. Reconnecting with the same `sp` command reattaches to the existing session.
 - **Detach/reattach** — press `Ctrl-b d` inside tmux to detach without stopping the session. Run `sp` again to reattach.
 - **Multiple sessions** — use `--name` to run multiple independent sessions in the same sprite (e.g., `claude` + `bash` side by side).
+- **Command exits = session exits** — if the command finishes (e.g., `claude -c` with no conversation), the session ends. Use interactive commands for persistence.
+
+### Help
+
+```bash
+sp --help
+sp -h
+```
+
+Shows full usage information including all options and examples.
 
 ### Sprite Info (`sp info`)
 
