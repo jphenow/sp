@@ -228,14 +228,22 @@ start_sprite_proxy() {
     local lock_dir="/tmp"
     local lock_file="${lock_dir}/sprite-sync-${sprite_name}.port"
 
-    # If a lock file exists from a previous run of this sprite, check if it's stale
+    # If a lock file exists from a previous run of this sprite, check if it's stale.
+    # kill -0 alone isn't enough — a recycled PID would pass. Verify the process
+    # is actually an sp script by checking its command line.
     if [[ -f "$lock_file" ]]; then
         local old_port old_pid
         read -r old_port old_pid < "$lock_file" 2>/dev/null || true
         if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            error "Another sync session for sprite '${sprite_name}' is already running (PID ${old_pid}, port ${old_port})."
+            local pid_cmd
+            pid_cmd=$(ps -p "$old_pid" -o command= 2>/dev/null || echo "")
+            if [[ "$pid_cmd" == *"sp"* ]]; then
+                warn "Another sync session is already active (PID ${old_pid}, port ${old_port}), reusing"
+                return 0
+            fi
+            # PID is alive but not an sp process — stale lock from recycled PID
+            warn "Removing stale lock file (PID ${old_pid} is not an sp process)"
         fi
-        # Previous owner is dead — stale lock. Clean up and continue.
         rm -f "$lock_file"
     fi
 
@@ -873,9 +881,15 @@ handle_repo_mode() {
     local is_new=false
     if ! sprite_exists "$sprite_name"; then
         info "Creating new sprite: $sprite_name"
-        sprite create -skip-console "$sprite_name"
-        wait_for_sprite "$sprite_name"
-        is_new=true
+        local create_output
+        if create_output=$(sprite create -skip-console "$sprite_name" 2>&1); then
+            wait_for_sprite "$sprite_name"
+            is_new=true
+        elif echo "$create_output" | grep -qi "already exists"; then
+            info "Sprite already exists: $sprite_name"
+        else
+            error "Failed to create sprite: $create_output"
+        fi
     else
         info "Sprite already exists: $sprite_name"
     fi
@@ -995,9 +1009,15 @@ handle_current_dir_mode() {
     local is_new=false
     if ! sprite_exists "$sprite_name"; then
         info "Creating new sprite: $sprite_name"
-        sprite create -skip-console "$sprite_name"
-        wait_for_sprite "$sprite_name"
-        is_new=true
+        local create_output
+        if create_output=$(sprite create -skip-console "$sprite_name" 2>&1); then
+            wait_for_sprite "$sprite_name"
+            is_new=true
+        elif echo "$create_output" | grep -qi "already exists"; then
+            info "Sprite already exists: $sprite_name"
+        else
+            error "Failed to create sprite: $create_output"
+        fi
     else
         info "Using existing sprite: $sprite_name"
     fi
@@ -1021,8 +1041,27 @@ handle_current_dir_mode() {
 
     # Setup bidirectional sync if enabled
     if [[ "$SYNC_ENABLED" == "true" ]]; then
-        # Derive a per-sprite SSH port so concurrent sync sessions don't collide
         SSH_PORT=$(sprite_ssh_port "$sprite_name")
+        local lock_file="/tmp/sprite-sync-${sprite_name}.port"
+
+        # If another sp process is already syncing this sprite, skip sync setup.
+        # The existing session handles bidirectional sync — we just need to connect.
+        if [[ -f "$lock_file" ]]; then
+            local old_port old_pid
+            read -r old_port old_pid < "$lock_file" 2>/dev/null || true
+            if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+                local pid_cmd
+                pid_cmd=$(ps -p "$old_pid" -o command= 2>/dev/null || echo "")
+                if [[ "$pid_cmd" == *"sp"* ]]; then
+                    info "Sync already active from another session (PID ${old_pid}), skipping sync setup"
+                    # Disable sync so cleanup doesn't tear down the other session
+                    SYNC_ENABLED=false
+                fi
+            fi
+        fi
+    fi
+
+    if [[ "$SYNC_ENABLED" == "true" ]]; then
         SYNC_SPRITE_NAME="$sprite_name"
         info "Setting up bidirectional sync (port ${SSH_PORT})..."
 
