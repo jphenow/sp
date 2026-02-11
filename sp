@@ -125,7 +125,8 @@ setup_ssh_server() {
             fi
             install_attempts=$((install_attempts + 1))
             if [[ $install_attempts -ge $max_install_attempts ]]; then
-                error "Failed to install SSH server after $max_install_attempts attempts"
+                warn "Failed to install SSH server after $max_install_attempts attempts"
+                return 1
             fi
             warn "SSH server install attempt $install_attempts failed, retrying..."
             sleep 2
@@ -212,7 +213,8 @@ ensure_ssh_server_running() {
         sprite exec -s "$sprite_name" sudo /usr/sbin/sshd -t 2>&1 || true
         info "Checking SSH service status:"
         sprite exec -s "$sprite_name" sh -c 'sudo systemctl status ssh 2>&1 || sudo service ssh status 2>&1 || cat /tmp/sshd.log 2>&1' || true
-        error "SSH server did not start successfully"
+        warn "SSH server did not start successfully"
+        return 1
     fi
 
     info "SSH server started successfully"
@@ -254,7 +256,8 @@ start_sprite_proxy() {
     while lsof -i ":${port}" >/dev/null 2>&1; do
         offset=$((offset + 1))
         if [[ $offset -ge $max_offset ]]; then
-            error "Could not find an available port in range ${base_port}-$((base_port + max_offset - 1)) for sprite '${sprite_name}'."
+            warn "Could not find an available port in range ${base_port}-$((base_port + max_offset - 1)) for sprite '${sprite_name}'."
+            return 1
         fi
         port=$((base_port + offset))
     done
@@ -283,7 +286,8 @@ start_sprite_proxy() {
             warn "Proxy process died unexpectedly. Log:"
             cat "$proxy_log" >&2
             rm -f "$proxy_log"
-            error "Port forwarding failed to start"
+            warn "Port forwarding failed to start"
+            return 1
         fi
 
         # Check if port is actually listening using lsof
@@ -302,7 +306,8 @@ start_sprite_proxy() {
     warn "Proxy did not become ready. Log:"
     cat "$proxy_log" >&2
     rm -f "$proxy_log"
-    error "Port forwarding failed to start"
+    warn "Port forwarding failed to start"
+    return 1
 }
 
 # Test SSH connectivity through the proxy
@@ -411,7 +416,8 @@ EOF
         --ignore "._*" \
         "$local_dir" \
         "sprite-mutagen-${sprite_name}:${remote_dir}" || {
-        error "Failed to create Mutagen sync session"
+        warn "Failed to create Mutagen sync session"
+        return 1
     }
 
     info "Waiting for initial sync to complete..."
@@ -430,9 +436,11 @@ EOF
             return 0
         fi
 
-        # Check for errors
-        if echo "$status" | grep -qi "error"; then
-            error "Sync encountered an error: $status"
+        # Check for errors - only match "Status:" lines containing error,
+        # not "Last error:" which is historical and may be from a stale session
+        if echo "$status" | grep -q "Status:.*[Ee]rror"; then
+            warn "Sync encountered an error: $status"
+            return 1
         fi
 
         # Show progress every 5 seconds
