@@ -407,7 +407,6 @@ EOF
     mutagen sync create \
         --name "$SYNC_SESSION_NAME" \
         --sync-mode two-way-resolved \
-        --ignore-vcs \
         --ignore "node_modules" \
         --ignore ".next" \
         --ignore "dist" \
