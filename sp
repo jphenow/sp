@@ -375,9 +375,9 @@ start_mutagen_sync() {
     info "Local: $local_dir"
     info "Remote: sprite@localhost:$remote_dir"
 
-    # Check if session already exists
-    if mutagen sync list 2>/dev/null | grep -q "^${SYNC_SESSION_NAME}$"; then
-        warn "Sync session already exists, terminating old session..."
+    # Terminate any existing sessions with this name (stale or otherwise)
+    if mutagen sync list 2>/dev/null | grep -q "Name: ${SYNC_SESSION_NAME}$"; then
+        warn "Sync session already exists, terminating old session(s)..."
         mutagen sync terminate "$SYNC_SESSION_NAME" 2>/dev/null || true
         sleep 1
     fi
