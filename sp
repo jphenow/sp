@@ -1044,8 +1044,16 @@ handle_current_dir_mode() {
         setup_git_config "$sprite_name"
     fi
 
-    # Sync local directory to sprite (initial one-way sync)
-    sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
+    # Sync local directory to sprite (initial one-way sync).
+    # Skip on reconnect when --sync is enabled and the directory already exists —
+    # mutagen bidirectional sync will reconcile differences, and a tar upload
+    # would overwrite files modified on the sprite side (e.g. by claude or builds).
+    if [[ "$SYNC_ENABLED" == "true" ]] && \
+       sprite exec -s "$sprite_name" test -d "/home/sprite/$target_dir_name" 2>/dev/null; then
+        info "Directory already exists on sprite, skipping one-way sync (mutagen will handle it)"
+    else
+        sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
+    fi
 
     # Setup bidirectional sync if enabled
     if [[ "$SYNC_ENABLED" == "true" ]]; then
@@ -1073,26 +1081,42 @@ handle_current_dir_mode() {
         SYNC_SPRITE_NAME="$sprite_name"
         info "Setting up bidirectional sync (port ${SSH_PORT})..."
 
+        # Sync setup is non-fatal: if it fails, we still open the tmux session
+        # so the user can reconnect to running processes (e.g. claude, builds).
+        local sync_ok=true
+
         # Setup SSH server in sprite
-        setup_ssh_server "$sprite_name"
+        setup_ssh_server "$sprite_name" || sync_ok=false
 
         # Ensure SSH server is running
-        ensure_ssh_server_running "$sprite_name"
+        if [[ "$sync_ok" == "true" ]]; then
+            ensure_ssh_server_running "$sprite_name" || sync_ok=false
+        fi
 
         # Start sprite proxy for SSH port forwarding
-        start_sprite_proxy "$sprite_name"
+        if [[ "$sync_ok" == "true" ]]; then
+            start_sprite_proxy "$sprite_name" || sync_ok=false
+        fi
 
         # Test SSH connection
-        if ! test_ssh_connection; then
-            error "Failed to establish SSH connection to sprite. Cannot start Mutagen sync."
+        if [[ "$sync_ok" == "true" ]] && ! test_ssh_connection; then
+            sync_ok=false
         fi
 
         # Start Mutagen sync
-        start_mutagen_sync "$sprite_name" "$current_dir" "/home/sprite/$target_dir_name"
+        if [[ "$sync_ok" == "true" ]]; then
+            start_mutagen_sync "$sprite_name" "$current_dir" "/home/sprite/$target_dir_name" || sync_ok=false
+        fi
 
-        info ""
-        info "✓ Sync is active - changes will be bidirectional"
-        info ""
+        if [[ "$sync_ok" == "true" ]]; then
+            info ""
+            info "✓ Sync is active - changes will be bidirectional"
+            info ""
+        else
+            warn "Bidirectional sync failed to start, but continuing to open session..."
+            warn "File changes will not sync automatically. Use 'sp . --sync' to retry."
+            SYNC_ENABLED=false
+        fi
     fi
 
     # Open session in the synced directory
