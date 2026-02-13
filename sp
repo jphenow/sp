@@ -345,6 +345,72 @@ has_active_sync() {
     return 0
 }
 
+# Path to the local state file tracking whether a sprite's one-time setup is done.
+# Lives in /tmp so it resets on reboot.
+sprite_state_file() {
+    echo "/tmp/sprite-ready-${1}"
+}
+
+# Check if a sprite was previously set up by sp.
+# Returns 1 (not ready) if setup.conf has been modified since last setup.
+is_sprite_ready() {
+    local state_file
+    state_file=$(sprite_state_file "$1")
+    [[ -f "$state_file" ]] || return 1
+
+    # Re-run setup if the user has edited setup.conf since last run
+    if [[ -f "$SPRITE_SETUP_CONF" ]] && [[ "$SPRITE_SETUP_CONF" -nt "$state_file" ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Mark a sprite as fully set up after first-time configuration.
+mark_sprite_ready() {
+    touch "$(sprite_state_file "$1")"
+}
+
+# Check sprite state in a single remote call instead of 3+ sequential ones.
+# Gathers auth, target directory existence, and SSH readiness in one roundtrip.
+# Sets globals: BATCH_AUTH, BATCH_DIR, BATCH_SSHD_READY (each "y" or "n").
+batch_check_sprite() {
+    local sprite_name="$1"
+    local target_dir="$2"
+
+    local check_script=""
+    check_script+="echo auth=\$(test -f ~/.ssh/id_ed25519 && echo y || echo n);"
+    check_script+=" echo dir=\$(test -d '${target_dir}' && echo y || echo n);"
+
+    if [[ -f "$SSH_PUB_KEY" ]]; then
+        local pubkey_content
+        pubkey_content=$(cat "$SSH_PUB_KEY")
+        check_script+=" echo sshd=\$(pgrep -x sshd >/dev/null 2>&1 && grep -qF '${pubkey_content}' ~/.ssh/authorized_keys 2>/dev/null && echo y || echo n)"
+    else
+        check_script+=" echo sshd=n"
+    fi
+
+    local output
+    if ! output=$(sprite exec -s "$sprite_name" sh -c "$check_script" 2>/dev/null); then
+        BATCH_AUTH="n"
+        BATCH_DIR="n"
+        BATCH_SSHD_READY="n"
+        return 1
+    fi
+
+    BATCH_AUTH="n"
+    BATCH_DIR="n"
+    BATCH_SSHD_READY="n"
+
+    while IFS= read -r result_line; do
+        case "$result_line" in
+            auth=*) BATCH_AUTH="${result_line#auth=}" ;;
+            dir=*) BATCH_DIR="${result_line#dir=}" ;;
+            sshd=*) BATCH_SSHD_READY="${result_line#sshd=}" ;;
+        esac
+    done <<< "$output"
+}
+
 # Start sprite proxy for SSH port forwarding.
 # Resolves port collisions by scanning nearby ports when the deterministic port
 # is occupied. The proxy is disowned so it survives this process exiting —
