@@ -560,7 +560,7 @@ EOF
     warn "Initial sync did not complete in expected time, but continuing..."
 }
 
-# Stop Mutagen sync session
+# Stop Mutagen sync session and clean up SSH config
 stop_mutagen_sync() {
     if [[ -n "$SYNC_SESSION_NAME" ]]; then
         info "Stopping Mutagen sync..."
@@ -719,12 +719,14 @@ sanitize_session_name() {
 }
 
 # Return the tmux session name to use.
-# Uses SESSION_NAME if explicitly set, otherwise derives from EXEC_CMD.
+# Uses SESSION_NAME if explicitly set, otherwise derives from the first word
+# of EXEC_CMD (the command name, ignoring arguments).
 derive_session_name() {
     if [[ -n "$SESSION_NAME" ]]; then
         sanitize_session_name "$SESSION_NAME"
     else
-        sanitize_session_name "$EXEC_CMD"
+        local cmd_name="${EXEC_CMD%% *}"
+        sanitize_session_name "$cmd_name"
     fi
 }
 
@@ -826,6 +828,82 @@ handle_sessions() {
     fi
 
     sprite exec -s "$RESOLVED_SPRITE_NAME" tmux list-sessions 2>/dev/null || echo "No active tmux sessions"
+}
+
+# Handle 'sp conf' subcommand — manage ~/.config/sprite/setup.conf
+handle_conf() {
+    local action="${1:-}"
+
+    case "$action" in
+        init)
+            conf_init
+            ;;
+        edit)
+            conf_edit
+            ;;
+        show)
+            conf_show
+            ;;
+        *)
+            cat <<'EOF'
+Usage: sp conf {init|edit|show}
+
+  init   Create setup.conf with a starter template
+  edit   Open setup.conf in $EDITOR
+  show   Print setup.conf contents
+EOF
+            exit 1
+            ;;
+    esac
+}
+
+# Create ~/.config/sprite/setup.conf with a starter template
+conf_init() {
+    local conf_dir
+    conf_dir=$(dirname "$SPRITE_SETUP_CONF")
+    mkdir -p "$conf_dir"
+
+    if [[ -f "$SPRITE_SETUP_CONF" ]]; then
+        warn "Config already exists: $SPRITE_SETUP_CONF"
+        echo "Use 'sp conf edit' to modify it."
+        return 0
+    fi
+
+    cat > "$SPRITE_SETUP_CONF" <<'TMPL'
+# Sprite setup configuration
+# Files and commands here run automatically when connecting to any sprite.
+
+[files]
+# Paths to copy to the sprite. ~ expands to $HOME locally, /home/sprite remotely.
+# Files are only copied if they don't already exist on the sprite.
+# ~/.local/bin/claude
+# ~/.config/opencode/config.toml
+
+[commands]
+# condition :: command
+# Command runs on the sprite when condition exits non-zero (i.e. thing is missing).
+# ! command -v opencode :: curl -fsSL https://opencode.ai/install | bash &
+TMPL
+
+    info "Created $SPRITE_SETUP_CONF"
+    echo "Edit with: sp conf edit"
+}
+
+# Open setup.conf in the user's editor
+conf_edit() {
+    if [[ ! -f "$SPRITE_SETUP_CONF" ]]; then
+        conf_init
+    fi
+    "${EDITOR:-vi}" "$SPRITE_SETUP_CONF"
+}
+
+# Print setup.conf contents
+conf_show() {
+    if [[ ! -f "$SPRITE_SETUP_CONF" ]]; then
+        echo "No config found. Create one with: sp conf init"
+        return 0
+    fi
+    cat "$SPRITE_SETUP_CONF"
 }
 
 # Derive a deterministic SSH port from the sprite name.
@@ -1031,6 +1109,9 @@ handle_repo_mode() {
         setup_sprite_auth "$sprite_name"
         setup_git_config "$sprite_name"
     fi
+
+    # Run user-defined setup (copy files, conditional commands)
+    run_sprite_setup "$sprite_name"
 
     # Sync repository
     sync_repo "$sprite_name" "$repo"
@@ -1279,6 +1360,9 @@ handle_current_dir_mode() {
         setup_git_config "$sprite_name"
     fi
 
+    # Run user-defined setup (copy files, conditional commands)
+    run_sprite_setup "$sprite_name"
+
     # Sync local directory to sprite (initial one-way sync).
     # Skip on reconnect when --sync is enabled and the directory already exists —
     # mutagen bidirectional sync will reconcile differences, and a tar upload
@@ -1292,65 +1376,55 @@ handle_current_dir_mode() {
 
     # Setup bidirectional sync if enabled
     if [[ "$SYNC_ENABLED" == "true" ]]; then
-        SSH_PORT=$(sprite_ssh_port "$sprite_name")
-        local lock_file="/tmp/sprite-sync-${sprite_name}.port"
-
-        # If another sp process is already syncing this sprite, skip sync setup.
-        # The existing session handles bidirectional sync — we just need to connect.
-        if [[ -f "$lock_file" ]]; then
-            local old_port old_pid
-            read -r old_port old_pid < "$lock_file" 2>/dev/null || true
-            if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-                local pid_cmd
-                pid_cmd=$(ps -p "$old_pid" -o command= 2>/dev/null || echo "")
-                if [[ "$pid_cmd" == *"sp"* ]]; then
-                    info "Sync already active from another session (PID ${old_pid}), skipping sync setup"
-                    # Disable sync so cleanup doesn't tear down the other session
-                    SYNC_ENABLED=false
-                fi
-            fi
-        fi
-    fi
-
-    if [[ "$SYNC_ENABLED" == "true" ]]; then
         SYNC_SPRITE_NAME="$sprite_name"
-        info "Setting up bidirectional sync (port ${SSH_PORT})..."
+        SSH_PORT=$(sprite_ssh_port "$sprite_name")
 
-        # Sync setup is non-fatal: if it fails, we still open the tmux session
-        # so the user can reconnect to running processes (e.g. claude, builds).
-        local sync_ok=true
-
-        # Setup SSH server in sprite
-        setup_ssh_server "$sprite_name" || sync_ok=false
-
-        # Ensure SSH server is running
-        if [[ "$sync_ok" == "true" ]]; then
-            ensure_ssh_server_running "$sprite_name" || sync_ok=false
-        fi
-
-        # Start sprite proxy for SSH port forwarding
-        if [[ "$sync_ok" == "true" ]]; then
-            start_sprite_proxy "$sprite_name" || sync_ok=false
-        fi
-
-        # Test SSH connection
-        if [[ "$sync_ok" == "true" ]] && ! test_ssh_connection; then
-            sync_ok=false
-        fi
-
-        # Start Mutagen sync
-        if [[ "$sync_ok" == "true" ]]; then
-            start_mutagen_sync "$sprite_name" "$current_dir" "/home/sprite/$target_dir_name" || sync_ok=false
-        fi
-
-        if [[ "$sync_ok" == "true" ]]; then
-            info ""
-            info "✓ Sync is active - changes will be bidirectional"
-            info ""
+        # Check if another sp session already has sync running for this sprite.
+        # If so, just register as a user and share the existing sync infra.
+        if has_active_sync "$sprite_name"; then
+            info "Sync already active, joining existing session (port ${SSH_PORT})"
+            register_sync_user "$sprite_name"
         else
-            warn "Bidirectional sync failed to start, but continuing to open session..."
-            warn "File changes will not sync automatically. Use 'sp . --sync' to retry."
-            SYNC_ENABLED=false
+            info "Setting up bidirectional sync (port ${SSH_PORT})..."
+
+            # Sync setup is non-fatal: if it fails, we still open the tmux session
+            # so the user can reconnect to running processes (e.g. claude, builds).
+            local sync_ok=true
+
+            # Setup SSH server in sprite
+            setup_ssh_server "$sprite_name" || sync_ok=false
+
+            # Ensure SSH server is running
+            if [[ "$sync_ok" == "true" ]]; then
+                ensure_ssh_server_running "$sprite_name" || sync_ok=false
+            fi
+
+            # Start sprite proxy for SSH port forwarding
+            if [[ "$sync_ok" == "true" ]]; then
+                start_sprite_proxy "$sprite_name" || sync_ok=false
+            fi
+
+            # Test SSH connection
+            if [[ "$sync_ok" == "true" ]] && ! test_ssh_connection; then
+                sync_ok=false
+            fi
+
+            # Start Mutagen sync
+            if [[ "$sync_ok" == "true" ]]; then
+                start_mutagen_sync "$sprite_name" "$current_dir" "/home/sprite/$target_dir_name" || sync_ok=false
+            fi
+
+            if [[ "$sync_ok" == "true" ]]; then
+                SYNC_OWNER=true
+                register_sync_user "$sprite_name"
+                info ""
+                info "✓ Sync is active - changes will be bidirectional"
+                info ""
+            else
+                warn "Bidirectional sync failed to start, but continuing to open session..."
+                warn "File changes will not sync automatically."
+                SYNC_SPRITE_NAME=""
+            fi
         fi
     fi
 
@@ -1385,6 +1459,11 @@ main() {
         --help|-h|help)
             usage
             ;;
+        conf)
+            shift
+            handle_conf "$@"
+            exit 0
+            ;;
         info|sessions)
             subcommand="$1"
             shift
@@ -1400,7 +1479,7 @@ main() {
             ;;
     esac
 
-    # Parse flags
+    # Parse flags. Everything after -- becomes the command to run.
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --help|-h)
@@ -1408,6 +1487,10 @@ main() {
                 ;;
             --sync)
                 SYNC_ENABLED=true
+                shift
+                ;;
+            --no-sync)
+                SYNC_ENABLED=false
                 shift
                 ;;
             --cmd)
@@ -1423,6 +1506,13 @@ main() {
                 fi
                 SESSION_NAME="$2"
                 shift 2
+                ;;
+            --)
+                shift
+                if [[ $# -gt 0 ]]; then
+                    EXEC_CMD="$*"
+                fi
+                break
                 ;;
             *)
                 error "Unknown flag: $1"
