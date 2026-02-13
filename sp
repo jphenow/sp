@@ -33,10 +33,10 @@ SSH_CONFIG_CHANGED=""
 
 # Sync configuration
 SYNC_ENABLED=true
-SYNC_OWNER=false
 PROXY_PID=""
 SYNC_SESSION_NAME=""
 SYNC_SPRITE_NAME=""
+SYNC_BG_PID=""
 SSH_PORT=""
 
 # Command and session configuration
@@ -679,6 +679,12 @@ cleanup_sync_session() {
     [[ -n "$SYNC_SPRITE_NAME" ]] || return 0
 
     echo ""  # Newline for cleaner output
+
+    # Kill background sync process if still running
+    if [[ -n "$SYNC_BG_PID" ]] && kill -0 "$SYNC_BG_PID" 2>/dev/null; then
+        kill "$SYNC_BG_PID" 2>/dev/null || true
+        wait "$SYNC_BG_PID" 2>/dev/null || true
+    fi
 
     if unregister_sync_user "$SYNC_SPRITE_NAME"; then
         # We're the last user — tear everything down
