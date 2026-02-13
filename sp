@@ -243,34 +243,95 @@ ensure_ssh_server_running() {
     info "SSH server started successfully"
 }
 
-# Start sprite proxy for SSH port forwarding
+# Return the lock directory path for a sprite's sync session.
+# The lock dir holds: port (proxy port), proxy.pid, and per-user PID files.
+sync_lock_dir() {
+    echo "/tmp/sprite-sync-${1}.d"
+}
+
+# Register this sp process as a sync user for reference counting.
+# Multiple sp processes can share one proxy + mutagen session.
+register_sync_user() {
+    local sprite_name="$1"
+    local lock_dir
+    lock_dir=$(sync_lock_dir "$sprite_name")
+    mkdir -p "$lock_dir"
+    echo "$$" > "${lock_dir}/$$.user"
+}
+
+# Unregister this process and check if any other sp processes remain.
+# Returns 0 if we're the last user (caller should tear down sync).
+# Returns 1 if others are still alive (leave sync running).
+unregister_sync_user() {
+    local sprite_name="$1"
+    local lock_dir
+    lock_dir=$(sync_lock_dir "$sprite_name")
+    rm -f "${lock_dir}/$$.user" 2>/dev/null
+
+    for pid_file in "${lock_dir}"/*.user; do
+        [[ -f "$pid_file" ]] || continue
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            return 1  # Another user is still alive
+        fi
+        # Stale PID file — clean it up
+        rm -f "$pid_file" 2>/dev/null
+    done
+
+    return 0  # We're the last user
+}
+
+# Check if sync infrastructure (proxy + mutagen) is already running for a sprite.
+# If healthy, sets SSH_PORT from the existing proxy and returns 0.
+has_active_sync() {
+    local sprite_name="$1"
+    local lock_dir
+    lock_dir=$(sync_lock_dir "$sprite_name")
+    local port_file="${lock_dir}/port"
+    local proxy_pid_file="${lock_dir}/proxy.pid"
+
+    # Need both a port file and a live proxy
+    [[ -f "$port_file" ]] || return 1
+    [[ -f "$proxy_pid_file" ]] || return 1
+
+    local port proxy_pid
+    port=$(cat "$port_file" 2>/dev/null || echo "")
+    proxy_pid=$(cat "$proxy_pid_file" 2>/dev/null || echo "")
+
+    [[ -n "$port" ]] || return 1
+    [[ -n "$proxy_pid" ]] || return 1
+
+    # Proxy process must be alive
+    if ! kill -0 "$proxy_pid" 2>/dev/null; then
+        return 1
+    fi
+
+    # Port must be listening
+    if ! lsof -i ":${port}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # Mutagen session should exist (any status is OK — it may be scanning)
+    local sync_name="sprite-${sprite_name}"
+    if ! mutagen sync list 2>/dev/null | grep -q "Name: ${sync_name}$"; then
+        return 1
+    fi
+
+    SSH_PORT="$port"
+    return 0
+}
+
+# Start sprite proxy for SSH port forwarding.
 # Resolves port collisions by scanning nearby ports when the deterministic port
-# is occupied. Writes a lock file so stale sessions can be detected.
+# is occupied. The proxy is disowned so it survives this process exiting —
+# cleanup is handled explicitly by the last sync user.
 start_sprite_proxy() {
     local sprite_name="$1"
     local base_port="$SSH_PORT"
     local port="$base_port"
-    local lock_dir="/tmp"
-    local lock_file="${lock_dir}/sprite-sync-${sprite_name}.port"
-
-    # If a lock file exists from a previous run of this sprite, check if it's stale.
-    # kill -0 alone isn't enough — a recycled PID would pass. Verify the process
-    # is actually an sp script by checking its command line.
-    if [[ -f "$lock_file" ]]; then
-        local old_port old_pid
-        read -r old_port old_pid < "$lock_file" 2>/dev/null || true
-        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            local pid_cmd
-            pid_cmd=$(ps -p "$old_pid" -o command= 2>/dev/null || echo "")
-            if [[ "$pid_cmd" == *"sp"* ]]; then
-                warn "Another sync session is already active (PID ${old_pid}, port ${old_port}), reusing"
-                return 0
-            fi
-            # PID is alive but not an sp process — stale lock from recycled PID
-            warn "Removing stale lock file (PID ${old_pid} is not an sp process)"
-        fi
-        rm -f "$lock_file"
-    fi
+    local lock_dir
+    lock_dir=$(sync_lock_dir "$sprite_name")
 
     # Find an available port, starting from the deterministic base.
     # Tries up to 20 consecutive ports to handle hash collisions.
