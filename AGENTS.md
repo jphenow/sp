@@ -100,13 +100,21 @@ The `sp` tool automatically configures:
 - Git configuration
 - Shell environment variables
 
+### Setup Config
+Files and commands in `~/.config/sprite/setup.conf` run on first connect:
+- `[files]` — copy dotfiles, configs, and tools to the sprite
+- `[commands]` — install dependencies when missing
+- Use `source -> dest` syntax for files where local and remote paths differ
+
+Manage with `sp conf init`, `sp conf edit`, `sp conf show`.
+
 ### Syncing Local Changes
-Use `sp .` to work with uncommitted local changes:
+Use `sp .` to work with uncommitted local changes. Bidirectional sync is on by default:
 ```bash
 cd ~/projects/my-app
 # Make some local changes
 sp .
-# Claude can now work with your uncommitted changes in the sprite
+# Changes sync both ways — local edits appear in sprite, sprite edits appear locally
 ```
 
 ## Best Practices
@@ -189,30 +197,30 @@ Run multiple independent commands in the same sprite simultaneously:
 
 ```bash
 # Terminal 1: run claude
-sp owner/repo --name claude-main
+sp owner/repo -- claude --name claude-main
 
 # Terminal 2: open a bash shell for manual debugging
-sp owner/repo --cmd bash --name debug
+sp owner/repo --name debug
 
 # Terminal 3: run tests in a loop
-sp owner/repo --cmd bash --name tests
+sp owner/repo --name tests
 ```
 
 Each `--name` creates a separate tmux session. Use `sp sessions owner/repo` to list them all.
 
 ### Custom Commands
 
-Use `--cmd` to run something other than `claude`:
+Use `--` to run something other than the default `bash`:
 
 ```bash
-# Drop into a shell
-sp . --cmd bash
+# Open claude
+sp . -- claude
 
 # Open an editor
-sp owner/repo --cmd vim
+sp owner/repo -- vim
 
-# Run any command
-sp . --cmd "htop"
+# Run a command with flags
+sp . -- claude -f foo bar baz
 ```
 
 ## Common Workflows
