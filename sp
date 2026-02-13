@@ -1274,6 +1274,9 @@ setup_git_config() {
 }
 
 # Copy a single file to the sprite, expanding ~ for local and remote paths.
+# Supports two formats:
+#   ~/.config/foo        — same path on local and sprite (~ expands accordingly)
+#   ~/.config/foo -> ~/bar  — different local source and remote destination
 # Skips if the file already exists on the sprite.
 # Preserves executable permission.
 copy_setup_file() {
@@ -1283,9 +1286,21 @@ copy_setup_file() {
     # Trim whitespace
     file_path=$(echo "$file_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
-    # Expand ~ for local and remote paths
-    local local_path="${file_path/#\~/$HOME}"
-    local remote_path="${file_path/#\~//home/sprite}"
+    local local_path remote_path
+
+    # Support "source -> dest" syntax for different local/remote paths
+    if [[ "$file_path" == *" -> "* ]]; then
+        local source="${file_path%% -> *}"
+        local dest="${file_path##* -> }"
+        source=$(echo "$source" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        dest=$(echo "$dest" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        local_path="${source/#\~/$HOME}"
+        remote_path="${dest/#\~//home/sprite}"
+    else
+        # Expand ~ for local and remote paths
+        local_path="${file_path/#\~/$HOME}"
+        remote_path="${file_path/#\~//home/sprite}"
+    fi
 
     if [[ ! -f "$local_path" ]]; then
         warn "Setup file not found locally: $local_path"
