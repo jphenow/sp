@@ -316,12 +316,18 @@ sp .
 # Quick access to any public GitHub repo
 sp torvalds/linux
 
-# Open a bash shell in a sprite
-sp . --cmd bash
+# Open claude in a sprite
+sp . -- claude
 
-# Run claude and bash simultaneously in the same sprite
-sp . --name claude-session        # Terminal 1
-sp . --cmd bash --name debug      # Terminal 2
+# Run claude with flags
+sp . -- claude -f foo bar baz
+
+# Run multiple sessions in the same sprite
+sp . -- claude --name claude-session   # Terminal 1
+sp . --name debug                      # Terminal 2
+
+# Disable file sync
+sp . --no-sync
 
 # Check sprite info before connecting
 sp info owner/repo
@@ -329,8 +335,9 @@ sp info owner/repo
 # List active tmux sessions
 sp sessions .
 
-# Sync + custom session name
-sp . --sync --cmd claude --name feature
+# Manage setup config
+sp conf init
+sp conf edit
 ```
 
 ## License
