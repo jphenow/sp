@@ -8,9 +8,9 @@ A command-line tool for managing Fly.io sprites with GitHub repositories or loca
 - Works with any local directory, even without a GitHub repository
 - Copies Claude authentication tokens and SSH keys to sprites
 - Syncs repositories with `git pull --recurse-submodules`
-- Opens Claude Code CLI sessions in the repository directory
-- Supports working with local repository changes via directory sync
-- **NEW:** Bidirectional file syncing with Mutagen (optional `--sync` flag)
+- Opens persistent tmux sessions in the repository directory
+- Bidirectional file syncing with Mutagen (on by default, disable with `--no-sync`)
+- Configurable setup: auto-copy files and run commands on first connect via `~/.config/sprite/setup.conf`
 
 ## Prerequisites
 
@@ -19,7 +19,7 @@ A command-line tool for managing Fly.io sprites with GitHub repositories or loca
 - Claude Code CLI (required for opening Claude sessions)
 - SSH key at `~/.ssh/id_ed25519` (for GitHub authentication)
 - Claude Code OAuth token (will be generated automatically on first run via `claude setup-token`)
-- [Mutagen](https://mutagen.io/) (optional, required only for `--sync` flag): `brew install mutagen`
+- [Mutagen](https://mutagen.io/) (required for bidirectional sync, disable with `--no-sync`): `brew install mutagen`
 
 ## Installation
 
@@ -50,14 +50,15 @@ alias sp='/path/to/sprite-repo/sp'
 ### Work with a GitHub Repository
 
 ```bash
-sp owner/repo [--sync] [--cmd CMD] [--name NAME]
+sp owner/repo [--no-sync] [--name NAME] [-- COMMAND...]
 ```
 
 This will:
 1. Create a sprite named `gh-owner--repo` (if it doesn't exist)
-2. Copy your Claude config and SSH keys to the sprite
+2. Set up authentication, git config, and run setup.conf entries
 3. Clone the repository (or pull latest changes if already cloned)
-4. Open a tmux session running the command (default: `claude`) in the repository directory
+4. Start bidirectional file sync via Mutagen
+5. Open a tmux session running the command (default: `bash`) in the repository directory
 
 Example:
 ```bash
@@ -68,40 +69,44 @@ sp superfly/flyctl
 
 ```bash
 cd /path/to/your/project
-sp . [--sync] [--cmd CMD] [--name NAME]
+sp . [--no-sync] [--name NAME] [-- COMMAND...]
 ```
 
 This will:
 1. Detect the GitHub repository from the current directory's git remote (if available)
 2. If no GitHub repo is found, use the directory name with a `local-` prefix
 3. Create or connect to the appropriate sprite
-4. Sync your local directory contents to the sprite (excluding `.git/objects`, `node_modules`, etc.)
-5. Open a tmux session running the command (default: `claude`) in the synced directory
+4. Sync your local directory contents to the sprite
+5. Open a tmux session running the command (default: `bash`) in the synced directory
 
 Works with any directory -- no GitHub repository required.
 
-### Custom Commands (`--cmd`)
+### Custom Commands (`--`)
 
-By default, `sp` launches `claude` inside the sprite. Use `--cmd` to run a different command:
+By default, `sp` launches `bash` inside the sprite. Use `--` to run a different command:
 
 ```bash
-# Open a bash shell instead of claude
-sp . --cmd bash
+# Open claude instead of bash
+sp . -- claude
 
-# Run a specific tool
+# Run a command with flags
+sp . -- claude -f foo bar baz
+
+# Alternative: use --cmd
 sp owner/repo --cmd vim
 ```
 
 ### Custom Session Names (`--name`)
 
-By default, the tmux session is named after the command (e.g., `claude`). Use `--name` to set a custom session name:
+By default, the tmux session is named after the command (e.g., `bash`). Use `--name` to set a custom session name:
 
 ```bash
-# Launch claude in a session named "feature"
+# Launch bash in a session named "feature"
 sp . --name feature
 
-# Launch bash in a session named "debug"
-sp . --cmd bash --name debug
+# Launch claude and bash simultaneously in the same sprite
+sp . -- claude --name claude-session   # Terminal 1
+sp . --name debug                      # Terminal 2
 ```
 
 ### tmux Session Behavior

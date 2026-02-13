@@ -12,14 +12,14 @@ The `sp` tool creates isolated Fly.io sprite environments with Claude Code pre-c
 
 ## Quick Start with Claude Code
 
-Once you've connected to a sprite using `sp owner/repo` or `sp .`, Claude Code is already authenticated and ready to use. You can immediately start working with Claude on your code.
+Once you've connected to a sprite using `sp owner/repo` or `sp .`, authentication is set up and files are synced. Launch Claude Code with `-- claude`:
 
 ```bash
-# Connect to a repository
-sp superfly/flyctl
+# Connect to a repository and open claude
+sp superfly/flyctl -- claude
 
-# Claude Code is automatically opened in the repository directory
-# Start coding!
+# Or open bash first (default), then run claude manually
+sp superfly/flyctl
 ```
 
 ## Recommended Agent Patterns
