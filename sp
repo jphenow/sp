@@ -1063,6 +1063,117 @@ setup_git_config() {
     fi
 }
 
+# Copy a single file to the sprite, expanding ~ for local and remote paths.
+# Skips if the file already exists on the sprite.
+# Preserves executable permission.
+copy_setup_file() {
+    local sprite_name="$1"
+    local file_path="$2"
+
+    # Trim whitespace
+    file_path=$(echo "$file_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    # Expand ~ for local and remote paths
+    local local_path="${file_path/#\~/$HOME}"
+    local remote_path="${file_path/#\~//home/sprite}"
+
+    if [[ ! -f "$local_path" ]]; then
+        warn "Setup file not found locally: $local_path"
+        return 0
+    fi
+
+    # Skip if file already exists on sprite
+    if sprite exec -s "$sprite_name" test -f "$remote_path" 2>/dev/null; then
+        return 0
+    fi
+
+    # Ensure destination directory exists
+    local remote_dir
+    remote_dir=$(dirname "$remote_path")
+    sprite exec -s "$sprite_name" mkdir -p "$remote_dir" 2>/dev/null || true
+
+    info "Copying $file_path to sprite..."
+    if [[ -x "$local_path" ]]; then
+        sprite exec -s "$sprite_name" -file "${local_path}:${remote_path}" \
+            chmod +x "$remote_path" || warn "Failed to copy $file_path"
+    else
+        sprite exec -s "$sprite_name" -file "${local_path}:${remote_path}" \
+            true || warn "Failed to copy $file_path"
+    fi
+}
+
+# Run a conditional setup command on the sprite.
+# Format: "condition :: command"
+# The command runs only when the condition fails (non-zero exit) on the sprite.
+run_setup_command() {
+    local sprite_name="$1"
+    local line="$2"
+
+    # Split on " :: " delimiter
+    local condition="${line%% :: *}"
+    local command="${line#* :: }"
+
+    if [[ "$condition" == "$line" ]] || [[ -z "$condition" ]] || [[ -z "$command" ]]; then
+        warn "Invalid setup command format (use 'condition :: command'): $line"
+        return 0
+    fi
+
+    # Check condition on sprite — run command only if condition fails
+    if ! sprite exec -s "$sprite_name" sh -c "$condition" >/dev/null 2>&1; then
+        info "Running: $command"
+        sprite exec -s "$sprite_name" sh -c "$command" 2>&1 || {
+            warn "Setup command failed: $command"
+        }
+    fi
+}
+
+# Run sprite setup from ~/.config/sprite/setup.conf.
+# Copies files and runs conditional commands defined in the config.
+#
+# Config format:
+#   [files]
+#   ~/.local/bin/claude
+#   ~/.config/something/config.toml
+#
+#   [commands]
+#   # condition :: command (command runs when condition fails on sprite)
+#   ! command -v opencode :: curl -fsSL https://opencode.ai/install | bash &
+run_sprite_setup() {
+    local sprite_name="$1"
+
+    if [[ ! -f "$SPRITE_SETUP_CONF" ]]; then
+        return 0
+    fi
+
+    local section=""
+    local has_work=false
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Detect section headers
+        if [[ "$line" =~ ^\[([a-z]+)\]$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        case "$section" in
+            files)
+                has_work=true
+                copy_setup_file "$sprite_name" "$line"
+                ;;
+            commands)
+                has_work=true
+                run_setup_command "$sprite_name" "$line"
+                ;;
+            *)
+                warn "Unknown section in setup.conf: [$section]"
+                ;;
+        esac
+    done < "$SPRITE_SETUP_CONF"
+}
+
 # Sync current directory to sprite
 # Args: sprite_name, target_dir_name (basename for /home/sprite/<name>), source_dir
 sync_local_dir() {
