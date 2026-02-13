@@ -1314,7 +1314,7 @@ copy_setup_file() {
 
 # Run a conditional setup command on the sprite.
 # Format: "condition :: command"
-# The command runs only when the condition fails (non-zero exit) on the sprite.
+# The command runs when the condition succeeds (exits 0) on the sprite.
 run_setup_command() {
     local sprite_name="$1"
     local line="$2"
@@ -1331,7 +1331,18 @@ run_setup_command() {
     # Check condition on sprite — run command when condition succeeds (exits 0)
     if sprite exec -s "$sprite_name" sh -c "$condition" >/dev/null 2>&1; then
         info "Running: $command"
-        sprite exec -s "$sprite_name" sh -c "$command" 2>&1 || {
+        # Run in background with keepalive dots so sprite exec doesn't
+        # drop the connection during long-running installs.
+        sprite exec -s "$sprite_name" sh -c "
+            ($command) </dev/null &
+            child=\$!
+            while kill -0 \$child 2>/dev/null; do
+                sleep 3
+                printf '.'
+            done
+            echo ''
+            wait \$child
+        " 2>&1 || {
             warn "Setup command failed: $command"
         }
     fi
@@ -1358,7 +1369,9 @@ run_sprite_setup() {
     local section=""
     local has_work=false
 
-    while IFS= read -r line || [[ -n "$line" ]]; do
+    # Read on fd 3 so sprite exec calls inside the loop don't consume
+    # the config file via inherited stdin.
+    while IFS= read -r line <&3 || [[ -n "$line" ]]; do
         # Skip empty lines and comments
         [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
 
@@ -1381,7 +1394,7 @@ run_sprite_setup() {
                 warn "Unknown section in setup.conf: [$section]"
                 ;;
         esac
-    done < "$SPRITE_SETUP_CONF"
+    done 3< "$SPRITE_SETUP_CONF"
 }
 
 # Sync current directory to sprite
@@ -1537,55 +1550,25 @@ handle_current_dir_mode() {
         mark_sprite_ready "$sprite_name"
     fi
 
-    # Setup bidirectional sync if enabled
+    # Setup bidirectional sync in background if enabled.
+    # The sync pipeline (SSH, proxy, mutagen) runs asynchronously so the user
+    # gets a shell immediately instead of waiting 5-15s for sync readiness.
     if [[ "$SYNC_ENABLED" == "true" ]]; then
-        # SYNC_SPRITE_NAME and SSH_PORT already set above
-        info "Setting up bidirectional sync (port ${SSH_PORT})..."
+        # SYNC_SPRITE_NAME and SSH_PORT already set above.
+        # Pre-set SYNC_SESSION_NAME so cleanup can find the mutagen session.
+        SYNC_SESSION_NAME="sprite-${sprite_name}"
+        register_sync_user "$sprite_name"
 
-        # Sync setup is non-fatal: if it fails, we still open the tmux session
-        # so the user can reconnect to running processes (e.g. claude, builds).
-        local sync_ok=true
+        local sync_log="/tmp/sprite-sync-${sprite_name}.log"
+        info "Starting sync in background (log: $sync_log)"
 
-        # Skip SSH setup if batch check confirmed sshd is ready with our key
-        if [[ "${BATCH_SSHD_READY:-}" == "y" ]]; then
-            info "SSH server already configured"
-        else
-            setup_ssh_server "$sprite_name" || sync_ok=false
-
-            if [[ "$sync_ok" == "true" ]]; then
-                ensure_ssh_server_running "$sprite_name" || sync_ok=false
-            fi
-        fi
-
-        # Start sprite proxy for SSH port forwarding
-        if [[ "$sync_ok" == "true" ]]; then
-            start_sprite_proxy "$sprite_name" || sync_ok=false
-        fi
-
-        # Test SSH connection
-        if [[ "$sync_ok" == "true" ]] && ! test_ssh_connection; then
-            sync_ok=false
-        fi
-
-        # Start Mutagen sync
-        if [[ "$sync_ok" == "true" ]]; then
-            start_mutagen_sync "$sprite_name" "$current_dir" "$target_dir" || sync_ok=false
-        fi
-
-        if [[ "$sync_ok" == "true" ]]; then
-            SYNC_OWNER=true
-            register_sync_user "$sprite_name"
-            info ""
-            info "✓ Sync is active - changes will be bidirectional"
-            info ""
-        else
-            warn "Bidirectional sync failed to start, but continuing to open session..."
-            warn "File changes will not sync automatically."
-            SYNC_SPRITE_NAME=""
-        fi
+        (
+            setup_sync_session "$sprite_name" "$current_dir" "$target_dir"
+        ) > "$sync_log" 2>&1 &
+        SYNC_BG_PID=$!
     fi
 
-    # Open session
+    # Open session — the user gets a shell immediately
     local session_name
     session_name=$(derive_session_name)
     info "Opening ${EXEC_CMD} session in $target_dir_name (tmux session: $session_name)..."
