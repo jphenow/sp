@@ -89,6 +89,7 @@ Setup config (~/.config/sprite/setup.conf):
   [files]
   ~/.local/bin/claude              # Copied to /home/sprite/.local/bin/claude
   ~/.config/opencode/config.toml   # ~ expands to $HOME locally, /home/sprite remotely
+  ~/.config/sprite/foo -> ~/.bar   # Different source and destination paths
 
   [commands]
   # condition :: command (command runs when condition fails on sprite)
@@ -993,8 +994,10 @@ conf_init() {
 [files]
 # Paths to copy to the sprite. ~ expands to $HOME locally, /home/sprite remotely.
 # Files are only copied if they don't already exist on the sprite.
+# Use "source -> dest" to copy from a different local path.
 # ~/.local/bin/claude
 # ~/.config/opencode/config.toml
+# ~/.config/sprite/tmux.conf.local -> ~/.tmux.conf.local
 
 [commands]
 # condition :: command
@@ -1368,8 +1371,8 @@ run_setup_command() {
 #
 # Config format:
 #   [files]
-#   ~/.local/bin/claude
-#   ~/.config/something/config.toml
+#   ~/.local/bin/claude                           # same path on both sides
+#   ~/.config/sprite/foo.conf -> ~/.foo.conf      # different source and dest
 #
 #   [commands]
 #   # condition :: command (command runs when condition succeeds on sprite)
