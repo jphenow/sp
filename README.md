@@ -148,53 +148,67 @@ sp sessions .
 sp sessions owner/repo
 ```
 
-### Bidirectional File Syncing (NEW)
+### Bidirectional File Syncing
 
-```bash
-cd /path/to/your/repo
-sp . --sync
-```
+Sync is **on by default**. Real-time bidirectional file syncing via Mutagen keeps your local files and the sprite in lockstep:
 
-Enable real-time bidirectional file syncing using Mutagen. This mode:
-1. Performs initial directory sync to sprite
-2. Sets up SSH server inside the sprite
-3. Starts Mutagen sync session with two-way sync
-4. Watches for changes on both local machine and sprite
-5. Automatically syncs changes in both directions while Claude session is active
+- Changes you make locally are automatically synced to the sprite
+- Changes made in the sprite are automatically synced back to your machine
+- Sync session is active while `sp` is running
+- Automatic cleanup when you exit
 
-**Prerequisites for --sync:**
+**Prerequisites:**
 - Mutagen installed locally: `brew install mutagen`
 - SSH key at `~/.ssh/id_ed25519` (used for SSH authentication to sprite)
 
-**How it works:**
-- Changes you make locally are automatically synced to the sprite
-- Changes Claude makes in the sprite are automatically synced back to your machine
-- Sync session is active while `sp` is running
-- Automatic cleanup when you exit the Claude session
-
 **What gets synced:**
-All files except:
-- `.git` (version control)
+All files including `.git`, except:
 - `node_modules` (dependencies)
 - `.next`, `dist`, `build` (build artifacts)
 - `.DS_Store`, `._*` (system files)
 
-**Use cases:**
-- Real-time collaboration between local tools and Claude
-- Keep your local editor in sync with Claude's changes
-- Work simultaneously in multiple environments
-- No need to manually pull changes from sprite
+**Disable sync:**
+```bash
+sp . --no-sync
+```
 
 **Example workflow:**
 ```bash
-# Start sprite with sync enabled
 cd ~/projects/my-app
-sp . --sync
+sp .
 
-# Claude makes changes in sprite → automatically appear in your local files
-# You make changes locally → automatically appear in sprite for Claude
-# Exit Claude session → sync automatically stops and cleans up
+# Edit locally → changes appear in sprite instantly
+# Edit in sprite → changes appear locally instantly
+# Exit → sync stops and cleans up
 ```
+
+### Setup Config (`sp conf`)
+
+Manage `~/.config/sprite/setup.conf` to auto-copy files and run commands on first connect:
+
+```bash
+sp conf init    # Create starter config
+sp conf edit    # Edit in $EDITOR
+sp conf show    # Print contents
+```
+
+**Config format:**
+```ini
+[files]
+# Copy files to the sprite. ~ expands to $HOME locally, /home/sprite remotely.
+# Files are only copied if they don't already exist on the sprite.
+~/.tmux.conf
+~/.local/share/opencode/auth.json
+
+# Use "source -> dest" when local and remote paths differ:
+~/.config/sprite/tmux.conf.local -> ~/.tmux.conf.local
+
+[commands]
+# condition :: command — runs on the sprite when condition succeeds (exits 0).
+! command -v opencode :: curl -fsSL https://opencode.ai/install | bash
+```
+
+Setup runs once per sprite (cached in `/tmp`). Edit setup.conf to re-trigger on next connect.
 
 ## Sprite Naming Convention
 
@@ -243,13 +257,15 @@ The tool automatically sets up authentication in sprites:
 
 ## Directory Sync Exclusions
 
-When using `sp .`, the following directories are excluded from sync:
-- `.git/objects`, `.git/refs`, `.git/logs` (partial git exclusion to reduce size)
+When using `sp .`, the following are excluded from Mutagen sync:
 - `node_modules`
 - `.next`
 - `dist`
 - `build`
 - `.DS_Store`
+- `._*`
+
+Note: `.git` is **included** in sync to keep branches in lockstep between local and sprite.
 
 ## Token Setup
 

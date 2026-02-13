@@ -216,9 +216,19 @@ Test these scenarios before submitting:
 - [ ] Verify repository updates (git pull)
 - [ ] Verify auth files not re-copied unnecessarily
 
+### Setup Config
+- [ ] `sp conf init` creates starter config
+- [ ] `sp conf edit` opens in $EDITOR
+- [ ] `sp conf show` prints contents
+- [ ] `[files]` entries copy to sprite on first connect
+- [ ] `source -> dest` syntax maps different local/remote paths
+- [ ] `[commands]` entries run when condition succeeds
+- [ ] Editing setup.conf re-triggers setup on next connect
+
 ### Current Directory Mode
 - [ ] Sync local directory
-- [ ] Verify exclusions work (node_modules, .git/objects, etc.)
+- [ ] Verify exclusions work (node_modules, .next, etc.)
+- [ ] Verify `.git` is included in sync
 - [ ] Verify git repository state maintained
 - [ ] Test with uncommitted changes
 
