@@ -124,10 +124,24 @@ check_mutagen() {
 }
 
 # Setup SSH server in sprite
-# Installs OpenSSH server, configures it for key-based auth, and adds local public key
+# Installs OpenSSH server, configures it for key-based auth, and adds local public key.
+# Short-circuits if sshd is already running and our public key is present.
 setup_ssh_server() {
     local sprite_name="$1"
 
+    # Fast path: if sshd is running and our key is already authorized, skip setup entirely.
+    # This avoids ~6 sprite exec round trips on every reconnect.
+    if [[ -f "$SSH_PUB_KEY" ]]; then
+        local pubkey_content
+        pubkey_content=$(cat "$SSH_PUB_KEY")
+        if sprite exec -s "$sprite_name" sh -c "pgrep -x sshd >/dev/null 2>&1 && grep -qF '$pubkey_content' ~/.ssh/authorized_keys 2>/dev/null"; then
+            info "SSH server already configured"
+            return 0
+        fi
+    fi
+
+    # Full setup path — flag so ensure_ssh_server_running knows to restart
+    SSH_CONFIG_CHANGED=true
     info "Setting up SSH server in sprite..."
 
     # Check if SSH server is already installed.
@@ -198,14 +212,18 @@ EOF
 }
 
 # Ensure SSH server is running in sprite
-# Restarts sshd if already running to pick up config changes, starts it otherwise
+# Ensures sshd is running. If already running, returns immediately.
+# Only restarts if setup_ssh_server wrote new config (indicated by $SSH_CONFIG_CHANGED).
 ensure_ssh_server_running() {
     local sprite_name="$1"
 
-    # Always restart sshd to ensure it picks up any config changes from setup_ssh_server.
-    # A stale sshd process (from a previous session or auto-started by apt) may have
-    # outdated config or host keys, causing "Connection reset by peer" errors.
+    # If sshd is already running and no config was changed, nothing to do
     if sprite exec -s "$sprite_name" pgrep -x sshd >/dev/null 2>&1; then
+        if [[ "${SSH_CONFIG_CHANGED:-}" != "true" ]]; then
+            info "SSH server already running"
+            return 0
+        fi
+        # Config was changed by setup_ssh_server — restart to pick up changes
         info "Restarting SSH server to pick up config changes..."
         sprite exec -s "$sprite_name" sh -c 'sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo killall sshd 2>/dev/null' || true
         sleep 2
