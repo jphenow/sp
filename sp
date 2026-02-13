@@ -1438,90 +1438,117 @@ handle_current_dir_mode() {
         sprite use "$sprite_name"
     fi
 
-    # Check if SSH key exists in sprite, set up auth if missing
-    if [[ "$is_new" == "true" ]] || ! sprite exec -s "$sprite_name" test -f /home/sprite/.ssh/id_ed25519 2>/dev/null; then
-        setup_sprite_auth "$sprite_name"
-        setup_git_config "$sprite_name"
-    fi
+    local target_dir="/home/sprite/$target_dir_name"
 
-    # Run user-defined setup (copy files, conditional commands)
-    run_sprite_setup "$sprite_name"
-
-    # Sync local directory to sprite (initial one-way sync).
-    # Skip on reconnect when --sync is enabled and the directory already exists —
-    # mutagen bidirectional sync will reconcile differences, and a tar upload
-    # would overwrite files modified on the sprite side (e.g. by claude or builds).
-    if [[ "$SYNC_ENABLED" == "true" ]] && \
-       sprite exec -s "$sprite_name" test -d "/home/sprite/$target_dir_name" 2>/dev/null; then
-        info "Directory already exists on sprite, skipping one-way sync (mutagen will handle it)"
-    else
-        sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
-    fi
-
-    # Setup bidirectional sync if enabled
+    # Set sync metadata early (needed for fast path check and sync setup)
     if [[ "$SYNC_ENABLED" == "true" ]]; then
         SYNC_SPRITE_NAME="$sprite_name"
         SSH_PORT=$(sprite_ssh_port "$sprite_name")
 
-        # Check if another sp session already has sync running for this sprite.
-        # If so, just register as a user and share the existing sync infra.
+        # FAST PATH: sync already active from another sp session.
+        # If sync infra (proxy + mutagen) is running, the sprite is fully set up.
+        # Skip all setup and connect immediately.
         if has_active_sync "$sprite_name"; then
-            info "Sync already active, joining existing session (port ${SSH_PORT})"
+            info "Sync active, joining existing session (port ${SSH_PORT})"
             register_sync_user "$sprite_name"
-        else
-            info "Setting up bidirectional sync (port ${SSH_PORT})..."
-
-            # Sync setup is non-fatal: if it fails, we still open the tmux session
-            # so the user can reconnect to running processes (e.g. claude, builds).
-            local sync_ok=true
-
-            # Setup SSH server in sprite
-            setup_ssh_server "$sprite_name" || sync_ok=false
-
-            # Ensure SSH server is running
-            if [[ "$sync_ok" == "true" ]]; then
-                ensure_ssh_server_running "$sprite_name" || sync_ok=false
-            fi
-
-            # Start sprite proxy for SSH port forwarding
-            if [[ "$sync_ok" == "true" ]]; then
-                start_sprite_proxy "$sprite_name" || sync_ok=false
-            fi
-
-            # Test SSH connection
-            if [[ "$sync_ok" == "true" ]] && ! test_ssh_connection; then
-                sync_ok=false
-            fi
-
-            # Start Mutagen sync
-            if [[ "$sync_ok" == "true" ]]; then
-                start_mutagen_sync "$sprite_name" "$current_dir" "/home/sprite/$target_dir_name" || sync_ok=false
-            fi
-
-            if [[ "$sync_ok" == "true" ]]; then
-                SYNC_OWNER=true
-                register_sync_user "$sprite_name"
-                info ""
-                info "✓ Sync is active - changes will be bidirectional"
-                info ""
-            else
-                warn "Bidirectional sync failed to start, but continuing to open session..."
-                warn "File changes will not sync automatically."
-                SYNC_SPRITE_NAME=""
-            fi
+            local claude_token
+            claude_token=$(get_claude_token)
+            exec_in_sprite "$sprite_name" "$target_dir" "$claude_token"
+            return
         fi
     fi
 
-    # Open session in the synced directory
+    # --- Setup: three paths based on sprite state ---
+    if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
+        # FAST PATH: sprite previously set up (state file exists).
+        # Skip auth, git config, sprite_setup, and dir check entirely.
+        info "Sprite previously configured, skipping setup"
+    elif [[ "$is_new" == "true" ]]; then
+        # NEW SPRITE: full setup required
+        setup_sprite_auth "$sprite_name"
+        setup_git_config "$sprite_name"
+        run_sprite_setup "$sprite_name"
+        sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
+        mark_sprite_ready "$sprite_name"
+    else
+        # EXISTING SPRITE, FIRST CONNECT: batch check + selective setup.
+        # One remote call replaces 3-5 sequential sprite exec checks.
+        info "Checking sprite state..."
+        batch_check_sprite "$sprite_name" "$target_dir"
+
+        if [[ "$BATCH_AUTH" != "y" ]]; then
+            setup_sprite_auth "$sprite_name"
+            setup_git_config "$sprite_name"
+        fi
+
+        run_sprite_setup "$sprite_name"
+
+        if [[ "$BATCH_DIR" != "y" ]]; then
+            sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
+        elif [[ "$SYNC_ENABLED" == "true" ]]; then
+            info "Directory exists on sprite, skipping one-way sync (mutagen will handle it)"
+        fi
+
+        mark_sprite_ready "$sprite_name"
+    fi
+
+    # Setup bidirectional sync if enabled
+    if [[ "$SYNC_ENABLED" == "true" ]]; then
+        # SYNC_SPRITE_NAME and SSH_PORT already set above
+        info "Setting up bidirectional sync (port ${SSH_PORT})..."
+
+        # Sync setup is non-fatal: if it fails, we still open the tmux session
+        # so the user can reconnect to running processes (e.g. claude, builds).
+        local sync_ok=true
+
+        # Skip SSH setup if batch check confirmed sshd is ready with our key
+        if [[ "${BATCH_SSHD_READY:-}" == "y" ]]; then
+            info "SSH server already configured"
+        else
+            setup_ssh_server "$sprite_name" || sync_ok=false
+
+            if [[ "$sync_ok" == "true" ]]; then
+                ensure_ssh_server_running "$sprite_name" || sync_ok=false
+            fi
+        fi
+
+        # Start sprite proxy for SSH port forwarding
+        if [[ "$sync_ok" == "true" ]]; then
+            start_sprite_proxy "$sprite_name" || sync_ok=false
+        fi
+
+        # Test SSH connection
+        if [[ "$sync_ok" == "true" ]] && ! test_ssh_connection; then
+            sync_ok=false
+        fi
+
+        # Start Mutagen sync
+        if [[ "$sync_ok" == "true" ]]; then
+            start_mutagen_sync "$sprite_name" "$current_dir" "$target_dir" || sync_ok=false
+        fi
+
+        if [[ "$sync_ok" == "true" ]]; then
+            SYNC_OWNER=true
+            register_sync_user "$sprite_name"
+            info ""
+            info "✓ Sync is active - changes will be bidirectional"
+            info ""
+        else
+            warn "Bidirectional sync failed to start, but continuing to open session..."
+            warn "File changes will not sync automatically."
+            SYNC_SPRITE_NAME=""
+        fi
+    fi
+
+    # Open session
     local session_name
     session_name=$(derive_session_name)
     info "Opening ${EXEC_CMD} session in $target_dir_name (tmux session: $session_name)..."
 
-    # Get the token to pass as env var
     local claude_token
     claude_token=$(get_claude_token)
 
-    exec_in_sprite "$sprite_name" "/home/sprite/$target_dir_name" "$claude_token"
+    exec_in_sprite "$sprite_name" "$target_dir" "$claude_token"
 }
 
 # Set up cleanup trap
