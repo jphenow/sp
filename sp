@@ -1175,16 +1175,29 @@ handle_repo_mode() {
         info "Sprite already exists: $sprite_name"
     fi
 
-    # Check if SSH key exists in sprite, set up auth if missing
-    if [[ "$is_new" == "true" ]] || ! sprite exec -s "$sprite_name" test -f /home/sprite/.ssh/id_ed25519 2>/dev/null; then
+    # Setup: fast path skips auth/config/setup if sprite was previously configured
+    if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
+        info "Sprite previously configured, skipping setup"
+    elif [[ "$is_new" == "true" ]]; then
         setup_sprite_auth "$sprite_name"
         setup_git_config "$sprite_name"
+        run_sprite_setup "$sprite_name"
+        mark_sprite_ready "$sprite_name"
+    else
+        # Existing sprite, first connect: batch check + selective setup
+        info "Checking sprite state..."
+        batch_check_sprite "$sprite_name" "/home/sprite/$(basename "$repo")"
+
+        if [[ "$BATCH_AUTH" != "y" ]]; then
+            setup_sprite_auth "$sprite_name"
+            setup_git_config "$sprite_name"
+        fi
+
+        run_sprite_setup "$sprite_name"
+        mark_sprite_ready "$sprite_name"
     fi
 
-    # Run user-defined setup (copy files, conditional commands)
-    run_sprite_setup "$sprite_name"
-
-    # Sync repository
+    # Sync repository (always pull latest)
     sync_repo "$sprite_name" "$repo"
 
     # Open session in the repo directory
