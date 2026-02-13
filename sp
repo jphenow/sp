@@ -1206,7 +1206,6 @@ handle_repo_mode() {
     session_name=$(derive_session_name)
     info "Opening ${EXEC_CMD} session in $repo_dir (tmux session: $session_name)..."
 
-    # Get the token to pass as env var
     local claude_token
     claude_token=$(get_claude_token)
 
