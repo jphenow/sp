@@ -46,6 +46,11 @@ RESOLVED_SPRITE_NAME=""
 RESOLVED_TARGET_DIR=""
 RESOLVED_REPO=""
 
+# Batch check results (set by batch_check_sprite)
+BATCH_AUTH=""
+BATCH_DIR=""
+BATCH_SSHD_READY=""
+
 # Print usage information and exit
 usage() {
     cat <<'EOF'
