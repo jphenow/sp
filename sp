@@ -672,6 +672,46 @@ stop_sprite_proxy() {
     SYNC_SPRITE_NAME=""
 }
 
+# Run the full sync setup pipeline in the background.
+# Called from a subshell — writes state to the lock directory so the main
+# process's cleanup trap can tear things down on exit.
+setup_sync_session() {
+    local sprite_name="$1"
+    local local_dir="$2"
+    local target_dir="$3"
+
+    local sync_ok=true
+
+    # Skip SSH setup if batch check confirmed sshd is ready with our key
+    if [[ "${BATCH_SSHD_READY:-}" == "y" ]]; then
+        info "SSH server already configured"
+    else
+        setup_ssh_server "$sprite_name" || sync_ok=false
+
+        if [[ "$sync_ok" == "true" ]]; then
+            ensure_ssh_server_running "$sprite_name" || sync_ok=false
+        fi
+    fi
+
+    if [[ "$sync_ok" == "true" ]]; then
+        start_sprite_proxy "$sprite_name" || sync_ok=false
+    fi
+
+    if [[ "$sync_ok" == "true" ]] && ! test_ssh_connection; then
+        sync_ok=false
+    fi
+
+    if [[ "$sync_ok" == "true" ]]; then
+        start_mutagen_sync "$sprite_name" "$local_dir" "$target_dir" || sync_ok=false
+    fi
+
+    if [[ "$sync_ok" == "true" ]]; then
+        info "✓ Sync is active — changes will be bidirectional"
+    else
+        warn "Bidirectional sync failed to start. File changes will not sync automatically."
+    fi
+}
+
 # Cleanup function called on exit.
 # Uses reference counting: only tears down sync infra when this is the last
 # sp process using it. Otherwise leaves proxy + mutagen running for others.
