@@ -576,27 +576,46 @@ stop_mutagen_sync() {
     fi
 }
 
-# Stop sprite proxy and remove its lock file
+# Stop sprite proxy using the PID from the lock directory.
+# Cleans up the lock directory afterwards.
 stop_sprite_proxy() {
-    if [[ -n "$PROXY_PID" ]]; then
-        info "Stopping port forwarding..."
-        kill "$PROXY_PID" 2>/dev/null || true
-        PROXY_PID=""
+    local sprite_name="${1:-$SYNC_SPRITE_NAME}"
+    [[ -n "$sprite_name" ]] || return 0
+
+    local lock_dir
+    lock_dir=$(sync_lock_dir "$sprite_name")
+    local proxy_pid_file="${lock_dir}/proxy.pid"
+
+    if [[ -f "$proxy_pid_file" ]]; then
+        local proxy_pid
+        proxy_pid=$(cat "$proxy_pid_file" 2>/dev/null || echo "")
+        if [[ -n "$proxy_pid" ]]; then
+            info "Stopping port forwarding..."
+            kill "$proxy_pid" 2>/dev/null || true
+        fi
     fi
-    # Remove the port lock file so other sessions don't see us as alive
-    if [[ -n "$SYNC_SPRITE_NAME" ]]; then
-        rm -f "/tmp/sprite-sync-${SYNC_SPRITE_NAME}.port"
-        SYNC_SPRITE_NAME=""
-    fi
+
+    # Clean up the entire lock directory
+    rm -rf "$lock_dir" 2>/dev/null || true
+    PROXY_PID=""
+    SYNC_SPRITE_NAME=""
 }
 
-# Cleanup function called on exit
+# Cleanup function called on exit.
+# Uses reference counting: only tears down sync infra when this is the last
+# sp process using it. Otherwise leaves proxy + mutagen running for others.
 cleanup_sync_session() {
-    if [[ "$SYNC_ENABLED" == "true" ]]; then
-        echo ""  # Newline for cleaner output
+    [[ -n "$SYNC_SPRITE_NAME" ]] || return 0
+
+    echo ""  # Newline for cleaner output
+
+    if unregister_sync_user "$SYNC_SPRITE_NAME"; then
+        # We're the last user — tear everything down
         info "Cleaning up sync session..."
         stop_mutagen_sync
-        stop_sprite_proxy
+        stop_sprite_proxy "$SYNC_SPRITE_NAME"
+    else
+        info "Other sp sessions still active, leaving sync running"
     fi
 }
 
