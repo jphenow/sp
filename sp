@@ -374,9 +374,11 @@ start_sprite_proxy() {
     # Create a temporary log file for proxy output
     local proxy_log="/tmp/sprite-proxy-$$.log"
 
-    # Start proxy in background with logging
+    # Start proxy in background and disown so it survives shell exit.
+    # The last sp session to exit will explicitly kill it via the proxy.pid file.
     sprite proxy -s "$sprite_name" "${SSH_PORT}:22" >"$proxy_log" 2>&1 &
     PROXY_PID=$!
+    disown "$PROXY_PID" 2>/dev/null || true
 
     # Wait for proxy to be ready
     local attempts=0
@@ -394,8 +396,10 @@ start_sprite_proxy() {
 
         # Check if port is actually listening using lsof
         if lsof -i ":${SSH_PORT}" >/dev/null 2>&1; then
-            # Write lock file: port and PID so other sessions can detect us
-            echo "${SSH_PORT} $$" > "$lock_file"
+            # Write proxy metadata into the lock directory
+            mkdir -p "$lock_dir"
+            echo "$SSH_PORT" > "${lock_dir}/port"
+            echo "$PROXY_PID" > "${lock_dir}/proxy.pid"
             info "Port forwarding ready"
             rm -f "$proxy_log"
             return 0
