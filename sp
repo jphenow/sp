@@ -4,40 +4,43 @@ set -euo pipefail
 
 # sp - Sprite environment manager for GitHub repositories and local directories
 # Usage:
-#   sp owner/repo [--sync] [--cmd CMD] [--name NAME]
-#   sp . [--sync] [--cmd CMD] [--name NAME]
-#   sp info owner/repo [--cmd CMD] [--name NAME]
-#   sp info .
-#   sp sessions owner/repo
-#   sp sessions .
+#   sp owner/repo [--no-sync] [--name NAME] [-- COMMAND...]
+#   sp . [--no-sync] [--name NAME] [-- COMMAND...]
+#   sp info owner/repo|.
+#   sp sessions owner/repo|.
+#   sp conf {init|edit|show}
 #
 # Sprite naming:
 #   GitHub repos:     gh-owner--repo      (e.g., gh-acme--widgets)
 #   Local directories: local-<dirname>    (e.g., local-my-project)
 #
 # Options:
-#   --sync        Enable bidirectional file syncing with Mutagen (requires: brew install mutagen)
-#   --cmd CMD     Command to run instead of 'claude' (default: claude)
+#   --no-sync     Disable bidirectional file syncing (sync is on by default)
 #   --name NAME   tmux session name (default: derived from command name)
+#   -- COMMAND    Command to run in the sprite (default: bash)
 #
 # Subcommands:
 #   info       Show sprite info (name, existence, target dir, command, session) without connecting
 #   sessions   List active tmux sessions in a sprite
+#   conf       Manage setup config (~/.config/sprite/setup.conf)
 
 # Configuration
 CLAUDE_CONFIG_DIR="${HOME}/.claude"
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 SSH_PUB_KEY="${HOME}/.ssh/id_ed25519.pub"
+SPRITE_SETUP_CONF="${HOME}/.config/sprite/setup.conf"
+SSH_CONFIG_CHANGED=""
 
 # Sync configuration
-SYNC_ENABLED=false
+SYNC_ENABLED=true
+SYNC_OWNER=false
 PROXY_PID=""
 SYNC_SESSION_NAME=""
 SYNC_SPRITE_NAME=""
 SSH_PORT=""
 
 # Command and session configuration
-EXEC_CMD="claude"
+EXEC_CMD="bash"
 SESSION_NAME=""
 RESOLVED_SPRITE_NAME=""
 RESOLVED_TARGET_DIR=""
@@ -49,34 +52,54 @@ usage() {
 sp - Sprite environment manager for GitHub repositories and local directories
 
 Usage:
-  sp owner/repo [--sync] [--cmd CMD] [--name NAME]
-  sp . [--sync] [--cmd CMD] [--name NAME]
-  sp info owner/repo|. [--cmd CMD] [--name NAME]
+  sp owner/repo [--no-sync] [--name NAME] [-- COMMAND...]
+  sp . [--no-sync] [--name NAME] [-- COMMAND...]
+  sp info owner/repo|. [--name NAME]
   sp sessions owner/repo|.
+  sp conf {init|edit|show}
 
 Subcommands:
   info       Show sprite metadata (name, existence, target dir, command, session)
              without connecting
   sessions   List active tmux sessions in a sprite
+  conf       Manage setup config (~/.config/sprite/setup.conf)
 
 Options:
-  --sync        Enable bidirectional file syncing with Mutagen
-  --cmd CMD     Command to run instead of 'claude' (default: claude)
+  --no-sync     Disable bidirectional file syncing (sync is on by default)
+  --sync        Explicitly enable sync (default, for clarity)
   --name NAME   tmux session name (default: derived from command name)
+  --cmd CMD     Command to run (alternative to --)
   --help, -h    Show this help message
+
+Commands:
+  Everything after -- is the command to run in the sprite (default: bash).
+  Use this for commands with flags: sp . -- claude -f foo bar baz
 
 Sprite naming (in priority order):
   1. .sprite file   Read from local .sprite JSON file if present
   2. GitHub remote   gh-owner--repo      (e.g., gh-acme--widgets)
   3. Directory name  local-<dirname>     (e.g., local-my-project)
 
+Setup config (~/.config/sprite/setup.conf):
+  [files]
+  ~/.local/bin/claude              # Copied to /home/sprite/.local/bin/claude
+  ~/.config/opencode/config.toml   # ~ expands to $HOME locally, /home/sprite remotely
+
+  [commands]
+  # condition :: command (command runs when condition fails on sprite)
+  ! command -v opencode :: curl -fsSL https://opencode.ai/install | bash &
+
 Examples:
-  sp superfly/flyctl                  # Work on a GitHub repo
-  sp .                                # Work on current directory
-  sp . --cmd bash --name debug        # Open bash in a named tmux session
-  sp . --sync                         # Enable bidirectional file sync
-  sp info .                           # Show sprite info without connecting
-  sp sessions owner/repo              # List tmux sessions in a sprite
+  sp superfly/flyctl                    # Work on a GitHub repo (opens bash)
+  sp .                                  # Work on current directory
+  sp . -- claude                        # Open claude in the sprite
+  sp . -- claude -f foo bar baz         # Command with flags
+  sp . --no-sync -- bash                 # Skip file sync
+  sp . --name debug -- bash             # Named tmux session
+  sp info .                             # Show sprite info without connecting
+  sp sessions owner/repo                # List tmux sessions in a sprite
+  sp conf init                          # Create setup config
+  sp conf edit                          # Edit setup config
 EOF
     exit 0
 }
