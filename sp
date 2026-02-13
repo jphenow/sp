@@ -911,6 +911,14 @@ exec_in_sprite() {
 
     sprite exec -s "$sprite_name" -dir "$work_dir" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty \
         sh -c "$shell_cmd"
+
+    # Reset terminal mouse tracking modes after disconnect.
+    # The remote tmux enables SGR mouse tracking (modes 1000/1003/1006).
+    # If the connection drops, the local terminal is still in mouse mode
+    # but the consumer is gone — causing raw escape sequences like
+    # "65;40;62M" to print on scroll/click. Disabling all mouse modes
+    # returns the pane to normal.
+    printf '\e[?1000l\e[?1003l\e[?1006l'
 }
 
 # Print sprite metadata without connecting or creating anything.
