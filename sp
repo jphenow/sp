@@ -952,7 +952,7 @@ conf_init() {
 
 [commands]
 # condition :: command
-# Command runs on the sprite when condition exits non-zero (i.e. thing is missing).
+# Command runs on the sprite when condition succeeds (exits 0).
 # ! command -v opencode :: curl -fsSL https://opencode.ai/install | bash &
 TMPL
 
@@ -1282,8 +1282,8 @@ run_setup_command() {
         return 0
     fi
 
-    # Check condition on sprite — run command only if condition fails
-    if ! sprite exec -s "$sprite_name" sh -c "$condition" >/dev/null 2>&1; then
+    # Check condition on sprite — run command when condition succeeds (exits 0)
+    if sprite exec -s "$sprite_name" sh -c "$condition" >/dev/null 2>&1; then
         info "Running: $command"
         sprite exec -s "$sprite_name" sh -c "$command" 2>&1 || {
             warn "Setup command failed: $command"
@@ -1300,7 +1300,7 @@ run_setup_command() {
 #   ~/.config/something/config.toml
 #
 #   [commands]
-#   # condition :: command (command runs when condition fails on sprite)
+#   # condition :: command (command runs when condition succeeds on sprite)
 #   ! command -v opencode :: curl -fsSL https://opencode.ai/install | bash &
 run_sprite_setup() {
     local sprite_name="$1"
