@@ -31,6 +31,9 @@ SSH_PUB_KEY="${HOME}/.ssh/id_ed25519.pub"
 SPRITE_SETUP_CONF="${HOME}/.config/sprite/setup.conf"
 SSH_CONFIG_CHANGED=""
 
+# Output control
+VERBOSE=false
+
 # Sync configuration
 SYNC_ENABLED=true
 PROXY_PID=""
@@ -74,6 +77,7 @@ Options:
   --sync        Explicitly enable sync (default, for clarity)
   --name NAME   tmux session name (default: derived from command name)
   --cmd CMD     Command to run (alternative to --)
+  --verbose, -v Show detailed progress output
   --help, -h    Show this help message
 
 Commands:
@@ -713,11 +717,22 @@ setup_sync_session() {
     fi
 }
 
+# Reset terminal mouse tracking modes.
+# The remote tmux enables SGR mouse tracking (modes 1000/1003/1006).
+# If the connection drops, the local terminal is still in mouse mode
+# but the consumer is gone — causing raw escape sequences like
+# "65;40;62M" to print on scroll/click. Disabling all mouse modes
+# returns the pane to normal.
+reset_terminal() {
+    printf '\e[?1000l\e[?1003l\e[?1006l' 2>/dev/null || true
+}
+
 # Cleanup function called on exit.
 # Uses reference counting: only tears down sync infra when this is the last
 # sp process using it. Otherwise leaves proxy + mutagen running for others.
-cleanup_sync_session() {
-    [[ -n "$SYNC_SPRITE_NAME" ]] || return 0
+# Always resets terminal mouse modes regardless of how we exited.
+cleanup() {
+    reset_terminal
 
     echo ""  # Newline for cleaner output
 
@@ -729,11 +744,8 @@ cleanup_sync_session() {
 
     if unregister_sync_user "$SYNC_SPRITE_NAME"; then
         # We're the last user — tear everything down
-        info "Cleaning up sync session..."
         stop_mutagen_sync
         stop_sprite_proxy "$SYNC_SPRITE_NAME"
-    else
-        info "Other sp sessions still active, leaving sync running"
     fi
 }
 
@@ -910,15 +922,7 @@ exec_in_sprite() {
     shell_cmd=$(printf "exec tmux new-session -A -s '%s' %s" "$session_name" "$EXEC_CMD")
 
     sprite exec -s "$sprite_name" -dir "$work_dir" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty \
-        sh -c "$shell_cmd"
-
-    # Reset terminal mouse tracking modes after disconnect.
-    # The remote tmux enables SGR mouse tracking (modes 1000/1003/1006).
-    # If the connection drops, the local terminal is still in mouse mode
-    # but the consumer is gone — causing raw escape sequences like
-    # "65;40;62M" to print on scroll/click. Disabling all mouse modes
-    # returns the pane to normal.
-    printf '\e[?1000l\e[?1003l\e[?1006l'
+        sh -c "$shell_cmd" || true
 }
 
 # Print sprite metadata without connecting or creating anything.
