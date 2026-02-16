@@ -133,6 +133,44 @@ check_mutagen() {
     fi
 }
 
+# Install gum if missing. Non-fatal — script degrades to printing titles without animation.
+ensure_gum() {
+    command -v gum >/dev/null 2>&1 && return 0
+    if [[ "$(uname)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+        brew install gum >/dev/null 2>&1 && return 0
+    fi
+    if [[ "$(uname)" == "Linux" ]]; then
+        local arch
+        arch=$(uname -m)
+        [[ "$arch" == "x86_64" ]] && arch="amd64"
+        [[ "$arch" == "aarch64" ]] && arch="arm64"
+        local url="https://github.com/charmbracelet/gum/releases/download/v0.16.2/gum_0.16.2_Linux_${arch}.tar.gz"
+        mkdir -p "$HOME/.local/bin"
+        curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin" gum 2>/dev/null && {
+            export PATH="$HOME/.local/bin:$PATH"
+            return 0
+        }
+    fi
+    return 1
+}
+
+# Run a function under a gum spinner. Falls back to printing the title if gum is unavailable.
+# Uses self-invocation: gum spin runs "$0 _run func args..." so gum has a real process to monitor.
+spin() {
+    local title="$1"; shift
+    if command -v gum >/dev/null 2>&1; then
+        gum spin --show-error --spinner dot --title "$title" -- "$0" _run "$@"
+    else
+        printf "  %s\n" "$title"
+        "$@"
+    fi
+}
+
+# Print a user-facing status line. Always visible regardless of --verbose.
+msg() {
+    echo "$1"
+}
+
 # Setup SSH server in sprite
 # Installs OpenSSH server, configures it for key-based auth, and adds local public key.
 # Short-circuits if sshd is already running and our public key is present.
