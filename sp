@@ -91,9 +91,10 @@ Sprite naming (in priority order):
 
 Setup config (~/.config/sprite/setup.conf):
   [files]
-  ~/.local/bin/claude              # Copied to /home/sprite/.local/bin/claude
+  ~/.local/bin/claude              # Copied if local is newer (default)
   ~/.config/opencode/config.toml   # ~ expands to $HOME locally, /home/sprite remotely
   ~/.config/sprite/foo -> ~/.bar   # Different source and destination paths
+  ~/.tmux.conf [always]            # Always overwrite, even if remote is newer
 
   [commands]
   # condition :: command (command runs when condition fails on sprite)
@@ -1046,11 +1047,12 @@ conf_init() {
 
 [files]
 # Paths to copy to the sprite. ~ expands to $HOME locally, /home/sprite remotely.
-# Files are only copied if they don't already exist on the sprite.
+# Default: only copy if local file is newer than remote (or remote is missing).
+# Append [always] to always overwrite, or [newest] to be explicit about default.
 # Use "source -> dest" to copy from a different local path.
 # ~/.local/bin/claude
 # ~/.config/opencode/config.toml
-# ~/.config/sprite/tmux.conf.local -> ~/.tmux.conf.local
+# ~/.config/sprite/tmux.conf.local -> ~/.tmux.conf.local [always]
 
 [commands]
 # condition :: command
@@ -1307,6 +1309,49 @@ _do_sync_repo() {
     sync_repo "$sprite_name" "$repo"
 }
 
+# Composite function for spin(): all preflight work for current-dir mode.
+# Covers existence check, sprite use, creation if needed, setup if needed.
+# Called via spin() in a subprocess. All side effects are remote or file-based,
+# so the parent can re-derive cheap state after the spinner completes.
+# Env: _PREFLIGHT_TARGET_DIR, _PREFLIGHT_TARGET_DIR_NAME, _PREFLIGHT_CURRENT_DIR,
+#      CLAUDE_CODE_OAUTH_TOKEN
+_do_connect_preflight() {
+    local sprite_name="$1"
+
+    # Create sprite if it doesn't exist
+    if ! sprite_exists "$sprite_name"; then
+        _do_create_sprite "$sprite_name"
+        # Full setup for new sprite
+        setup_sprite_auth "$sprite_name"
+        setup_git_config "$sprite_name"
+        run_sprite_setup "$sprite_name"
+        sync_local_dir "$sprite_name" "$_PREFLIGHT_TARGET_DIR_NAME" "$_PREFLIGHT_CURRENT_DIR"
+        mark_sprite_ready "$sprite_name"
+        return
+    fi
+
+    # Set default sprite for this directory
+    sprite use "$sprite_name" >/dev/null 2>&1 || true
+
+    # Setup if not previously configured
+    if ! is_sprite_ready "$sprite_name"; then
+        batch_check_sprite "$sprite_name" "$_PREFLIGHT_TARGET_DIR"
+
+        if [[ "$BATCH_AUTH" != "y" ]]; then
+            setup_sprite_auth "$sprite_name"
+            setup_git_config "$sprite_name"
+        fi
+
+        run_sprite_setup "$sprite_name"
+
+        if [[ "$BATCH_DIR" != "y" ]]; then
+            sync_local_dir "$sprite_name" "$_PREFLIGHT_TARGET_DIR_NAME" "$_PREFLIGHT_CURRENT_DIR"
+        fi
+
+        mark_sprite_ready "$sprite_name"
+    fi
+}
+
 # Main function for owner/repo mode
 handle_repo_mode() {
     local repo="$1"
@@ -1365,18 +1410,35 @@ setup_git_config() {
     fi
 }
 
-# Copy a single file to the sprite, expanding ~ for local and remote paths.
-# Supports two formats:
-#   ~/.config/foo        — same path on local and sprite (~ expands accordingly)
-#   ~/.config/foo -> ~/bar  — different local source and remote destination
-# Skips if the file already exists on the sprite.
-# Preserves executable permission.
+# Get a file's modification time as a unix timestamp (portable across macOS/Linux).
+local_file_mtime() {
+    if [[ "$OSTYPE" == darwin* ]]; then
+        stat -f %m "$1"
+    else
+        stat -c %Y "$1"
+    fi
+}
+
+# Copy a single setup.conf file entry to the sprite.
+# Supports per-file copy mode via [always] or [newest] annotation.
+# Default mode is "newest" — only copy when local file is newer than remote.
+#   ~/.tmux.conf                        # newest (default)
+#   ~/.tmux.conf [always]               # always overwrite
+#   ~/.config/foo -> ~/.bar [newest]    # explicit newest
 copy_setup_file() {
     local sprite_name="$1"
     local file_path="$2"
 
     # Trim whitespace
     file_path=$(echo "$file_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    # Parse optional [mode] annotation at end of line
+    local copy_mode="newest"
+    if [[ "$file_path" =~ \[(always|newest)\]$ ]]; then
+        copy_mode="${BASH_REMATCH[1]}"
+        # Strip the annotation from the path
+        file_path=$(echo "$file_path" | sed 's/[[:space:]]*\['"$copy_mode"'\]$//')
+    fi
 
     local local_path remote_path
 
@@ -1399,10 +1461,23 @@ copy_setup_file() {
         return 0
     fi
 
-    # Skip if file already exists on sprite
-    if sprite exec -s "$sprite_name" test -f "$remote_path" 2>/dev/null; then
-        return 0
+    # Decide whether to copy based on mode
+    if [[ "$copy_mode" == "newest" ]]; then
+        # Get remote mtime; if file doesn't exist, remote_mtime will be empty
+        local remote_mtime
+        remote_mtime=$(sprite exec -s "$sprite_name" stat -c %Y "$remote_path" 2>/dev/null || true)
+
+        if [[ -n "$remote_mtime" ]]; then
+            local local_mtime
+            local_mtime=$(local_file_mtime "$local_path")
+            # Skip if remote is same age or newer
+            if [[ "$local_mtime" -le "$remote_mtime" ]]; then
+                return 0
+            fi
+        fi
+        # Remote missing or local is newer — fall through to copy
     fi
+    # "always" mode — no skip check, always copy
 
     # Ensure destination directory exists
     local remote_dir
@@ -1460,8 +1535,9 @@ run_setup_command() {
 #
 # Config format:
 #   [files]
-#   ~/.local/bin/claude                           # same path on both sides
+#   ~/.local/bin/claude                           # copy if local is newer (default)
 #   ~/.config/sprite/foo.conf -> ~/.foo.conf      # different source and dest
+#   ~/.tmux.conf [always]                         # always overwrite remote
 #
 #   [commands]
 #   # condition :: command (command runs when condition succeeds on sprite)
@@ -1572,78 +1648,47 @@ handle_current_dir_mode() {
         target_dir_name="$dir_name"
     fi
 
+    local target_dir="/home/sprite/$target_dir_name"
+
     # Pre-acquire token before spinners (interactive prompt can't run inside gum spin)
     local claude_token
     claude_token=$(get_claude_token)
     export CLAUDE_CODE_OAUTH_TOKEN="$claude_token"
 
-    # Create sprite if it doesn't exist
-    local is_new=false
-    if ! sprite_exists "$sprite_name"; then
-        spin "Creating sprite ${sprite_name}..." _do_create_sprite "$sprite_name"
-        is_new=true
-    fi
+    # Export state for spinner subprocess
+    export _PREFLIGHT_TARGET_DIR="$target_dir"
+    export _PREFLIGHT_TARGET_DIR_NAME="$target_dir_name"
+    export _PREFLIGHT_CURRENT_DIR="$current_dir"
 
-    # Set this directory's default sprite so 'sprite' commands without -s use it
-    local current_dir_sprite
-    current_dir_sprite=$(get_current_dir_sprite)
-    if [[ "$current_dir_sprite" != "$sprite_name" ]]; then
-        sprite use "$sprite_name" >/dev/null 2>&1
-    fi
+    # All preflight work under one spinner (existence check, sprite use, create/setup).
+    # On the fast path this covers sprite_exists + sprite use (~1-2s).
+    # On the slow path it covers creation + full setup.
+    local session_name
+    session_name=$(derive_session_name)
+    spin "Connecting to $target_dir_name (tmux: $session_name)" _do_connect_preflight "$sprite_name"
 
-    local target_dir="/home/sprite/$target_dir_name"
-
-    # Set sync metadata early (needed for fast path check and sync setup)
+    # Post-spinner: set up sync state in parent (needed for cleanup trap).
+    # Re-checking has_active_sync is cheap (local files + lsof) — the expensive
+    # work (create, setup) already happened in the spinner subprocess.
     if [[ "$SYNC_ENABLED" == "true" ]]; then
         SYNC_SPRITE_NAME="$sprite_name"
         SSH_PORT=$(sprite_ssh_port "$sprite_name")
 
-        # FAST PATH: sync already active from another sp session.
-        # If sync infra (proxy + mutagen) is running, the sprite is fully set up.
-        # Skip all setup and connect immediately.
         if has_active_sync "$sprite_name"; then
+            # Sync already running from another session, just join
             register_sync_user "$sprite_name"
-            local session_name
-            session_name=$(derive_session_name)
-            msg "Connecting to $target_dir_name (tmux: $session_name)"
-            exec_in_sprite "$sprite_name" "$target_dir" "$claude_token"
-            return
+        else
+            # Start sync pipeline in background so user gets a shell immediately
+            SYNC_SESSION_NAME="sprite-${sprite_name}"
+            register_sync_user "$sprite_name"
+
+            local sync_log="/tmp/sprite-sync-${sprite_name}.log"
+            (
+                setup_sync_session "$sprite_name" "$current_dir" "$target_dir"
+            ) > "$sync_log" 2>&1 &
+            SYNC_BG_PID=$!
         fi
     fi
-
-    # --- Setup: three paths based on sprite state ---
-    if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
-        : # Already configured, nothing to do
-    else
-        export _SETUP_TARGET_DIR="$target_dir"
-        export _SETUP_TARGET_DIR_NAME="$target_dir_name"
-        export _SETUP_CURRENT_DIR="$current_dir"
-        export _SETUP_IS_NEW="$is_new"
-        export _SETUP_MODE="dir"
-        spin "Setting up sprite..." _do_setup_sprite "$sprite_name"
-    fi
-
-    # Setup bidirectional sync in background if enabled.
-    # The sync pipeline (SSH, proxy, mutagen) runs asynchronously so the user
-    # gets a shell immediately instead of waiting 5-15s for sync readiness.
-    if [[ "$SYNC_ENABLED" == "true" ]]; then
-        # SYNC_SPRITE_NAME and SSH_PORT already set above.
-        # Pre-set SYNC_SESSION_NAME so cleanup can find the mutagen session.
-        SYNC_SESSION_NAME="sprite-${sprite_name}"
-        register_sync_user "$sprite_name"
-
-        local sync_log="/tmp/sprite-sync-${sprite_name}.log"
-
-        (
-            setup_sync_session "$sprite_name" "$current_dir" "$target_dir"
-        ) > "$sync_log" 2>&1 &
-        SYNC_BG_PID=$!
-    fi
-
-    # Open session — the user gets a shell immediately
-    local session_name
-    session_name=$(derive_session_name)
-    msg "Connecting to $target_dir_name (tmux: $session_name)"
 
     exec_in_sprite "$sprite_name" "$target_dir" "$claude_token"
 }

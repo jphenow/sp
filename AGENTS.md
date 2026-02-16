@@ -103,6 +103,9 @@ The `sp` tool automatically configures:
 ### Setup Config
 Files and commands in `~/.config/sprite/setup.conf` run on first connect:
 - `[files]` — copy dotfiles, configs, and tools to the sprite
+  - Default mode is `[newest]` — only copies when local file is newer than remote (or remote is missing)
+  - Append `[always]` to always overwrite the remote file
+  - Example: `~/.tmux.conf [always]`
 - `[commands]` — install dependencies when missing
 - Use `source -> dest` syntax for files where local and remote paths differ
 
