@@ -772,7 +772,7 @@ reset_terminal() {
 cleanup() {
     reset_terminal
 
-    echo ""  # Newline for cleaner output
+    [[ -n "$SYNC_SPRITE_NAME" ]] || return 0
 
     # Kill background sync process if still running
     if [[ -n "$SYNC_BG_PID" ]] && kill -0 "$SYNC_BG_PID" 2>/dev/null; then
@@ -801,9 +801,12 @@ error() {
     exit 1
 }
 
-# Print info message
+# Print info message. Quiet by default; only prints in verbose mode.
+# Inside gum spin subprocesses, output is captured and shown on error.
 info() {
-    echo -e "${GREEN}$1${NC}"
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo -e "${GREEN}$1${NC}"
+    fi
 }
 
 # Print warning message
@@ -1248,44 +1251,39 @@ sync_repo() {
     fi
 }
 
-# Main function for owner/repo mode
-handle_repo_mode() {
-    local repo="$1"
-    local sprite_name
-    sprite_name=$(repo_to_sprite_name "$repo")
-
-    info "Managing sprite for repository: $repo"
-    info "Sprite name: $sprite_name"
-
-    # Create sprite if it doesn't exist
-    local is_new=false
-    if ! sprite_exists "$sprite_name"; then
-        info "Creating new sprite: $sprite_name"
-        local create_output
-        if create_output=$(sprite create -skip-console "$sprite_name" 2>&1); then
-            wait_for_sprite "$sprite_name"
-            is_new=true
-        elif echo "$create_output" | grep -qi "already exists"; then
-            info "Sprite already exists: $sprite_name"
-        else
-            error "Failed to create sprite: $create_output"
-        fi
-    else
+# Composite function for spin(): create sprite + wait for readiness.
+# Called via spin() in a subprocess — all side effects are remote or file-based.
+_do_create_sprite() {
+    local sprite_name="$1"
+    local create_output
+    if create_output=$(sprite create -skip-console "$sprite_name" 2>&1); then
+        wait_for_sprite "$sprite_name"
+    elif echo "$create_output" | grep -qi "already exists"; then
         info "Sprite already exists: $sprite_name"
+    else
+        error "Failed to create sprite: $create_output"
     fi
+}
 
-    # Setup: fast path skips auth/config/setup if sprite was previously configured
-    if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
-        info "Sprite previously configured, skipping setup"
-    elif [[ "$is_new" == "true" ]]; then
+# Composite function for spin(): full sprite setup (auth, git, config, optional sync + mark ready).
+# Called via spin() in a subprocess. Reads env vars for options.
+# Env: _SETUP_TARGET_DIR, _SETUP_TARGET_DIR_NAME, _SETUP_CURRENT_DIR,
+#      _SETUP_IS_NEW, _SETUP_MODE (dir|repo), CLAUDE_CODE_OAUTH_TOKEN
+_do_setup_sprite() {
+    local sprite_name="$1"
+
+    if [[ "${_SETUP_IS_NEW}" == "true" ]]; then
+        # New sprite: full setup
         setup_sprite_auth "$sprite_name"
         setup_git_config "$sprite_name"
         run_sprite_setup "$sprite_name"
+        if [[ "${_SETUP_MODE}" == "dir" ]]; then
+            sync_local_dir "$sprite_name" "$_SETUP_TARGET_DIR_NAME" "$_SETUP_CURRENT_DIR"
+        fi
         mark_sprite_ready "$sprite_name"
     else
         # Existing sprite, first connect: batch check + selective setup
-        info "Checking sprite state..."
-        batch_check_sprite "$sprite_name" "/home/sprite/$(basename "$repo")"
+        batch_check_sprite "$sprite_name" "$_SETUP_TARGET_DIR"
 
         if [[ "$BATCH_AUTH" != "y" ]]; then
             setup_sprite_auth "$sprite_name"
@@ -1293,20 +1291,61 @@ handle_repo_mode() {
         fi
 
         run_sprite_setup "$sprite_name"
+
+        if [[ "${_SETUP_MODE}" == "dir" ]] && [[ "$BATCH_DIR" != "y" ]]; then
+            sync_local_dir "$sprite_name" "$_SETUP_TARGET_DIR_NAME" "$_SETUP_CURRENT_DIR"
+        fi
+
         mark_sprite_ready "$sprite_name"
+    fi
+}
+
+# Composite function for spin(): clone or pull repository.
+_do_sync_repo() {
+    local sprite_name="$1"
+    local repo="$2"
+    sync_repo "$sprite_name" "$repo"
+}
+
+# Main function for owner/repo mode
+handle_repo_mode() {
+    local repo="$1"
+    local sprite_name
+    sprite_name=$(repo_to_sprite_name "$repo")
+
+    # Pre-acquire token before spinners (interactive prompt can't run inside gum spin)
+    local claude_token
+    claude_token=$(get_claude_token)
+    export CLAUDE_CODE_OAUTH_TOKEN="$claude_token"
+
+    # Create sprite if it doesn't exist
+    local is_new=false
+    if ! sprite_exists "$sprite_name"; then
+        spin "Creating sprite ${sprite_name}..." _do_create_sprite "$sprite_name"
+        is_new=true
+    fi
+
+    # Setup: fast path skips auth/config/setup if sprite was previously configured
+    if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
+        : # Already configured, nothing to do
+    else
+        export _SETUP_TARGET_DIR="/home/sprite/$(basename "$repo")"
+        export _SETUP_TARGET_DIR_NAME=""
+        export _SETUP_CURRENT_DIR=""
+        export _SETUP_IS_NEW="$is_new"
+        export _SETUP_MODE="repo"
+        spin "Setting up sprite..." _do_setup_sprite "$sprite_name"
     fi
 
     # Sync repository (always pull latest)
-    sync_repo "$sprite_name" "$repo"
+    spin "Syncing repository..." _do_sync_repo "$sprite_name" "$repo"
 
     # Open session in the repo directory
-    local repo_dir=$(basename "$repo")
+    local repo_dir
+    repo_dir=$(basename "$repo")
     local session_name
     session_name=$(derive_session_name)
-    info "Opening ${EXEC_CMD} session in $repo_dir (tmux session: $session_name)..."
-
-    local claude_token
-    claude_token=$(get_claude_token)
+    msg "Connecting to $repo_dir (tmux: $session_name)"
 
     exec_in_sprite "$sprite_name" "/home/sprite/$repo_dir" "$claude_token"
 }
@@ -1525,43 +1564,31 @@ handle_current_dir_mode() {
         else
             target_dir_name="$dir_name"
         fi
-        info "Using sprite from .sprite file: $sprite_name"
     elif [[ -n "$repo" ]]; then
-        info "Detected GitHub repository: $repo"
         sprite_name=$(repo_to_sprite_name "$repo")
         target_dir_name=$(basename "$repo")
     else
-        info "No GitHub repository detected, using directory name: $dir_name"
         sprite_name=$(dir_to_sprite_name "$dir_name")
         target_dir_name="$dir_name"
     fi
 
-    info "Working directory: $current_dir"
-    info "Sprite name: $sprite_name"
+    # Pre-acquire token before spinners (interactive prompt can't run inside gum spin)
+    local claude_token
+    claude_token=$(get_claude_token)
+    export CLAUDE_CODE_OAUTH_TOKEN="$claude_token"
 
     # Create sprite if it doesn't exist
     local is_new=false
     if ! sprite_exists "$sprite_name"; then
-        info "Creating new sprite: $sprite_name"
-        local create_output
-        if create_output=$(sprite create -skip-console "$sprite_name" 2>&1); then
-            wait_for_sprite "$sprite_name"
-            is_new=true
-        elif echo "$create_output" | grep -qi "already exists"; then
-            info "Sprite already exists: $sprite_name"
-        else
-            error "Failed to create sprite: $create_output"
-        fi
-    else
-        info "Using existing sprite: $sprite_name"
+        spin "Creating sprite ${sprite_name}..." _do_create_sprite "$sprite_name"
+        is_new=true
     fi
 
     # Set this directory's default sprite so 'sprite' commands without -s use it
     local current_dir_sprite
     current_dir_sprite=$(get_current_dir_sprite)
     if [[ "$current_dir_sprite" != "$sprite_name" ]]; then
-        info "Setting default sprite for this directory: $sprite_name"
-        sprite use "$sprite_name"
+        sprite use "$sprite_name" >/dev/null 2>&1
     fi
 
     local target_dir="/home/sprite/$target_dir_name"
@@ -1575,10 +1602,10 @@ handle_current_dir_mode() {
         # If sync infra (proxy + mutagen) is running, the sprite is fully set up.
         # Skip all setup and connect immediately.
         if has_active_sync "$sprite_name"; then
-            info "Sync active, joining existing session (port ${SSH_PORT})"
             register_sync_user "$sprite_name"
-            local claude_token
-            claude_token=$(get_claude_token)
+            local session_name
+            session_name=$(derive_session_name)
+            msg "Connecting to $target_dir_name (tmux: $session_name)"
             exec_in_sprite "$sprite_name" "$target_dir" "$claude_token"
             return
         fi
@@ -1586,36 +1613,14 @@ handle_current_dir_mode() {
 
     # --- Setup: three paths based on sprite state ---
     if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
-        # FAST PATH: sprite previously set up (state file exists).
-        # Skip auth, git config, sprite_setup, and dir check entirely.
-        info "Sprite previously configured, skipping setup"
-    elif [[ "$is_new" == "true" ]]; then
-        # NEW SPRITE: full setup required
-        setup_sprite_auth "$sprite_name"
-        setup_git_config "$sprite_name"
-        run_sprite_setup "$sprite_name"
-        sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
-        mark_sprite_ready "$sprite_name"
+        : # Already configured, nothing to do
     else
-        # EXISTING SPRITE, FIRST CONNECT: batch check + selective setup.
-        # One remote call replaces 3-5 sequential sprite exec checks.
-        info "Checking sprite state..."
-        batch_check_sprite "$sprite_name" "$target_dir"
-
-        if [[ "$BATCH_AUTH" != "y" ]]; then
-            setup_sprite_auth "$sprite_name"
-            setup_git_config "$sprite_name"
-        fi
-
-        run_sprite_setup "$sprite_name"
-
-        if [[ "$BATCH_DIR" != "y" ]]; then
-            sync_local_dir "$sprite_name" "$target_dir_name" "$current_dir"
-        elif [[ "$SYNC_ENABLED" == "true" ]]; then
-            info "Directory exists on sprite, skipping one-way sync (mutagen will handle it)"
-        fi
-
-        mark_sprite_ready "$sprite_name"
+        export _SETUP_TARGET_DIR="$target_dir"
+        export _SETUP_TARGET_DIR_NAME="$target_dir_name"
+        export _SETUP_CURRENT_DIR="$current_dir"
+        export _SETUP_IS_NEW="$is_new"
+        export _SETUP_MODE="dir"
+        spin "Setting up sprite..." _do_setup_sprite "$sprite_name"
     fi
 
     # Setup bidirectional sync in background if enabled.
@@ -1628,7 +1633,6 @@ handle_current_dir_mode() {
         register_sync_user "$sprite_name"
 
         local sync_log="/tmp/sprite-sync-${sprite_name}.log"
-        info "Starting sync in background (log: $sync_log)"
 
         (
             setup_sync_session "$sprite_name" "$current_dir" "$target_dir"
@@ -1639,19 +1643,22 @@ handle_current_dir_mode() {
     # Open session — the user gets a shell immediately
     local session_name
     session_name=$(derive_session_name)
-    info "Opening ${EXEC_CMD} session in $target_dir_name (tmux session: $session_name)..."
-
-    local claude_token
-    claude_token=$(get_claude_token)
+    msg "Connecting to $target_dir_name (tmux: $session_name)"
 
     exec_in_sprite "$sprite_name" "$target_dir" "$claude_token"
 }
 
 # Set up cleanup trap
-trap cleanup_sync_session EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # Main entry point
 main() {
+    # Self-invocation dispatch for gum spin subprocesses.
+    # spin() runs: "$0" _run func args...
+    if [[ "${1:-}" == "_run" ]]; then
+        shift; VERBOSE=true; "$@"; exit $?
+    fi
+
     check_requirements
 
     if [[ $# -eq 0 ]]; then
@@ -1700,6 +1707,10 @@ main() {
                 SYNC_ENABLED=false
                 shift
                 ;;
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
             --cmd)
                 if [[ $# -lt 2 ]]; then
                     error "--cmd requires an argument"
@@ -1731,6 +1742,9 @@ main() {
     if [[ "$SYNC_ENABLED" == "true" ]]; then
         check_mutagen
     fi
+
+    # Install gum for spinner support (non-fatal)
+    ensure_gum || true
 
     # Dispatch subcommands
     case "$subcommand" in
