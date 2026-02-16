@@ -1463,11 +1463,12 @@ copy_setup_file() {
 
     # Decide whether to copy based on mode
     if [[ "$copy_mode" == "newest" ]]; then
-        # Get remote mtime; if file doesn't exist, remote_mtime will be empty
+        # Get remote mtime; if file doesn't exist or stat fails, remote_mtime is empty
         local remote_mtime
-        remote_mtime=$(sprite exec -s "$sprite_name" stat -c %Y "$remote_path" 2>/dev/null || true)
+        remote_mtime=$(sprite exec -s "$sprite_name" stat -c %Y "$remote_path" 2>/dev/null) || true
 
-        if [[ -n "$remote_mtime" ]]; then
+        # Only compare if we got a valid integer back (stat can emit error text to stdout)
+        if [[ "$remote_mtime" =~ ^[0-9]+$ ]]; then
             local local_mtime
             local_mtime=$(local_file_mtime "$local_path")
             # Skip if remote is same age or newer
@@ -1475,7 +1476,7 @@ copy_setup_file() {
                 return 0
             fi
         fi
-        # Remote missing or local is newer — fall through to copy
+        # Remote missing, stat failed, or local is newer — fall through to copy
     fi
     # "always" mode — no skip check, always copy
 
