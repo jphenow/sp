@@ -351,8 +351,15 @@ unregister_sync_user() {
 
 # Check if sync infrastructure (proxy + mutagen) is already running for a sprite.
 # If healthy, sets SSH_PORT from the existing proxy and returns 0.
+# If the proxy is alive but mutagen is missing or errored, attempts recovery
+# by recreating the mutagen session on the existing proxy — avoids orphaning
+# the proxy by starting a duplicate on a different port.
+# Args: sprite_name [local_dir] [remote_dir]
+#   local_dir/remote_dir are needed for recovery; if omitted, recovery is skipped.
 has_active_sync() {
     local sprite_name="$1"
+    local local_dir="${2:-}"
+    local remote_dir="${3:-}"
     local lock_dir
     lock_dir=$(sync_lock_dir "$sprite_name")
     local port_file="${lock_dir}/port"
@@ -379,13 +386,103 @@ has_active_sync() {
         return 1
     fi
 
+    SSH_PORT="$port"
+
     # Mutagen session should exist (any status is OK — it may be scanning)
     local sync_name="sprite-${sprite_name}"
-    if ! mutagen sync list 2>/dev/null | grep -q "Name: ${sync_name}$"; then
+    local sync_output
+    sync_output=$(mutagen sync list "$sync_name" 2>/dev/null || echo "")
+
+    if echo "$sync_output" | grep -q "Name: ${sync_name}$"; then
+        # Session exists — check for error state
+        if echo "$sync_output" | grep -q "Status:.*[Ee]rror"; then
+            warn "Mutagen sync session in error state, resetting..."
+            mutagen sync reset "$sync_name" 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    # Proxy is alive but mutagen session is gone — try to recover.
+    # Without local/remote dirs we can't recreate the session.
+    if [[ -z "$local_dir" ]] || [[ -z "$remote_dir" ]]; then
         return 1
     fi
 
-    SSH_PORT="$port"
+    warn "Mutagen sync session missing, recreating on existing proxy (port $port)..."
+    recover_mutagen_session "$sprite_name" "$port" "$local_dir" "$remote_dir"
+    return $?
+}
+
+# Recreate a mutagen sync session using an existing healthy proxy.
+# Called when the proxy is alive but the mutagen session disappeared
+# (e.g., daemon restart, crash). Ensures the SSH config points at the
+# right port, then creates a fresh session and waits for initial sync.
+recover_mutagen_session() {
+    local sprite_name="$1"
+    local port="$2"
+    local local_dir="$3"
+    local remote_dir="$4"
+    local sync_name="sprite-${sprite_name}"
+    local ssh_config_marker="# mutagen-sprite-temp-${sprite_name}"
+
+    # Ensure SSH config entry points at the existing proxy port
+    mkdir -p ~/.ssh
+    touch ~/.ssh/config
+    sed -i.bak "/${ssh_config_marker}/,+7d" ~/.ssh/config 2>/dev/null || true
+
+    cat >> ~/.ssh/config <<EOF
+
+${ssh_config_marker}
+Host sprite-mutagen-${sprite_name}
+    HostName localhost
+    Port ${port}
+    User sprite
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    IdentityFile ~/.ssh/id_ed25519
+EOF
+
+    # Terminate any leftover session with this name (shouldn't exist, but be safe)
+    mutagen sync terminate "$sync_name" 2>/dev/null || true
+
+    # Create the sync session
+    mutagen sync create \
+        --name "$sync_name" \
+        --sync-mode two-way-resolved \
+        --ignore "node_modules" \
+        --ignore ".next" \
+        --ignore "dist" \
+        --ignore "build" \
+        --ignore ".DS_Store" \
+        --ignore "._*" \
+        "$local_dir" \
+        "sprite-mutagen-${sprite_name}:${remote_dir}" || {
+        warn "Failed to recreate Mutagen sync session"
+        return 1
+    }
+
+    # Wait briefly for initial sync
+    local attempts=0
+    local max_attempts=60  # 30 seconds
+    while [[ $attempts -lt $max_attempts ]]; do
+        local status
+        status=$(mutagen sync list "$sync_name" 2>/dev/null || echo "")
+
+        if echo "$status" | grep -q "Status: Watching for changes"; then
+            info "Sync session recovered — watching for changes"
+            return 0
+        fi
+
+        if echo "$status" | grep -q "Status:.*[Ee]rror"; then
+            warn "Recovered sync session hit an error"
+            return 1
+        fi
+
+        attempts=$((attempts + 1))
+        sleep 0.5
+    done
+
+    warn "Recovered sync session did not complete initial sync in time, but continuing..."
     return 0
 }
 
@@ -456,15 +553,31 @@ batch_check_sprite() {
 }
 
 # Start sprite proxy for SSH port forwarding.
-# Resolves port collisions by scanning nearby ports when the deterministic port
-# is occupied. The proxy is disowned so it survives this process exiting —
-# cleanup is handled explicitly by the last sync user.
+# Kills any orphaned proxy processes for the same sprite before starting,
+# so we always land on the deterministic port. The proxy is disowned so it
+# survives this process exiting — cleanup is handled by the last sync user.
 start_sprite_proxy() {
     local sprite_name="$1"
     local base_port="$SSH_PORT"
     local port="$base_port"
     local lock_dir
     lock_dir=$(sync_lock_dir "$sprite_name")
+
+    # Kill any orphaned sprite proxy processes for this sprite.
+    # These can survive when a previous sp session's cleanup races with the
+    # disowned proxy (e.g., background sync subshell was killed before it
+    # could record the PID, or the lock dir was already cleaned up).
+    local stale_pid
+    while IFS= read -r stale_pid; do
+        [[ -n "$stale_pid" ]] || continue
+        info "Killing orphaned proxy (PID $stale_pid) for $sprite_name"
+        kill "$stale_pid" 2>/dev/null || true
+    done < <(pgrep -f "sprite proxy -s ${sprite_name} " 2>/dev/null || true)
+
+    # Brief pause to let the port(s) free up after killing orphans
+    if lsof -i ":${port}" >/dev/null 2>&1; then
+        sleep 0.5
+    fi
 
     # Find an available port, starting from the deterministic base.
     # Tries up to 20 consecutive ports to handle hash collisions.
@@ -1493,6 +1606,12 @@ copy_setup_file() {
         sprite exec -s "$sprite_name" -file "${local_path}:${remote_path}" \
             true || warn "Failed to copy $file_path"
     fi
+
+    # sprite exec -file uploads as ubuntu:ubuntu and clobbers parent dir
+    # ownership via mkdirParents. Fix both the file and its parent directory.
+    sprite exec -s "$sprite_name" sh -c \
+        "chown sprite:sprite '$remote_path' '$remote_dir' 2>/dev/null; chown sprite:sprite /home/sprite 2>/dev/null" \
+        || true
 }
 
 # Run a conditional setup command on the sprite.
@@ -1675,8 +1794,10 @@ handle_current_dir_mode() {
         SYNC_SPRITE_NAME="$sprite_name"
         SSH_PORT=$(sprite_ssh_port "$sprite_name")
 
-        if has_active_sync "$sprite_name"; then
-            # Sync already running from another session, just join
+        if has_active_sync "$sprite_name" "$current_dir" "$target_dir"; then
+            # Sync already running (possibly recovered), just join.
+            # Set session name so cleanup can terminate it if we're the last user.
+            SYNC_SESSION_NAME="sprite-${sprite_name}"
             register_sync_user "$sprite_name"
         else
             # Start sync pipeline in background so user gets a shell immediately
