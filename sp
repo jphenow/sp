@@ -1074,9 +1074,10 @@ exec_in_sprite() {
     session_name=$(derive_session_name)
 
     local shell_cmd
-    shell_cmd=$(printf "exec tmux new-session -A -s '%s' %s" "$session_name" "$EXEC_CMD")
+    shell_cmd=$(printf "mkdir -p '%s' && cd '%s' && exec tmux new-session -A -s '%s' %s" \
+        "$work_dir" "$work_dir" "$session_name" "$EXEC_CMD")
 
-    sprite exec -s "$sprite_name" -dir "$work_dir" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty \
+    sprite exec -s "$sprite_name" -env "CLAUDE_CODE_OAUTH_TOKEN=${claude_token}" -tty \
         sh -c "$shell_cmd" || true
 }
 
