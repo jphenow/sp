@@ -1065,6 +1065,8 @@ resolve_sprite_info() {
 # Wrapped in sh -c so sprite exec doesn't consume tmux's -s flag as its own.
 # EXEC_CMD is left unquoted inside the sh -c string so multi-word commands
 # (e.g. "claude -c") are properly word-split into command + arguments.
+# Uses mkdir -p to ensure the work directory exists (initial sync may have
+# failed for large repos) and cd instead of -dir so the command still runs.
 exec_in_sprite() {
     local sprite_name="$1"
     local work_dir="$2"
@@ -1394,7 +1396,7 @@ _do_setup_sprite() {
         setup_git_config "$sprite_name"
         run_sprite_setup "$sprite_name"
         if [[ "${_SETUP_MODE}" == "dir" ]]; then
-            sync_local_dir "$sprite_name" "$_SETUP_TARGET_DIR_NAME" "$_SETUP_CURRENT_DIR"
+            sync_local_dir "$sprite_name" "$_SETUP_TARGET_DIR_NAME" "$_SETUP_CURRENT_DIR" || true
         fi
         mark_sprite_ready "$sprite_name"
     else
@@ -1409,7 +1411,7 @@ _do_setup_sprite() {
         run_sprite_setup "$sprite_name"
 
         if [[ "${_SETUP_MODE}" == "dir" ]] && [[ "$BATCH_DIR" != "y" ]]; then
-            sync_local_dir "$sprite_name" "$_SETUP_TARGET_DIR_NAME" "$_SETUP_CURRENT_DIR"
+            sync_local_dir "$sprite_name" "$_SETUP_TARGET_DIR_NAME" "$_SETUP_CURRENT_DIR" || true
         fi
 
         mark_sprite_ready "$sprite_name"
@@ -1439,7 +1441,7 @@ _do_connect_preflight() {
         setup_sprite_auth "$sprite_name"
         setup_git_config "$sprite_name"
         run_sprite_setup "$sprite_name"
-        sync_local_dir "$sprite_name" "$_PREFLIGHT_TARGET_DIR_NAME" "$_PREFLIGHT_CURRENT_DIR"
+        sync_local_dir "$sprite_name" "$_PREFLIGHT_TARGET_DIR_NAME" "$_PREFLIGHT_CURRENT_DIR" || true
         mark_sprite_ready "$sprite_name"
         return
     fi
@@ -1459,10 +1461,14 @@ _do_connect_preflight() {
         run_sprite_setup "$sprite_name"
 
         if [[ "$BATCH_DIR" != "y" ]]; then
-            sync_local_dir "$sprite_name" "$_PREFLIGHT_TARGET_DIR_NAME" "$_PREFLIGHT_CURRENT_DIR"
+            sync_local_dir "$sprite_name" "$_PREFLIGHT_TARGET_DIR_NAME" "$_PREFLIGHT_CURRENT_DIR" || true
         fi
 
         mark_sprite_ready "$sprite_name"
+    else
+        # Sprite is already set up — still refresh [always] files
+        # so things like auth tokens stay current between connects.
+        copy_always_files "$sprite_name"
     fi
 }
 
@@ -1486,7 +1492,8 @@ handle_repo_mode() {
 
     # Setup: fast path skips auth/config/setup if sprite was previously configured
     if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
-        : # Already configured, nothing to do
+        # Still refresh [always] files (e.g. auth tokens)
+        copy_always_files "$sprite_name"
     else
         export _SETUP_TARGET_DIR="/home/sprite/$(basename "$repo")"
         export _SETUP_TARGET_DIR_NAME=""
@@ -1701,6 +1708,29 @@ run_sprite_setup() {
     done 3< "$SPRITE_SETUP_CONF"
 }
 
+# Copy files annotated with [always] from setup.conf.
+# Called on every connection, even when the sprite is already "ready",
+# so that [always] files (like auth tokens) stay current.
+copy_always_files() {
+    local sprite_name="$1"
+
+    [[ -f "$SPRITE_SETUP_CONF" ]] || return 0
+
+    local section=""
+    while IFS= read -r line <&3 || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+        if [[ "$line" =~ ^\[([a-z]+)\]$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        if [[ "$section" == "files" ]] && [[ "$line" =~ \[always\] ]]; then
+            copy_setup_file "$sprite_name" "$line"
+        fi
+    done 3< "$SPRITE_SETUP_CONF"
+}
+
 # Sync current directory to sprite
 # Args: sprite_name, target_dir_name (basename for /home/sprite/<name>), source_dir
 sync_local_dir() {
@@ -1711,8 +1741,8 @@ sync_local_dir() {
 
     info "Syncing local directory to sprite..."
 
-    # Create a temporary tar file excluding git, node_modules, etc.
-    # COPYFILE_DISABLE prevents macOS from creating ._* resource fork files
+    # Create a temporary tar file excluding build artifacts and dependencies.
+    # COPYFILE_DISABLE prevents macOS from creating ._* resource fork files.
     local temp_tar="/tmp/sprite-sync-$$.tar.gz"
     COPYFILE_DISABLE=1 tar -czf "$temp_tar" \
         --no-xattrs \
@@ -1722,13 +1752,26 @@ sync_local_dir() {
         --exclude='build' \
         --exclude='.DS_Store' \
         --exclude='._*' \
+        --exclude='_build' \
+        --exclude='deps' \
+        --exclude='.elixir_ls' \
         -C "$(dirname "$current_dir")" \
-        "$(basename "$current_dir")" 2>/dev/null || error "Failed to create archive"
+        "$(basename "$current_dir")" 2>/dev/null || {
+        warn "Failed to create archive for initial sync"
+        rm -f "$temp_tar"
+        return 1
+    }
 
-    # Upload and extract in sprite (use absolute path for -file)
+    # Upload and extract in sprite (use absolute path for -file).
+    # Non-fatal: if the tar is too large for the upload timeout, the sprite
+    # still boots and mutagen (if enabled) will sync files incrementally.
     info "Uploading directory contents..."
     sprite exec -s "$sprite_name" -file "${temp_tar}:/home/sprite/sync.tar.gz" \
-        sh -c "cd ~ && tar -xzf sync.tar.gz 2>/dev/null && rm sync.tar.gz" || error "Failed to upload and extract"
+        sh -c "cd ~ && tar -xzf sync.tar.gz 2>/dev/null && rm sync.tar.gz" || {
+        warn "Initial sync upload failed (archive may be too large). Mutagen will sync files if enabled."
+        rm -f "$temp_tar"
+        return 1
+    }
 
     # Clean up
     rm -f "$temp_tar"
