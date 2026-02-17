@@ -882,6 +882,9 @@ reset_terminal() {
 # Cleanup function called on exit.
 # Uses reference counting: only tears down sync infra when this is the last
 # sp process using it. Otherwise leaves proxy + mutagen running for others.
+# When this is the last user, waits a grace period before tearing down to
+# allow a reconnecting sp process to register — avoids destroying sync
+# infrastructure during brief connection drops / session recovery.
 # Always resets terminal mouse modes regardless of how we exited.
 cleanup() {
     reset_terminal
@@ -895,9 +898,55 @@ cleanup() {
     fi
 
     if unregister_sync_user "$SYNC_SPRITE_NAME"; then
-        # We're the last user — tear everything down
-        stop_mutagen_sync
-        stop_sprite_proxy "$SYNC_SPRITE_NAME"
+        # We're the last user — defer teardown with a grace period.
+        # A reconnecting sp process can register during this window,
+        # inheriting the running proxy + mutagen session intact.
+        # Run the deferred teardown in a detached background process so
+        # the user's terminal isn't blocked waiting for the grace period.
+        local _sprite="$SYNC_SPRITE_NAME"
+        local _session="$SYNC_SESSION_NAME"
+        (
+            local grace_seconds=30
+            local elapsed=0
+            local lock_dir
+            lock_dir=$(sync_lock_dir "$_sprite")
+
+            while [[ $elapsed -lt $grace_seconds ]]; do
+                sleep 1
+                elapsed=$((elapsed + 1))
+
+                # Check if a new sp process registered as a sync user
+                for pid_file in "${lock_dir}"/*.user; do
+                    [[ -f "$pid_file" ]] || continue
+                    local pid
+                    pid=$(cat "$pid_file" 2>/dev/null || echo "")
+                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                        # A new sp process showed up — leave sync running
+                        exit 0
+                    fi
+                done
+            done
+
+            # Nobody reconnected — tear everything down
+            if [[ -n "$_session" ]]; then
+                mutagen sync terminate "$_session" 2>/dev/null || true
+                local ssh_config_marker="# mutagen-sprite-temp-"
+                if [[ -f ~/.ssh/config ]]; then
+                    sed -i.bak "/${ssh_config_marker}/,+7d" ~/.ssh/config 2>/dev/null || true
+                fi
+            fi
+
+            local proxy_pid_file="${lock_dir}/proxy.pid"
+            if [[ -f "$proxy_pid_file" ]]; then
+                local proxy_pid
+                proxy_pid=$(cat "$proxy_pid_file" 2>/dev/null || echo "")
+                if [[ -n "$proxy_pid" ]]; then
+                    kill "$proxy_pid" 2>/dev/null || true
+                fi
+            fi
+            rm -rf "$lock_dir" 2>/dev/null || true
+        ) &
+        disown $! 2>/dev/null || true
     fi
 }
 
@@ -1410,9 +1459,9 @@ _do_setup_sprite() {
 
         run_sprite_setup "$sprite_name"
 
-        if [[ "${_SETUP_MODE}" == "dir" ]] && [[ "$BATCH_DIR" != "y" ]]; then
-            sync_local_dir "$sprite_name" "$_SETUP_TARGET_DIR_NAME" "$_SETUP_CURRENT_DIR" || true
-        fi
+        # Skip tar sync for existing sprites — their files may have been
+        # updated remotely and a naive tar overwrite would clobber those
+        # changes. Mutagen (if enabled) will reconcile diffs incrementally.
 
         mark_sprite_ready "$sprite_name"
     fi
@@ -1460,9 +1509,9 @@ _do_connect_preflight() {
 
         run_sprite_setup "$sprite_name"
 
-        if [[ "$BATCH_DIR" != "y" ]]; then
-            sync_local_dir "$sprite_name" "$_PREFLIGHT_TARGET_DIR_NAME" "$_PREFLIGHT_CURRENT_DIR" || true
-        fi
+        # Skip tar sync for existing sprites — their files may have been
+        # updated remotely and a naive tar overwrite would clobber those
+        # changes. Mutagen (if enabled) will reconcile diffs incrementally.
 
         mark_sprite_ready "$sprite_name"
     else
