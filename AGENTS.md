@@ -319,6 +319,8 @@ sprite delete gh-owner--repo
 sp .  # Will create fresh sprite and sync
 ```
 
+**Note:** Sync infrastructure (proxy + Mutagen) stays alive for 30 seconds after you disconnect, so reconnecting quickly with `sp .` reuses the existing session. The initial tar-based file upload only runs when a sprite is first created — reconnecting to an existing sprite never overwrites remote files; Mutagen handles incremental reconciliation.
+
 ## Advanced Patterns
 
 ### CI/CD Integration

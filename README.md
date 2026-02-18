@@ -155,7 +155,8 @@ Sync is **on by default**. Real-time bidirectional file syncing via Mutagen keep
 - Changes you make locally are automatically synced to the sprite
 - Changes made in the sprite are automatically synced back to your machine
 - Sync session is active while `sp` is running
-- Automatic cleanup when you exit
+- On exit, sync infrastructure stays alive for 30 seconds to allow quick reconnection — if you run `sp .` again within that window, mutagen resumes without restarting
+- Initial file upload (tar) only happens when a sprite is **first created** — reconnecting to an existing sprite relies entirely on Mutagen for incremental sync, so remote edits are never clobbered
 
 **Prerequisites:**
 - Mutagen installed locally: `brew install mutagen`

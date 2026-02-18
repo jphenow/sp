@@ -60,6 +60,9 @@ Before submitting a pull request:
 4. Test cleanup:
    - Verify no temp files are left behind
    - Check that sprites are properly configured
+   - Verify sync grace period: after exiting, proxy + mutagen stay alive for ~30s
+   - Verify reconnecting within the grace period reuses existing sync (no restart)
+   - Verify sync tears down after grace period expires with no reconnection
 
 ## Code Style
 
@@ -226,11 +229,12 @@ Test these scenarios before submitting:
 - [ ] Editing setup.conf re-triggers setup on next connect
 
 ### Current Directory Mode
-- [ ] Sync local directory
+- [ ] Sync local directory (tar upload only on new sprites; Mutagen for reconnects)
 - [ ] Verify exclusions work (node_modules, .next, etc.)
 - [ ] Verify `.git` is included in sync
 - [ ] Verify git repository state maintained
 - [ ] Test with uncommitted changes
+- [ ] Verify reconnecting to existing sprite does NOT re-tar-sync (remote edits preserved)
 
 ### Error Conditions
 - [ ] Invalid repository format
