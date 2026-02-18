@@ -1790,26 +1790,50 @@ sync_local_dir() {
 
     info "Syncing local directory to sprite..."
 
-    # Create a temporary tar file excluding build artifacts and dependencies.
+    # Create a temporary tar file of the directory contents.
     # COPYFILE_DISABLE prevents macOS from creating ._* resource fork files.
+    #
+    # If the directory is a git repo, use `git ls-files` to respect .gitignore
+    # and avoid uploading build artifacts, binaries, and other ignored files.
+    # Falls back to hardcoded excludes for non-git directories.
     local temp_tar="/tmp/sprite-sync-$$.tar.gz"
-    COPYFILE_DISABLE=1 tar -czf "$temp_tar" \
-        --no-xattrs \
-        --exclude='node_modules' \
-        --exclude='.next' \
-        --exclude='dist' \
-        --exclude='build' \
-        --exclude='.DS_Store' \
-        --exclude='._*' \
-        --exclude='_build' \
-        --exclude='deps' \
-        --exclude='.elixir_ls' \
-        -C "$(dirname "$current_dir")" \
-        "$(basename "$current_dir")" 2>/dev/null || {
-        warn "Failed to create archive for initial sync"
-        rm -f "$temp_tar"
-        return 1
-    }
+    local dir_basename
+    dir_basename=$(basename "$current_dir")
+
+    if git -C "$current_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # Git repo: tar only tracked + untracked-but-not-ignored files.
+        # Prefix each path with the directory basename so the tar extracts
+        # into /home/sprite/<dir_basename>/ matching the target layout.
+        git -C "$current_dir" ls-files -co --exclude-standard \
+            | sed "s|^|${dir_basename}/|" \
+            | COPYFILE_DISABLE=1 tar -czf "$temp_tar" \
+                --no-xattrs \
+                -C "$(dirname "$current_dir")" \
+                -T - 2>/dev/null || {
+            warn "Failed to create archive for initial sync"
+            rm -f "$temp_tar"
+            return 1
+        }
+    else
+        # Not a git repo: use hardcoded excludes for common build artifacts.
+        COPYFILE_DISABLE=1 tar -czf "$temp_tar" \
+            --no-xattrs \
+            --exclude='node_modules' \
+            --exclude='.next' \
+            --exclude='dist' \
+            --exclude='build' \
+            --exclude='.DS_Store' \
+            --exclude='._*' \
+            --exclude='_build' \
+            --exclude='deps' \
+            --exclude='.elixir_ls' \
+            -C "$(dirname "$current_dir")" \
+            "$dir_basename" 2>/dev/null || {
+            warn "Failed to create archive for initial sync"
+            rm -f "$temp_tar"
+            return 1
+        }
+    fi
 
     # Upload and extract in sprite (use absolute path for -file).
     # Non-fatal: if the tar is too large for the upload timeout, the sprite
