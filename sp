@@ -1465,6 +1465,9 @@ _do_setup_sprite() {
 
         mark_sprite_ready "$sprite_name"
     fi
+
+    # Always (re)install the open wrapper so we can iterate on it
+    install_open_wrapper "$sprite_name"
 }
 
 # Composite function for spin(): clone or pull repository.
@@ -1519,6 +1522,9 @@ _do_connect_preflight() {
         # so things like auth tokens stay current between connects.
         copy_always_files "$sprite_name"
     fi
+
+    # Always (re)install the open wrapper so we can iterate on it
+    install_open_wrapper "$sprite_name"
 }
 
 # Main function for owner/repo mode
@@ -1543,6 +1549,7 @@ handle_repo_mode() {
     if [[ "$is_new" != "true" ]] && is_sprite_ready "$sprite_name"; then
         # Still refresh [always] files (e.g. auth tokens)
         copy_always_files "$sprite_name"
+        install_open_wrapper "$sprite_name"
     else
         export _SETUP_TARGET_DIR="/home/sprite/$(basename "$repo")"
         export _SETUP_TARGET_DIR_NAME=""
@@ -1755,6 +1762,49 @@ run_sprite_setup() {
                 ;;
         esac
     done 3< "$SPRITE_SETUP_CONF"
+}
+
+# Install a tmux-aware `open` wrapper inside the sprite.
+# The sprite CLI uses a custom OSC escape sequence (ESC ] 9999;browser-open;URL ST)
+# to open URLs in the user's local browser. When the session runs inside tmux
+# (as sp does), tmux swallows unknown OSC sequences before they reach the
+# sprite transport. This wrapper detects $TMUX and wraps the OSC in a DCS
+# passthrough envelope so it passes through tmux to the sprite client.
+# Always reinstalled on connect so we can iterate on the implementation.
+install_open_wrapper() {
+    local sprite_name="$1"
+
+    # Write the wrapper to a local temp file, upload it via -file, then
+    # move it into place and ensure ~/bin is on PATH. Using -file avoids
+    # all quoting/escaping issues with nested heredocs and escape sequences.
+    local tmp_open="/tmp/sprite-open-wrapper-$$.sh"
+    cat > "$tmp_open" <<'OPEN_WRAPPER'
+#!/bin/sh
+# Sprite-aware open command — emits OSC 9999 to open URLs in the local browser.
+# Installed by sp. When inside tmux, wraps the sequence in DCS passthrough.
+
+url="$1"
+if [ -z "$url" ]; then
+    echo "Usage: open <url>" >&2
+    exit 1
+fi
+
+# Emit the OSC 9999 browser-open sequence.
+# Inside tmux, wrap in DCS passthrough so the escape reaches the sprite client.
+if [ -n "$TMUX" ]; then
+    # DCS passthrough: \ePtmux; then inner sequence with ESC doubled, then \e\\
+    printf '\ePtmux;\e\e]9999;browser-open;%s\a\e\\' "$url"
+else
+    printf '\e]9999;browser-open;%s\a' "$url"
+fi
+OPEN_WRAPPER
+
+    sprite exec -s "$sprite_name" \
+        -file "${tmp_open}:/tmp/sprite-open-wrapper.sh" \
+        sh -c 'mkdir -p ~/bin && mv /tmp/sprite-open-wrapper.sh ~/bin/open && chmod +x ~/bin/open && if ! grep -q "HOME/bin" ~/.profile 2>/dev/null; then echo "export PATH=\"\$HOME/bin:\$PATH\"" >> ~/.profile; fi' \
+        2>/dev/null || true
+
+    rm -f "$tmp_open"
 }
 
 # Copy files annotated with [always] from setup.conf.
