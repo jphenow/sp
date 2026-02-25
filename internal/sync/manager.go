@@ -130,7 +130,10 @@ func (m *Manager) SetupSSHServer(spriteName string) error {
 			sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server 2>/dev/null || true
 		fi
 
-		# Fix permissions on home dir and .ssh (sshd is strict about these)
+		# Fix ownership and permissions on home dir and .ssh (sshd is strict about these).
+		# Sprites may have /home/sprite owned by ubuntu — sshd rejects authorized_keys
+		# unless the home dir is owned by the authenticating user.
+		sudo chown sprite:sprite /home/sprite
 		chmod 755 /home/sprite
 		chmod 700 /home/sprite/.ssh
 
