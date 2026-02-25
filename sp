@@ -101,7 +101,7 @@ Setup config (~/.config/sprite/setup.conf):
   ~/.tmux.conf [always]            # Always overwrite, even if remote is newer
 
   [commands]
-  # condition :: command (command runs when condition fails on sprite)
+  # condition :: command (command runs when condition succeeds on sprite)
   ! command -v opencode :: curl -fsSL https://opencode.ai/install | bash &
 
 Examples:
