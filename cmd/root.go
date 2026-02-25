@@ -57,6 +57,12 @@ func runDefault(cmd *cobra.Command, args []string) error {
 		if v, _ := cmd.Flags().GetBool("web"); v {
 			webMode = true
 		}
+		if v, _ := cmd.Flags().GetBool("web-proxy"); v {
+			webProxy = true
+		}
+		if v, _ := cmd.Flags().GetInt("web-dev-port"); v != 0 {
+			webDevPort = v
+		}
 
 		// Handle -- separator for exec command
 		connectArgs := args
@@ -83,6 +89,8 @@ func init() {
 	rootCmd.Flags().Bool("no-sync", false, "disable file syncing")
 	rootCmd.Flags().String("name", "", "tmux session name")
 	rootCmd.Flags().Bool("web", false, "enable opencode web UI via sprite service")
+	rootCmd.Flags().Bool("web-proxy", false, "enable reverse proxy in front of opencode")
+	rootCmd.Flags().Int("web-dev-port", 0, "development server port for proxy fallthrough")
 
 	// Prevent cobra from complaining about unknown flags being passed through --
 	rootCmd.TraverseChildren = true

@@ -23,6 +23,8 @@ var (
 	noSync      bool
 	sessionName string
 	webMode     bool
+	webProxy    bool
+	webDevPort  int
 	execCmd     string
 )
 
@@ -44,6 +46,8 @@ func init() {
 	connectCmd.Flags().BoolVar(&noSync, "no-sync", false, "disable file syncing")
 	connectCmd.Flags().StringVar(&sessionName, "name", "", "tmux session name")
 	connectCmd.Flags().BoolVar(&webMode, "web", false, "enable opencode web UI via sprite service")
+	connectCmd.Flags().BoolVar(&webProxy, "web-proxy", false, "enable reverse proxy in front of opencode (routes /opencode to opencode, /* to dev server)")
+	connectCmd.Flags().IntVar(&webDevPort, "web-dev-port", 0, "development server port for proxy fallthrough (requires --web-proxy)")
 	connectCmd.Flags().StringVar(&execCmd, "exec", "", "command to run instead of bash")
 
 	// Register connect as both a subcommand and the default action
@@ -157,6 +161,14 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Setup web service if requested
+	if webMode {
+		fmt.Println("Setting up web service...")
+		if err := setupWebService(client, resolved.SpriteName); err != nil {
+			return fmt.Errorf("setting up web service: %w", err)
+		}
+	}
+
 	// Register with daemon
 	if err := registerWithDaemon(resolved); err != nil {
 		// Non-fatal: daemon might not be running
@@ -177,6 +189,137 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	// Connect to sprite shell
 	return execInSprite(client, resolved, token)
+}
+
+// defaultOpencodePort is the port opencode web listens on inside the sprite.
+const defaultOpencodePort = 8080
+
+// defaultProxyPort is the port the sp serve proxy listens on when --web-proxy is used.
+const defaultProxyPort = 9000
+
+// setupWebService configures a sprite-env service for the opencode web UI with
+// auto-wake on HTTP access. There are two modes:
+//
+// Direct mode (default): creates a service running `opencode web --port 8080`
+// with --http-port 8080 so the sprite proxy routes directly to opencode.
+//
+// Proxy mode (--web-proxy): uploads the sp binary to the sprite and creates a
+// service running `sp serve --opencode-port 8080 --proxy-port 9000` with
+// --http-port 9000. This lets /opencode route to opencode and /* fall through
+// to a dev server.
+func setupWebService(client *sprite.Client, spriteName string) error {
+	// Ensure opencode is installed
+	_, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "command -v opencode || (curl -fsSL https://opencode.ai/install | bash)"},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: opencode install check failed: %v\n", err)
+	}
+
+	// Delete any existing opencode/sp-web service to avoid conflicts
+	client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sprite-env", "services", "delete", "opencode"},
+	})
+	client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sprite-env", "services", "delete", "sp-web"},
+	})
+
+	if webProxy {
+		return setupWebServiceProxy(client, spriteName)
+	}
+	return setupWebServiceDirect(client, spriteName)
+}
+
+// setupWebServiceDirect creates a sprite service running opencode web directly
+// on the HTTP port. The sprite proxy routes all traffic to opencode.
+func setupWebServiceDirect(client *sprite.Client, spriteName string) error {
+	port := defaultOpencodePort
+
+	// Create the service with http-port for auto-wake
+	createCmd := fmt.Sprintf(
+		"sprite-env services create opencode --cmd opencode --args web,--port,%d --http-port %d --duration 10s",
+		port, port,
+	)
+
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", createCmd},
+	})
+	if err != nil {
+		return fmt.Errorf("creating opencode service: %w\n%s", err, string(out))
+	}
+	fmt.Printf("  opencode service created on port %d\n", port)
+
+	// Get and display the sprite URL
+	info, err := client.Get(spriteName)
+	if err == nil && info != nil {
+		fmt.Printf("  URL: %s\n", info.URL)
+	}
+
+	return nil
+}
+
+// setupWebServiceProxy uploads the sp binary to the sprite and creates a service
+// running `sp serve` as a reverse proxy with /opencode routing and dev server fallthrough.
+func setupWebServiceProxy(client *sprite.Client, spriteName string) error {
+	oc := defaultOpencodePort
+	pp := defaultProxyPort
+
+	// Build the linux binary for the sprite
+	fmt.Println("  Building sp binary for sprite (linux/amd64)...")
+	buildCmd := exec.Command("go", "build", "-o", "/tmp/sp-linux-amd64", ".")
+	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("building sp binary: %w\n%s", err, string(out))
+	}
+	defer os.Remove("/tmp/sp-linux-amd64")
+
+	// Upload sp binary to the sprite
+	fmt.Println("  Uploading sp binary to sprite...")
+	if _, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "chmod +x /usr/local/bin/sp"},
+		Files:   map[string]string{"/tmp/sp-linux-amd64": "/usr/local/bin/sp"},
+	}); err != nil {
+		return fmt.Errorf("uploading sp binary: %w", err)
+	}
+
+	// Build the service args
+	args := fmt.Sprintf("serve,--opencode-port,%d,--proxy-port,%d", oc, pp)
+	if webDevPort > 0 {
+		args += fmt.Sprintf(",--dev-port,%d", webDevPort)
+	}
+
+	createCmd := fmt.Sprintf(
+		"sprite-env services create sp-web --cmd /usr/local/bin/sp --args %s --http-port %d --duration 10s",
+		args, pp,
+	)
+
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", createCmd},
+	})
+	if err != nil {
+		return fmt.Errorf("creating sp-web service: %w\n%s", err, string(out))
+	}
+
+	fmt.Printf("  sp-web proxy service created on port %d\n", pp)
+	fmt.Printf("    /opencode -> localhost:%d (opencode web)\n", oc)
+	if webDevPort > 0 {
+		fmt.Printf("    /*        -> localhost:%d (dev server)\n", webDevPort)
+	}
+
+	// Get and display the sprite URL
+	info, err := client.Get(spriteName)
+	if err == nil && info != nil {
+		fmt.Printf("  URL: %s\n", info.URL)
+		fmt.Printf("  opencode: %s/opencode\n", info.URL)
+	}
+
+	return nil
 }
 
 // waitForSpriteReady polls until the sprite responds to commands.
