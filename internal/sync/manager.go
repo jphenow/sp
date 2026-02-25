@@ -172,28 +172,50 @@ func (m *Manager) StartProxy(spriteName string) (*exec.Cmd, int, error) {
 	return cmd, port, nil
 }
 
-// killStaleProxies finds and kills any orphaned sprite proxy processes for a
-// given sprite to free up the deterministic port.
+// killStaleProxies finds and kills any process listening on the deterministic
+// SSH proxy port, then waits for the port to actually be free.
 func killStaleProxies(spriteName string, port int) {
-	// Check if anything is using our port
-	if err := exec.Command("lsof", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Run(); err != nil {
+	// Use lsof to find the PID of whatever is listening on our port.
+	// -t returns just the PID(s), -i selects by address, -sTCP:LISTEN filters.
+	out, err := exec.Command("lsof", "-t", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Output()
+	if err != nil {
 		return // Port is free
 	}
-	slog.Info("proxy: killing stale process on port", "sprite", spriteName, "port", port)
-	// Try to find and kill the specific sprite proxy
-	out, err := exec.Command("pgrep", "-f", fmt.Sprintf("sprite proxy -s %s", spriteName)).Output()
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		slog.Info("proxy: killing stale process on port", "sprite", spriteName, "port", port, "pid", pid)
+		proc, _ := os.FindProcess(pid)
+		if proc != nil {
+			proc.Signal(syscall.SIGTERM)
+		}
+	}
+
+	// Wait for the port to actually be free (up to 5s)
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if exec.Command("lsof", "-t", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Run() != nil {
+			slog.Info("proxy: port is free", "sprite", spriteName, "port", port)
+			return
+		}
+	}
+
+	// Last resort: SIGKILL anything still on the port
+	slog.Warn("proxy: port still occupied after SIGTERM, force-killing", "sprite", spriteName, "port", port)
+	out, err = exec.Command("lsof", "-t", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Output()
 	if err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			pid, err := strconv.Atoi(strings.TrimSpace(line))
 			if err == nil && pid > 0 {
-				slog.Info("proxy: killing stale pid", "sprite", spriteName, "pid", pid)
 				proc, _ := os.FindProcess(pid)
 				if proc != nil {
 					proc.Kill()
 				}
 			}
 		}
-		// Brief pause to let the port free up
 		time.Sleep(500 * time.Millisecond)
 	}
 }
