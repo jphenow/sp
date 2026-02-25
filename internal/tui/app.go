@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -57,6 +58,10 @@ type Model struct {
 	selectedSprite *store.Sprite
 	selectedTags   []string
 
+	// Delete confirmation state
+	confirmDelete bool   // when true, waiting for y/n to confirm delete
+	deleteName    string // name of sprite pending deletion
+
 	// Binary change detection
 	startBinaryHash string // hash at TUI startup
 	binaryChanged   bool   // true if we detected a new binary
@@ -93,6 +98,25 @@ type binaryCheckMsg time.Time
 
 // binaryChangedMsg indicates the on-disk binary differs from what's running.
 type binaryChangedMsg struct{}
+
+// consoleFinishedMsg is sent when an interactive console session ends and
+// control returns to the TUI.
+type consoleFinishedMsg struct {
+	err error
+}
+
+// syncToggledMsg is sent after a sync start/stop operation completes.
+type syncToggledMsg struct {
+	name   string
+	action string // "started" or "stopped"
+	err    error
+}
+
+// deleteResultMsg is sent after a sprite delete operation completes.
+type deleteResultMsg struct {
+	name string
+	err  error
+}
 
 // NewModel creates a new TUI model connected to the daemon.
 func NewModel(client *daemon.Client, opts FilterOptions) Model {
@@ -177,6 +201,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh sprite list on any state change
 		return m, m.fetchSprites
 
+	case consoleFinishedMsg:
+		// Console session ended — refresh sprites to pick up any changes.
+		if msg.err != nil {
+			m.err = msg.err
+		}
+		return m, m.fetchSprites
+
+	case syncToggledMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Sync %s for %s", msg.action, msg.name)
+		}
+		return m, m.fetchSprites
+
+	case deleteResultMsg:
+		m.confirmDelete = false
+		m.deleteName = ""
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Deleted sprite %s", msg.name)
+			// If we were viewing the deleted sprite's detail, go back
+			if m.currentView == viewDetail && m.selectedSprite != nil && m.selectedSprite.Name == msg.name {
+				m.currentView = viewDashboard
+				m.selectedSprite = nil
+			}
+		}
+		return m, m.fetchSprites
+
 	case reconnectedMsg:
 		// Daemon connection was broken and we reconnected. Swap the client
 		// and immediately re-fetch sprites.
@@ -209,6 +263,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKey processes keyboard input based on current view.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Delete confirmation intercepts all keys
+	if m.confirmDelete {
+		return m.handleDeleteConfirm(msg)
+	}
+
 	// Global keys
 	switch msg.String() {
 	case "ctrl+c", "q":
@@ -266,6 +325,27 @@ func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.sprites) > 0 && m.cursor < len(m.sprites) {
 			return m, m.promptTag(m.sprites[m.cursor].Name)
 		}
+	case "o":
+		// Open sprite URL in browser
+		if s := m.selectedDashboardSprite(); s != nil {
+			return m, m.openInBrowser(s)
+		}
+	case "c":
+		// Connect to sprite via interactive console
+		if s := m.selectedDashboardSprite(); s != nil {
+			return m, m.connectConsole(s)
+		}
+	case "s":
+		// Toggle sync start/stop
+		if s := m.selectedDashboardSprite(); s != nil {
+			return m, m.toggleSync(s)
+		}
+	case "d":
+		// Delete sprite (enter confirmation mode)
+		if s := m.selectedDashboardSprite(); s != nil {
+			m.confirmDelete = true
+			m.deleteName = s.Name
+		}
 	}
 	return m, nil
 }
@@ -277,6 +357,27 @@ func (m Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.currentView = viewDashboard
 	case "r":
 		return m, m.fetchSprites
+	case "o":
+		// Open sprite URL in browser
+		if m.selectedSprite != nil {
+			return m, m.openInBrowser(m.selectedSprite)
+		}
+	case "c":
+		// Connect to sprite via interactive console
+		if m.selectedSprite != nil {
+			return m, m.connectConsole(m.selectedSprite)
+		}
+	case "s":
+		// Toggle sync start/stop
+		if m.selectedSprite != nil {
+			return m, m.toggleSync(m.selectedSprite)
+		}
+	case "d":
+		// Delete sprite (enter confirmation mode)
+		if m.selectedSprite != nil {
+			m.confirmDelete = true
+			m.deleteName = m.selectedSprite.Name
+		}
 	}
 	return m, nil
 }
@@ -402,9 +503,15 @@ func (m Model) viewDashboard() string {
 		b.WriteString(m.message)
 	}
 
+	// Delete confirmation banner
+	if m.confirmDelete {
+		b.WriteString("\n")
+		b.WriteString(ErrorStyle.Render(fmt.Sprintf("Delete sprite %q? [y] confirm  [n/esc] cancel", m.deleteName)))
+	}
+
 	// Help bar
 	b.WriteString("\n")
-	help := "[↑↓/jk] navigate  [enter] details  [f] filter  [t] tag  [r] refresh  [q] quit"
+	help := "[↑↓/jk] navigate  [enter] details  [o] open  [c] console  [s] sync  [d] delete  [f] filter  [t] tag  [r] refresh  [q] quit"
 	b.WriteString(HelpStyle.Render(help))
 
 	return b.String()
@@ -467,9 +574,15 @@ func (m Model) viewDetail() string {
 		b.WriteString("\n")
 	}
 
+	// Delete confirmation banner
+	if m.confirmDelete {
+		b.WriteString("\n")
+		b.WriteString(ErrorStyle.Render(fmt.Sprintf("Delete sprite %q? [y] confirm  [n/esc] cancel", m.deleteName)))
+	}
+
 	// Help
 	b.WriteString("\n")
-	help := "[esc] back  [r] refresh  [q] quit"
+	help := "[esc] back  [o] open  [c] console  [s] sync  [d] delete  [r] refresh  [q] quit"
 	b.WriteString(HelpStyle.Render(help))
 
 	return b.String()
@@ -576,5 +689,114 @@ func (m Model) promptTag(name string) tea.Cmd {
 			return errMsg{err: err}
 		}
 		return msgMsg(fmt.Sprintf("Added 'work' tag to %s", name))
+	}
+}
+
+// selectedDashboardSprite returns the sprite at the current cursor position, or nil.
+func (m Model) selectedDashboardSprite() *store.Sprite {
+	if len(m.sprites) > 0 && m.cursor < len(m.sprites) {
+		return m.sprites[m.cursor]
+	}
+	return nil
+}
+
+// openInBrowser opens the sprite's public URL in the default browser.
+func (m Model) openInBrowser(s *store.Sprite) tea.Cmd {
+	return func() tea.Msg {
+		url := s.URL
+		if url == "" {
+			return errMsg{err: fmt.Errorf("no URL for sprite %s", s.Name)}
+		}
+		if err := exec.Command("open", url).Start(); err != nil {
+			return errMsg{err: fmt.Errorf("opening browser: %w", err)}
+		}
+		return msgMsg(fmt.Sprintf("Opened %s", url))
+	}
+}
+
+// connectConsole suspends the TUI and opens an interactive console session to
+// the sprite using `sprite exec`. When the session ends, the TUI resumes.
+func (m Model) connectConsole(s *store.Sprite) tea.Cmd {
+	name := s.Name
+	org := s.Org
+	remotePath := s.RemotePath
+	if remotePath == "" {
+		remotePath = "/home/sprite"
+	}
+
+	shellCmd := fmt.Sprintf(
+		"mkdir -p '%s' && cd '%s' && exec tmux new-session -A -s console bash",
+		remotePath, remotePath,
+	)
+
+	args := []string{"exec"}
+	if org != "" {
+		args = append(args, "-o", org)
+	}
+	args = append(args, "-s", name, "-tty", "sh", "-c", shellCmd)
+
+	c := exec.Command("sprite", args...)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return consoleFinishedMsg{err: err}
+	})
+}
+
+// toggleSync starts or stops sync for a sprite depending on its current sync status.
+func (m Model) toggleSync(s *store.Sprite) tea.Cmd {
+	return func() tea.Msg {
+		name := s.Name
+		switch s.SyncStatus {
+		case "watching", "syncing", "connecting", "recovering":
+			// Sync is active — stop it
+			if err := m.client.StopSync(name); err != nil {
+				return syncToggledMsg{name: name, action: "stopped", err: err}
+			}
+			return syncToggledMsg{name: name, action: "stopped"}
+		default:
+			// Sync is not active — start it
+			if s.LocalPath == "" {
+				return syncToggledMsg{name: name, action: "started",
+					err: fmt.Errorf("no local path configured for %s", name)}
+			}
+			req := daemon.StartSyncRequest{
+				SpriteName: name,
+				LocalPath:  s.LocalPath,
+				RemotePath: s.RemotePath,
+				Org:        s.Org,
+			}
+			if _, err := m.client.StartSync(req); err != nil {
+				return syncToggledMsg{name: name, action: "started", err: err}
+			}
+			return syncToggledMsg{name: name, action: "started"}
+		}
+	}
+}
+
+// handleDeleteConfirm processes keys during delete confirmation mode.
+func (m Model) handleDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		name := m.deleteName
+		return m, m.deleteSprite(name)
+	case "n", "N", "esc":
+		m.confirmDelete = false
+		m.deleteName = ""
+	}
+	return m, nil
+}
+
+// deleteSprite removes a sprite from both the daemon database and the remote
+// Sprites API. Stops sync first if running.
+func (m Model) deleteSprite(name string) tea.Cmd {
+	return func() tea.Msg {
+		// Stop sync first (ignore errors — may not be running)
+		m.client.StopSync(name)
+
+		// Delete from daemon database
+		if err := m.client.DeleteSprite(name); err != nil {
+			return deleteResultMsg{name: name, err: fmt.Errorf("deleting from database: %w", err)}
+		}
+
+		return deleteResultMsg{name: name}
 	}
 }

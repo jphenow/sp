@@ -8,7 +8,11 @@ import (
 
 // UpsertSprite creates or updates a sprite record in the database.
 // Fields that are non-empty in the input overwrite existing values.
+// Returns an error if the sprite name is empty.
 func (d *DB) UpsertSprite(s *Sprite) error {
+	if s.Name == "" {
+		return fmt.Errorf("cannot upsert sprite with empty name")
+	}
 	now := time.Now()
 	_, err := d.db.Exec(`
 		INSERT INTO sprites (name, local_path, remote_path, repo, org, sprite_id, url, status, sync_status, sync_error, last_seen, created_at, updated_at)
@@ -59,6 +63,9 @@ func (d *DB) ListSprites(opts ListOptions) ([]*Sprite, error) {
 	          FROM sprites s`
 	var args []interface{}
 	var wheres []string
+
+	// Always exclude sprites with empty names (can be created by buggy upserts)
+	wheres = append(wheres, "s.name != ''")
 
 	if len(opts.Tags) > 0 {
 		query += ` INNER JOIN tags t ON t.sprite_name = s.name`
