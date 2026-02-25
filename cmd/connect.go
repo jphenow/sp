@@ -548,7 +548,7 @@ func startSyncInline(client *sprite.Client, resolved *setup.ResolvedTarget) erro
 	}
 
 	// Test SSH connection
-	if err := spSync.TestSSHConnection(resolved.SpriteName, port); err != nil {
+	if err := spSync.TestSSHConnection(resolved.SpriteName, port, nil); err != nil {
 		return fmt.Errorf("SSH connection test: %w", err)
 	}
 

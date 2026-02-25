@@ -67,6 +67,12 @@ type Daemon struct {
 	proxiesMu sync.RWMutex
 	proxies   map[string]*exec.Cmd
 
+	// proxyDeathChs is signalled when a tracked proxy exits unexpectedly.
+	// handleStartSync watches this to abort early instead of retrying SSH
+	// against a dead proxy for 55+ seconds.
+	proxyDeathChs   map[string]chan struct{}
+	proxyDeathChsMu sync.Mutex
+
 	// startBinaryHash is the SHA-256 of the sp binary at daemon startup.
 	// Used to detect when a new binary has been installed.
 	startBinaryHash string
@@ -112,6 +118,7 @@ func New(config Config, db *store.DB) *Daemon {
 		clients:         make(map[string]*clientConn),
 		subs:            make(map[string]chan StateUpdate),
 		proxies:         make(map[string]*exec.Cmd),
+		proxyDeathChs:   make(map[string]chan struct{}),
 		done:            make(chan struct{}),
 		startBinaryHash: hash,
 		exePath:         exePath,
@@ -492,21 +499,20 @@ func (d *Daemon) gracefulRestart() {
 		d.killProxy(name)
 	}
 
-	// Close the listener so the new daemon can bind
+	// Close the listener so the new daemon can bind the socket.
+	// Do NOT remove the PID file or socket — the re-exec'd process (same PID)
+	// will overwrite them. Removing them creates a race window where
+	// EnsureRunning could spawn a duplicate daemon.
 	if d.ln != nil {
 		d.ln.Close()
 	}
 
-	// Remove PID file so the new daemon can write its own
-	d.removePID()
-
-	// Remove socket so the new process can bind
-	os.Remove(d.config.SocketPath)
-
 	slog.Info("graceful_restart: exec-ing new binary", "path", d.exePath)
 
-	// Re-exec the daemon start command
-	err := syscall.Exec(d.exePath, []string{d.exePath, "daemon", "start"}, os.Environ())
+	// Re-exec with --reexec flag so the new process skips the IsRunning check
+	// (since we're the same PID, IsRunning would say "already running")
+	env := append(os.Environ(), "SP_DAEMON_REEXEC=1")
+	err := syscall.Exec(d.exePath, []string{d.exePath, "daemon", "start"}, env)
 	// If exec fails, we're still running — log and cancel so we stop cleanly
 	slog.Error("graceful_restart: exec failed, shutting down", "error", err)
 	d.Stop()
@@ -853,9 +859,22 @@ func (d *Daemon) handleRestart() Response {
 	return respondOK("restarting")
 }
 
+// syncSetupResult is the successful result of attemptSyncSetup.
+type syncSetupResult struct {
+	MutagenID string
+	Port      int
+	ProxyPID  int
+}
+
+// maxSyncRetries is the number of times to retry the full sync pipeline when
+// the proxy dies during setup (e.g., sprite cycling warm/cold).
+const maxSyncRetries = 3
+
 // handleStartSync sets up SSH, starts a proxy as a daemon child process, and
 // creates a Mutagen sync session. Because the proxy is a child of the daemon
 // (not the short-lived `sp` CLI), it survives after `sp . --web` returns.
+// Retries the full pipeline up to maxSyncRetries times if the proxy dies
+// during setup (which happens when the sprite is cycling).
 func (d *Daemon) handleStartSync(params json.RawMessage) Response {
 	var req struct {
 		SpriteName string `json:"sprite_name"`
@@ -870,90 +889,117 @@ func (d *Daemon) handleStartSync(params json.RawMessage) Response {
 	log := slog.With("sprite", req.SpriteName, "local", req.LocalPath, "remote", req.RemotePath)
 	log.Info("start_sync: beginning sync setup")
 
-	// Use a sprite client with the correct org for proxy commands
 	client := sprite.NewClient(req.Org)
 	mgr := spSync.NewManager(client)
 
-	// Stop any existing sync for this sprite first
-	log.Info("start_sync: stopping any existing sync")
-	d.stopSyncForSprite(req.SpriteName)
+	var lastErr error
+	for attempt := 1; attempt <= maxSyncRetries; attempt++ {
+		if attempt > 1 {
+			log.Info("start_sync: retrying", "attempt", attempt, "prev_error", lastErr)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
 
-	// 0. Wake the sprite if it's warm/cold — proxy can't connect otherwise
-	if err := mgr.WakeSprite(req.SpriteName); err != nil {
-		log.Error("start_sync: failed to wake sprite", "error", err)
-		return respondError(fmt.Sprintf("waking sprite: %v", err))
+		result, err := d.attemptSyncSetup(req.SpriteName, req.LocalPath, req.RemotePath, mgr, log)
+		if err == nil {
+			log.Info("start_sync: complete",
+				"mutagen_id", result.MutagenID, "port", result.Port,
+				"proxy_pid", result.ProxyPID, "attempts", attempt)
+			return respondJSON(map[string]interface{}{
+				"mutagen_id": result.MutagenID,
+				"ssh_port":   result.Port,
+				"proxy_pid":  result.ProxyPID,
+			})
+		}
+		lastErr = err
+	}
+
+	log.Error("start_sync: failed after retries", "attempts", maxSyncRetries, "error", lastErr)
+	return respondError(fmt.Sprintf("sync setup failed after %d attempts: %v", maxSyncRetries, lastErr))
+}
+
+// attemptSyncSetup runs one attempt of the full sync pipeline: wake, SSH,
+// proxy, test, Mutagen. If the proxy dies mid-setup the function returns
+// quickly so the caller can retry.
+func (d *Daemon) attemptSyncSetup(
+	spriteName, localPath, remotePath string,
+	mgr *spSync.Manager,
+	log *slog.Logger,
+) (*syncSetupResult, error) {
+	// Clean up any prior attempt
+	d.stopSyncForSprite(spriteName)
+
+	// Create a death channel BEFORE starting the proxy so monitorProxy
+	// can signal us if the proxy dies while we're still setting up
+	deathCh := d.makeProxyDeathCh(spriteName)
+
+	// 0. Wake the sprite
+	if err := mgr.WakeSprite(spriteName); err != nil {
+		return nil, fmt.Errorf("waking sprite: %w", err)
 	}
 
 	// 1. Setup SSH server on the sprite
-	log.Info("start_sync: setting up SSH server on sprite")
-	if err := mgr.SetupSSHServer(req.SpriteName); err != nil {
-		log.Error("start_sync: SSH server setup failed", "error", err)
-		return respondError(fmt.Sprintf("SSH server setup: %v", err))
+	log.Info("attempt_sync: setting up SSH server")
+	if err := mgr.SetupSSHServer(spriteName); err != nil {
+		return nil, fmt.Errorf("SSH server setup: %w", err)
 	}
 
 	// 2. Start proxy as a child of the daemon process
-	log.Info("start_sync: starting sprite proxy")
-	proxyCmd, port, err := mgr.StartProxy(req.SpriteName)
+	log.Info("attempt_sync: starting proxy")
+	proxyCmd, port, err := mgr.StartProxy(spriteName)
 	if err != nil {
-		log.Error("start_sync: proxy start failed", "error", err)
-		return respondError(fmt.Sprintf("starting proxy: %v", err))
+		return nil, fmt.Errorf("starting proxy: %w", err)
 	}
-	log.Info("start_sync: proxy started", "port", port, "pid", proxyCmd.Process.Pid)
+	log.Info("attempt_sync: proxy started", "port", port, "pid", proxyCmd.Process.Pid)
 
-	// Track the proxy process so we can monitor and restart it
+	// Track and monitor the proxy
 	d.proxiesMu.Lock()
-	d.proxies[req.SpriteName] = proxyCmd
+	d.proxies[spriteName] = proxyCmd
 	d.proxiesMu.Unlock()
+	go d.monitorProxy(spriteName, proxyCmd)
 
-	// Monitor proxy process in background — if it dies, mark sync as disconnected
-	go d.monitorProxy(req.SpriteName, proxyCmd)
-
-	// 3. Add SSH config entry for Mutagen
-	log.Info("start_sync: adding SSH config", "port", port)
-	if err := spSync.AddSSHConfig(req.SpriteName, port); err != nil {
-		log.Error("start_sync: SSH config failed", "error", err)
-		d.killProxy(req.SpriteName)
-		return respondError(fmt.Sprintf("adding SSH config: %v", err))
+	// 3. Add SSH config
+	log.Info("attempt_sync: adding SSH config", "port", port)
+	if err := spSync.AddSSHConfig(spriteName, port); err != nil {
+		d.killProxy(spriteName)
+		return nil, fmt.Errorf("SSH config: %w", err)
 	}
 
-	// 4. Test SSH connectivity through the proxy
-	log.Info("start_sync: testing SSH connection")
-	if err := spSync.TestSSHConnection(req.SpriteName, port); err != nil {
-		log.Error("start_sync: SSH test failed", "error", err)
-		d.killProxy(req.SpriteName)
-		spSync.RemoveSSHConfig(req.SpriteName)
-		return respondError(fmt.Sprintf("SSH connection test: %v", err))
+	// 4. Test SSH connectivity — aborts early if proxy dies
+	log.Info("attempt_sync: testing SSH connection")
+	if err := spSync.TestSSHConnection(spriteName, port, deathCh); err != nil {
+		log.Warn("attempt_sync: SSH test failed", "error", err)
+		d.killProxy(spriteName)
+		spSync.RemoveSSHConfig(spriteName)
+		return nil, fmt.Errorf("SSH test: %w", err)
 	}
-	log.Info("start_sync: SSH connection verified")
+	log.Info("attempt_sync: SSH connection verified")
 
 	// 5. Start Mutagen sync session
-	log.Info("start_sync: creating mutagen session")
-	mutagenID, err := mgr.StartMutagenSession(req.SpriteName, req.LocalPath, req.RemotePath)
+	log.Info("attempt_sync: creating mutagen session")
+	mutagenID, err := mgr.StartMutagenSession(spriteName, localPath, remotePath)
 	if err != nil {
-		log.Error("start_sync: mutagen failed", "error", err)
-		d.killProxy(req.SpriteName)
-		spSync.RemoveSSHConfig(req.SpriteName)
-		return respondError(fmt.Sprintf("starting Mutagen: %v", err))
+		d.killProxy(spriteName)
+		spSync.RemoveSSHConfig(spriteName)
+		return nil, fmt.Errorf("Mutagen: %w", err)
 	}
 
-	// 6. Persist sync session info in the database
+	// 6. Persist in DB
 	d.db.UpsertSyncSession(&store.SyncSession{
-		SpriteName: req.SpriteName,
+		SpriteName: spriteName,
 		MutagenID:  mutagenID,
 		SSHPort:    port,
 		ProxyPID:   proxyCmd.Process.Pid,
 	})
 
-	// 7. Update sprite sync status
-	d.db.UpdateSyncStatus(req.SpriteName, "watching", "")
-	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.SpriteName})
+	// 7. Mark sync as active
+	d.db.UpdateSyncStatus(spriteName, "watching", "")
+	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
 
-	log.Info("start_sync: complete", "mutagen_id", mutagenID, "port", port, "proxy_pid", proxyCmd.Process.Pid)
-	return respondJSON(map[string]interface{}{
-		"mutagen_id": mutagenID,
-		"ssh_port":   port,
-		"proxy_pid":  proxyCmd.Process.Pid,
-	})
+	return &syncSetupResult{
+		MutagenID: mutagenID,
+		Port:      port,
+		ProxyPID:  proxyCmd.Process.Pid,
+	}, nil
 }
 
 // handleStopSync terminates the Mutagen session, kills the proxy, and cleans
@@ -1025,6 +1071,28 @@ func (d *Daemon) killProxy(spriteName string) {
 	}
 }
 
+// makeProxyDeathCh creates (or resets) the death notification channel for a
+// sprite's proxy. handleStartSync calls this before starting the proxy so it
+// can select on the channel during SSH test and Mutagen setup.
+func (d *Daemon) makeProxyDeathCh(spriteName string) chan struct{} {
+	d.proxyDeathChsMu.Lock()
+	defer d.proxyDeathChsMu.Unlock()
+	ch := make(chan struct{})
+	d.proxyDeathChs[spriteName] = ch
+	return ch
+}
+
+// signalProxyDeath closes the death channel for a sprite, unblocking anyone
+// waiting on it. Called by monitorProxy when a proxy exits.
+func (d *Daemon) signalProxyDeath(spriteName string) {
+	d.proxyDeathChsMu.Lock()
+	defer d.proxyDeathChsMu.Unlock()
+	if ch, ok := d.proxyDeathChs[spriteName]; ok {
+		close(ch)
+		delete(d.proxyDeathChs, spriteName)
+	}
+}
+
 // monitorProxy watches a proxy process and handles its exit. If the sprite
 // went warm/cold, this is expected and sync is marked "idle". If the sprite
 // is still running, the proxy died unexpectedly and sync is "disconnected".
@@ -1049,11 +1117,17 @@ func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 	delete(d.proxies, spriteName)
 	d.proxiesMu.Unlock()
 
+	// Signal anyone waiting on this proxy (e.g., handleStartSync during SSH test)
+	d.signalProxyDeath(spriteName)
+
+	stderr := sprite.ProxyStderr(cmd)
+
 	// Check if the sprite went to sleep — that's expected, not an error
 	info, apiErr := d.client.Get(spriteName)
 	if apiErr == nil && info != nil && info.Status != "running" {
 		slog.Info("monitor_proxy: proxy exited because sprite is sleeping",
-			"sprite", spriteName, "pid", pid, "status", info.Status)
+			"sprite", spriteName, "pid", pid, "status", info.Status,
+			"stderr", stderr)
 		// Clean teardown — sprite is asleep, we'll re-sync when it wakes
 		spSync.TerminateMutagenSession(spriteName)
 		spSync.RemoveSSHConfig(spriteName)
@@ -1070,13 +1144,14 @@ func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 	}
 
 	slog.Error("monitor_proxy: unexpected exit while sprite running",
-		"sprite", spriteName, "pid", pid, "error", errMsg)
+		"sprite", spriteName, "pid", pid, "error", errMsg, "stderr", stderr)
 	d.db.UpdateSyncStatus(spriteName, "disconnected", errMsg)
 	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
 }
 
 // restartSync tears down and re-establishes sync for a sprite using the stored
 // session info. Called by the health monitor when recovery is needed.
+// Reuses attemptSyncSetup with retry logic.
 func (d *Daemon) restartSync(spriteName string) error {
 	log := slog.With("sprite", spriteName)
 	log.Info("restart_sync: beginning full sync restart")
@@ -1093,79 +1168,30 @@ func (d *Daemon) restartSync(spriteName string) error {
 
 	log = log.With("local", s.LocalPath, "remote", s.RemotePath, "org", s.Org)
 
-	// Stop existing sync
-	d.stopSyncForSprite(spriteName)
-
-	// Re-create with the sprite's org
 	client := sprite.NewClient(s.Org)
 	mgr := spSync.NewManager(client)
 
-	// Wake the sprite first
-	log.Info("restart_sync: waking sprite")
-	if err := mgr.WakeSprite(spriteName); err != nil {
-		log.Error("restart_sync: wake failed", "error", err)
-		return fmt.Errorf("waking sprite: %w", err)
+	var lastErr error
+	for attempt := 1; attempt <= maxSyncRetries; attempt++ {
+		if attempt > 1 {
+			log.Info("restart_sync: retrying", "attempt", attempt, "prev_error", lastErr)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+
+		result, err := d.attemptSyncSetup(spriteName, s.LocalPath, s.RemotePath, mgr, log)
+		if err == nil {
+			log.Info("restart_sync: complete",
+				"mutagen_id", result.MutagenID, "port", result.Port,
+				"proxy_pid", result.ProxyPID, "attempts", attempt)
+			return nil
+		}
+		lastErr = err
 	}
 
-	// Setup SSH
-	log.Info("restart_sync: setting up SSH server")
-	if err := mgr.SetupSSHServer(spriteName); err != nil {
-		log.Error("restart_sync: SSH setup failed", "error", err)
-		return fmt.Errorf("SSH setup: %w", err)
-	}
-
-	// Start proxy
-	log.Info("restart_sync: starting proxy")
-	proxyCmd, port, err := mgr.StartProxy(spriteName)
-	if err != nil {
-		log.Error("restart_sync: proxy failed", "error", err)
-		return fmt.Errorf("starting proxy: %w", err)
-	}
-	log.Info("restart_sync: proxy started", "port", port, "pid", proxyCmd.Process.Pid)
-
-	d.proxiesMu.Lock()
-	d.proxies[spriteName] = proxyCmd
-	d.proxiesMu.Unlock()
-	go d.monitorProxy(spriteName, proxyCmd)
-
-	// SSH config
-	log.Info("restart_sync: adding SSH config", "port", port)
-	if err := spSync.AddSSHConfig(spriteName, port); err != nil {
-		log.Error("restart_sync: SSH config failed", "error", err)
-		d.killProxy(spriteName)
-		return fmt.Errorf("SSH config: %w", err)
-	}
-
-	// Test connection
-	log.Info("restart_sync: testing SSH connection")
-	if err := spSync.TestSSHConnection(spriteName, port); err != nil {
-		log.Error("restart_sync: SSH test failed", "error", err)
-		d.killProxy(spriteName)
-		spSync.RemoveSSHConfig(spriteName)
-		return fmt.Errorf("SSH test: %w", err)
-	}
-
-	// Mutagen
-	log.Info("restart_sync: creating mutagen session")
-	mutagenID, err := mgr.StartMutagenSession(spriteName, s.LocalPath, s.RemotePath)
-	if err != nil {
-		log.Error("restart_sync: mutagen failed", "error", err)
-		d.killProxy(spriteName)
-		spSync.RemoveSSHConfig(spriteName)
-		return fmt.Errorf("Mutagen: %w", err)
-	}
-
-	d.db.UpsertSyncSession(&store.SyncSession{
-		SpriteName: spriteName,
-		MutagenID:  mutagenID,
-		SSHPort:    port,
-		ProxyPID:   proxyCmd.Process.Pid,
-	})
-	d.db.UpdateSyncStatus(spriteName, "watching", "")
+	log.Error("restart_sync: failed after retries", "attempts", maxSyncRetries, "error", lastErr)
+	d.db.UpdateSyncStatus(spriteName, "error", lastErr.Error())
 	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
-
-	log.Info("restart_sync: complete", "mutagen_id", mutagenID, "port", port, "proxy_pid", proxyCmd.Process.Pid)
-	return nil
+	return fmt.Errorf("sync setup failed after %d attempts: %w", maxSyncRetries, lastErr)
 }
 
 // --- Response helpers ---

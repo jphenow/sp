@@ -461,13 +461,23 @@ func MutagenSessionExists(spriteName string) bool {
 }
 
 // TestSSHConnection verifies SSH connectivity through the proxy.
-func TestSSHConnection(spriteName string, port int) error {
+// If done is non-nil and closed, the test aborts early (e.g., proxy died).
+func TestSSHConnection(spriteName string, port int, done <-chan struct{}) error {
 	alias := SSHHostAlias(spriteName)
 
 	// Clear any stale known_hosts entry
 	exec.Command("ssh-keygen", "-R", fmt.Sprintf("[localhost]:%d", port)).Run()
 
 	for attempt := 0; attempt < 10; attempt++ {
+		// Check if we've been told to stop
+		if done != nil {
+			select {
+			case <-done:
+				return fmt.Errorf("SSH test aborted: proxy died for %s (port %d)", alias, port)
+			default:
+			}
+		}
+
 		cmd := exec.Command("ssh", "-o", "ConnectTimeout=5",
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "UserKnownHostsFile=/dev/null",
@@ -477,7 +487,18 @@ func TestSSHConnection(spriteName string, port int) error {
 				return nil
 			}
 		}
-		time.Sleep(time.Duration(attempt+1) * time.Second)
+
+		// Sleep with early abort on proxy death
+		sleepDur := time.Duration(attempt+1) * time.Second
+		if done != nil {
+			select {
+			case <-done:
+				return fmt.Errorf("SSH test aborted: proxy died for %s (port %d)", alias, port)
+			case <-time.After(sleepDur):
+			}
+		} else {
+			time.Sleep(sleepDur)
+		}
 	}
 
 	return fmt.Errorf("SSH connection to %s (port %d) failed after 10 attempts", alias, port)

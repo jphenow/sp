@@ -27,7 +27,14 @@ var daemonStartCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		config := daemon.DefaultConfig()
 
-		if daemon.IsRunning(config) {
+		// SP_DAEMON_REEXEC=1 means gracefulRestart exec'd us. Skip the
+		// IsRunning check because we ARE the same PID and need to re-init.
+		// Also keep the PID file and socket untouched during the re-exec
+		// window so concurrent EnsureRunning callers don't spawn a duplicate.
+		reexec := os.Getenv("SP_DAEMON_REEXEC") == "1"
+		os.Unsetenv("SP_DAEMON_REEXEC")
+
+		if !reexec && daemon.IsRunning(config) {
 			fmt.Println("Daemon is already running")
 			return nil
 		}
