@@ -9,7 +9,9 @@ A command-line tool for managing Fly.io sprites with GitHub repositories or loca
 - Copies Claude authentication tokens and SSH keys to sprites
 - Syncs repositories with `git pull --recurse-submodules`
 - Opens persistent tmux sessions in the repository directory
-- Bidirectional file syncing with Mutagen (on by default, disable with `--no-sync`)
+- Bidirectional file syncing with Mutagen in `two-way-safe` mode (on by default, disable with `--no-sync`)
+- `.gitignore`-aware sync — all `.gitignore` patterns are automatically converted to Mutagen exclusions
+- Conflict detection and reporting via `sp status`
 - Configurable setup: auto-copy files and run commands on first connect via `~/.config/sprite/setup.conf`
 
 ## Prerequisites
@@ -148,12 +150,45 @@ sp sessions .
 sp sessions owner/repo
 ```
 
+### Sync Status (`sp status`)
+
+Check the health of your Mutagen sync session, proxy state, and any conflicts:
+
+```bash
+sp status .
+sp status owner/repo
+```
+
+Displays:
+- Sync session state (watching, scanning, etc.)
+- Proxy process status
+- Sync mode (`two-way-safe`)
+- Any errors or conflicts
+- Active user sessions
+
+If conflicts are detected, `sp status` shows the conflicting files and instructions for resolving them (e.g., `mutagen sync reset`).
+
+### Resync (`sp resync`)
+
+Tear down the current Mutagen sync session and restart it from scratch. Useful when:
+- You've added or changed `.gitignore` rules and want them picked up
+- Sync is stuck or in an error state
+- You want a clean sync baseline
+
+```bash
+sp resync .
+sp resync owner/repo
+```
+
+The resync runs in a detached background process so it doesn't block your terminal. Reconnect with `sp .` to use the new session.
+
 ### Bidirectional File Syncing
 
 Sync is **on by default**. Real-time bidirectional file syncing via Mutagen keeps your local files and the sprite in lockstep:
 
 - Changes you make locally are automatically synced to the sprite
 - Changes made in the sprite are automatically synced back to your machine
+- Uses **`two-way-safe` mode** — neither side silently overwrites the other when conflicts arise
 - Sync session is active while `sp` is running
 - On exit, sync infrastructure stays alive for 30 seconds to allow quick reconnection — if you run `sp .` again within that window, mutagen resumes without restarting
 - Initial file upload (tar) only happens when a sprite is **first created** — reconnecting to an existing sprite relies entirely on Mutagen for incremental sync, so remote edits are never clobbered
@@ -163,15 +198,27 @@ Sync is **on by default**. Real-time bidirectional file syncing via Mutagen keep
 - SSH key at `~/.ssh/id_ed25519` (used for SSH authentication to sprite)
 
 **What gets synced:**
-All files including `.git`, except:
-- `node_modules` (dependencies)
-- `.next`, `dist`, `build` (build artifacts)
-- `.DS_Store`, `._*` (system files)
+All files including `.git` (to keep branches in lockstep), minus anything excluded. Exclusions are determined by:
+
+1. **`.gitignore` patterns** — `sp` reads all `.gitignore` files in the repo tree (including nested ones) and converts them into Mutagen ignore rules. This means `node_modules`, `_build`, `deps`, `dist`, and any other gitignored paths are automatically excluded.
+2. **Baseline exclusions** — A small set of patterns are always excluded regardless of `.gitignore`: `.DS_Store`, `._*`.
+3. **`.git` is always included** — Even though `.gitignore` doesn't mention it, `.git/` is explicitly un-ignored so branch state stays synced.
+
+When you add or change `.gitignore` rules, run `sp resync .` to pick up the new patterns.
+
+**Conflict handling:**
+With `two-way-safe` mode, if both sides modify the same file before syncing, Mutagen flags a conflict instead of silently choosing a winner. Use `sp status .` to see conflicts and `mutagen sync reset` to resolve them.
 
 **Disable sync:**
 ```bash
 sp . --no-sync
 ```
+
+**Verbose output:**
+```bash
+sp . --verbose
+```
+Shows detailed Mutagen sync progress, `.gitignore` pattern collection, and SSH proxy setup information.
 
 **Example workflow:**
 ```bash
@@ -258,15 +305,16 @@ The tool automatically sets up authentication in sprites:
 
 ## Directory Sync Exclusions
 
-When using `sp .`, the following are excluded from Mutagen sync:
-- `node_modules`
-- `.next`
-- `dist`
-- `build`
-- `.DS_Store`
-- `._*`
+When using `sp .`, exclusions are determined dynamically from your `.gitignore` files:
 
-Note: `.git` is **included** in sync to keep branches in lockstep between local and sprite.
+- **All `.gitignore` patterns are respected** — `sp` walks the repo tree, reads every `.gitignore` file (including nested ones), and passes the patterns to Mutagen. This means `node_modules`, `_build`, `deps`, `dist`, and any other gitignored paths are automatically excluded.
+- **Baseline exclusions** always apply: `.DS_Store`, `._*`
+- **`.git` is always included** — explicitly un-ignored so branch state stays in lockstep between local and sprite.
+
+To pick up new `.gitignore` rules after changing them, run:
+```bash
+sp resync .
+```
 
 ## Token Setup
 

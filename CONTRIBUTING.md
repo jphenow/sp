@@ -230,11 +230,25 @@ Test these scenarios before submitting:
 
 ### Current Directory Mode
 - [ ] Sync local directory (tar upload only on new sprites; Mutagen for reconnects)
-- [ ] Verify exclusions work (node_modules, .next, etc.)
-- [ ] Verify `.git` is included in sync
+- [ ] Verify `.gitignore` patterns are respected (files ignored in git should not sync)
+- [ ] Verify nested `.gitignore` files are picked up (e.g., `subdir/.gitignore`)
+- [ ] Verify `.git` is included in sync (explicitly un-ignored)
 - [ ] Verify git repository state maintained
 - [ ] Test with uncommitted changes
 - [ ] Verify reconnecting to existing sprite does NOT re-tar-sync (remote edits preserved)
+
+### Sync Status and Resync
+- [ ] `sp status .` shows sync health, proxy state, and mode (`two-way-safe`)
+- [ ] `sp status .` reports conflicts when both sides modify the same file
+- [ ] `sp resync .` tears down and restarts sync without blocking the terminal
+- [ ] `sp resync .` picks up new `.gitignore` rules added after initial sync
+- [ ] Verify conflict detection during normal `sp .` connection (check_sync_conflicts)
+
+### Sync Conflict Scenarios
+- [ ] Modify a file on both local and sprite before sync catches up — verify conflict is reported
+- [ ] Run `mutagen sync reset` after conflict — verify resolution works
+- [ ] Verify `two-way-safe` mode does NOT silently overwrite sprite-side changes
+- [ ] Recreate a sync session (simulating recovery) — verify no silent data loss
 
 ### Error Conditions
 - [ ] Invalid repository format

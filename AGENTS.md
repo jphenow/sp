@@ -120,6 +120,27 @@ sp .
 # Changes sync both ways — local edits appear in sprite, sprite edits appear locally
 ```
 
+### `.gitignore`-Aware Sync
+Sync automatically reads all `.gitignore` files (including nested ones) and converts them into Mutagen exclusion rules. Build artifacts like `_build/`, `deps/`, `node_modules/`, `dist/` are excluded without manual configuration.
+
+If you change `.gitignore` rules after sync is running, run `sp resync .` to pick up the new patterns.
+
+### Sync Mode and Conflicts
+Sync uses `two-way-safe` mode — neither side silently overwrites the other. If both sides modify the same file, Mutagen flags a conflict. Use these commands to manage sync:
+
+```bash
+# Check sync health, errors, and conflicts
+sp status .
+
+# Reset sync session (re-reads .gitignore, restarts Mutagen)
+sp resync .
+
+# Resolve conflicts (Mutagen command)
+mutagen sync reset
+```
+
+During normal `sp .` usage, conflicts are checked automatically and displayed if detected.
+
 ## Best Practices
 
 ### 1. Start with Exploration
