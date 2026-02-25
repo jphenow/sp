@@ -335,7 +335,13 @@ sprite restart gh-owner--repo
 ### Sync Issues
 If local changes aren't syncing properly:
 ```bash
-# Delete and recreate the sprite
+# First, check sync health and look for errors or conflicts
+sp status .
+
+# Reset sync (re-reads .gitignore, restarts Mutagen)
+sp resync .
+
+# If still broken, delete and recreate the sprite
 sprite delete gh-owner--repo
 sp .  # Will create fresh sprite and sync
 ```

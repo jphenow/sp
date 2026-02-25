@@ -58,11 +58,20 @@ Before submitting a pull request:
    - Permission issues
 
 4. Test cleanup:
-   - Verify no temp files are left behind
-   - Check that sprites are properly configured
-   - Verify sync grace period: after exiting, proxy + mutagen stay alive for ~30s
-   - Verify reconnecting within the grace period reuses existing sync (no restart)
-   - Verify sync tears down after grace period expires with no reconnection
+    - Verify no temp files are left behind
+    - Check that sprites are properly configured
+    - Verify sync grace period: after exiting, proxy + mutagen stay alive for ~30s
+    - Verify reconnecting within the grace period reuses existing sync (no restart)
+    - Verify sync tears down after grace period expires with no reconnection
+
+5. Test new commands:
+    ```bash
+    # Check sync health
+    /path/to/your/sp status .
+
+    # Reset sync (picks up .gitignore changes)
+    /path/to/your/sp resync .
+    ```
 
 ## Code Style
 

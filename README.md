@@ -52,14 +52,14 @@ alias sp='/path/to/sprite-repo/sp'
 ### Work with a GitHub Repository
 
 ```bash
-sp owner/repo [--no-sync] [--name NAME] [-- COMMAND...]
+sp owner/repo [--no-sync] [--verbose] [--name NAME] [-- COMMAND...]
 ```
 
 This will:
 1. Create a sprite named `gh-owner--repo` (if it doesn't exist)
 2. Set up authentication, git config, and run setup.conf entries
 3. Clone the repository (or pull latest changes if already cloned)
-4. Start bidirectional file sync via Mutagen
+4. Start bidirectional file sync via Mutagen (respecting `.gitignore` patterns)
 5. Open a tmux session running the command (default: `bash`) in the repository directory
 
 Example:
@@ -71,7 +71,7 @@ sp superfly/flyctl
 
 ```bash
 cd /path/to/your/project
-sp . [--no-sync] [--name NAME] [-- COMMAND...]
+sp . [--no-sync] [--verbose] [--name NAME] [-- COMMAND...]
 ```
 
 This will:
@@ -244,9 +244,12 @@ sp conf show    # Print contents
 ```ini
 [files]
 # Copy files to the sprite. ~ expands to $HOME locally, /home/sprite remotely.
-# Files are only copied if they don't already exist on the sprite.
+# Default mode: [newest] — only copies when local file is newer than remote (or remote is missing).
 ~/.tmux.conf
 ~/.local/share/opencode/auth.json
+
+# Append [always] to always overwrite, even if remote is newer:
+~/.config/opencode/config.toml [always]
 
 # Use "source -> dest" when local and remote paths differ:
 ~/.config/sprite/tmux.conf.local -> ~/.tmux.conf.local
@@ -348,6 +351,21 @@ Ensure your SSH key is added to your GitHub account:
 ssh -T git@github.com
 ```
 
+### Sync not working or stuck
+```bash
+# Check sync health, errors, and conflicts
+sp status .
+
+# Reset sync session (re-reads .gitignore, restarts Mutagen)
+sp resync .
+```
+
+### Gitignored files still syncing
+If files that should be excluded are still syncing, your `.gitignore` patterns may have been added after the sync session started. Run `sp resync .` to pick up the new patterns.
+
+### Sync conflicts
+If both sides modified the same file, Mutagen flags a conflict instead of choosing a winner. Check with `sp status .` and resolve with `mutagen sync reset`.
+
 ## Examples
 
 ```bash
@@ -377,6 +395,15 @@ sp . --name debug                      # Terminal 2
 
 # Disable file sync
 sp . --no-sync
+
+# Verbose output (shows sync details, .gitignore patterns, SSH proxy info)
+sp . --verbose
+
+# Check sync health and conflicts
+sp status .
+
+# Reset sync (re-reads .gitignore, restarts Mutagen)
+sp resync .
 
 # Check sprite info before connecting
 sp info owner/repo
