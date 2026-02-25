@@ -296,12 +296,36 @@ func (d *Daemon) pollSpriteHealth() {
 			continue
 		}
 
-		oldStatus := existing.Status
-		if err := d.db.UpdateSpriteStatus(info.Name, info.Status); err != nil {
-			continue
+		changed := false
+
+		// Update status
+		if existing.Status != info.Status {
+			if err := d.db.UpdateSpriteStatus(info.Name, info.Status); err != nil {
+				continue
+			}
+			changed = true
 		}
 
-		if oldStatus != info.Status {
+		// Backfill missing ID, URL, and org from API data
+		if (existing.SpriteID == "" && info.ID != "") ||
+			(existing.URL == "" && info.URL != "") ||
+			(existing.Org == "" && info.Organization != "") {
+			patched := *existing
+			if patched.SpriteID == "" {
+				patched.SpriteID = info.ID
+			}
+			if patched.URL == "" {
+				patched.URL = info.URL
+			}
+			if patched.Org == "" {
+				patched.Org = info.Organization
+			}
+			patched.Status = info.Status
+			d.db.UpsertSprite(&patched)
+			changed = true
+		}
+
+		if changed {
 			d.broadcast(StateUpdate{
 				Type:       "sprite_status",
 				SpriteName: info.Name,

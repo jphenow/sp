@@ -171,7 +171,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	// Register with daemon — in web mode, the daemon is required for
 	// persistent sync, so treat failure as a hard error.
-	if err := registerWithDaemon(resolved); err != nil {
+	if err := registerWithDaemon(resolved, client); err != nil {
 		if webMode {
 			return fmt.Errorf("daemon required for --web sync persistence: %w", err)
 		}
@@ -465,14 +465,15 @@ func syncInitialFiles(client *sprite.Client, name, localDir, remoteDir string) e
 }
 
 // registerWithDaemon tells the daemon about this sprite for monitoring.
-func registerWithDaemon(resolved *setup.ResolvedTarget) error {
+// Fetches the sprite's API info to populate ID, URL, and status.
+func registerWithDaemon(resolved *setup.ResolvedTarget, client *sprite.Client) error {
 	dc, err := daemon.Connect()
 	if err != nil {
 		return err
 	}
 	defer dc.Close()
 
-	return dc.UpsertSprite(&store.Sprite{
+	s := &store.Sprite{
 		Name:       resolved.SpriteName,
 		LocalPath:  resolved.LocalPath,
 		RemotePath: resolved.RemotePath,
@@ -480,7 +481,19 @@ func registerWithDaemon(resolved *setup.ResolvedTarget) error {
 		Org:        resolved.Org,
 		Status:     "running",
 		SyncStatus: "none",
-	})
+	}
+
+	// Fetch ID, URL, and real status from the API
+	info, err := client.Get(resolved.SpriteName)
+	if err == nil && info != nil {
+		s.SpriteID = info.ID
+		s.URL = info.URL
+		if info.Status != "" {
+			s.Status = info.Status
+		}
+	}
+
+	return dc.UpsertSprite(s)
 }
 
 // startSync delegates sync setup to the daemon so the proxy process is owned
