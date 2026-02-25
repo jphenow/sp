@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,6 +11,10 @@ import (
 	"github.com/jphenow/sp/internal/daemon"
 	"github.com/jphenow/sp/internal/store"
 )
+
+// pollInterval is how often the TUI re-fetches the sprite list from the daemon
+// to pick up newly added/imported sprites and status changes.
+const pollInterval = 3 * time.Second
 
 // view represents which screen the TUI is showing.
 type view int
@@ -71,6 +76,9 @@ type errMsg struct {
 // msgMsg carries a status message to display briefly.
 type msgMsg string
 
+// tickMsg is sent periodically to trigger a sprite list refresh.
+type tickMsg time.Time
+
 // NewModel creates a new TUI model connected to the daemon.
 func NewModel(client *daemon.Client, opts FilterOptions) Model {
 	ti := textinput.New()
@@ -91,12 +99,20 @@ func NewModel(client *daemon.Client, opts FilterOptions) Model {
 	}
 }
 
-// Init returns the initial command to fetch sprites.
+// Init returns the initial command to fetch sprites and start the periodic poll ticker.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.fetchSprites,
 		tea.SetWindowTitle("sp"),
+		tickCmd(),
 	)
+}
+
+// tickCmd returns a tea.Cmd that sends a tickMsg after pollInterval.
+func tickCmd() tea.Cmd {
+	return tea.Tick(pollInterval, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 // Update handles messages and user input.
@@ -117,6 +133,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = max(0, len(m.sprites)-1)
 		}
 		return m, nil
+
+	case tickMsg:
+		// Periodic poll: re-fetch the sprite list and schedule the next tick.
+		// This ensures new imports and status changes always appear.
+		return m, tea.Batch(m.fetchSprites, tickCmd())
 
 	case stateUpdateMsg:
 		// Refresh sprite list on any state change
