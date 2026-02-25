@@ -3,11 +3,13 @@ package sync
 import (
 	"fmt"
 	"hash/crc32"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jphenow/sp/internal/sprite"
@@ -52,6 +54,28 @@ func SessionName(spriteName string) string {
 // SSHHostAlias returns the SSH config host alias for Mutagen to use.
 func SSHHostAlias(spriteName string) string {
 	return "sprite-mutagen-" + spriteName
+}
+
+// WakeSprite ensures a sprite is running by executing a trivial command.
+// This wakes warm/cold sprites before we try to set up SSH and proxies.
+// Retries a few times because waking can take several seconds.
+func (m *Manager) WakeSprite(spriteName string) error {
+	slog.Info("wake: ensuring sprite is running", "sprite", spriteName)
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		out, err := m.client.Exec(sprite.ExecOptions{
+			Sprite:  spriteName,
+			Command: []string{"echo", "ready"},
+		})
+		if err == nil {
+			slog.Info("wake: sprite is running", "sprite", spriteName, "output", strings.TrimSpace(string(out)))
+			return nil
+		}
+		lastErr = err
+		slog.Debug("wake: attempt failed, retrying", "sprite", spriteName, "attempt", attempt+1, "error", err)
+		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+	}
+	return fmt.Errorf("waking sprite %q: %w", spriteName, lastErr)
 }
 
 // SetupSSHServer installs and configures openssh-server on the sprite,
@@ -114,9 +138,16 @@ func (m *Manager) SetupSSHServer(spriteName string) error {
 
 // StartProxy starts a sprite proxy forwarding a local port to SSH port 22 on the sprite.
 // Returns the proxy command (caller must manage the process) and the local port.
+// If the proxy exits immediately (e.g., sprite is warm/cold and can't be reached),
+// returns the proxy's stderr output in the error for diagnostics.
 func (m *Manager) StartProxy(spriteName string) (*exec.Cmd, int, error) {
 	port := ComputeSSHPort(spriteName)
 	portMapping := fmt.Sprintf("%d:22", port)
+
+	// Kill any stale proxy on this port before starting
+	killStaleProxies(spriteName, port)
+
+	slog.Info("proxy: starting", "sprite", spriteName, "port", port, "mapping", portMapping)
 
 	cmd, err := m.client.StartProxy(sprite.ProxyOptions{
 		Sprite: spriteName,
@@ -126,13 +157,74 @@ func (m *Manager) StartProxy(spriteName string) (*exec.Cmd, int, error) {
 		return nil, 0, fmt.Errorf("starting proxy: %w", err)
 	}
 
-	// Wait for proxy to be listening
-	if err := waitForPort(port, 30*time.Second); err != nil {
+	// Wait for proxy to be listening, checking that it's still alive
+	if err := waitForPortOrDeath(cmd, port, 30*time.Second); err != nil {
+		stderr := sprite.ProxyStderr(cmd)
+		if stderr != "" {
+			slog.Error("proxy: failed", "sprite", spriteName, "port", port, "stderr", stderr)
+			return nil, 0, fmt.Errorf("proxy failed (port %d): %s", port, strings.TrimSpace(stderr))
+		}
 		cmd.Process.Kill()
 		return nil, 0, fmt.Errorf("waiting for proxy port %d: %w", port, err)
 	}
 
+	slog.Info("proxy: listening", "sprite", spriteName, "port", port, "pid", cmd.Process.Pid)
 	return cmd, port, nil
+}
+
+// killStaleProxies finds and kills any orphaned sprite proxy processes for a
+// given sprite to free up the deterministic port.
+func killStaleProxies(spriteName string, port int) {
+	// Check if anything is using our port
+	if err := exec.Command("lsof", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Run(); err != nil {
+		return // Port is free
+	}
+	slog.Info("proxy: killing stale process on port", "sprite", spriteName, "port", port)
+	// Try to find and kill the specific sprite proxy
+	out, err := exec.Command("pgrep", "-f", fmt.Sprintf("sprite proxy -s %s", spriteName)).Output()
+	if err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			pid, err := strconv.Atoi(strings.TrimSpace(line))
+			if err == nil && pid > 0 {
+				slog.Info("proxy: killing stale pid", "sprite", spriteName, "pid", pid)
+				proc, _ := os.FindProcess(pid)
+				if proc != nil {
+					proc.Kill()
+				}
+			}
+		}
+		// Brief pause to let the port free up
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// waitForPortOrDeath polls until a local TCP port is accepting connections,
+// or detects the proxy process has exited (whichever comes first).
+// Does NOT call cmd.Wait() — the caller (monitorProxy) owns that.
+func waitForPortOrDeath(cmd *exec.Cmd, port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		// Check if process is still alive using signal 0
+		if cmd.Process != nil {
+			if err := syscall.Kill(cmd.Process.Pid, 0); err != nil {
+				// Process is gone — give it a moment for stderr buffer to fill
+				time.Sleep(100 * time.Millisecond)
+				stderr := sprite.ProxyStderr(cmd)
+				if stderr != "" {
+					return fmt.Errorf("proxy died before port ready\nstderr: %s", strings.TrimSpace(stderr))
+				}
+				return fmt.Errorf("proxy died before port ready (pid %d)", cmd.Process.Pid)
+			}
+		}
+
+		// Check if port is listening
+		if err := exec.Command("lsof", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Run(); err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("port %d not listening after %v", port, timeout)
 }
 
 // AddSSHConfig adds a temporary SSH config entry for Mutagen to use.
@@ -366,19 +458,6 @@ func MutagenSessionExists(spriteName string) bool {
 	sessionName := SessionName(spriteName)
 	err := exec.Command("mutagen", "sync", "list", sessionName).Run()
 	return err == nil
-}
-
-// waitForPort polls until a local TCP port is accepting connections.
-func waitForPort(port int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		cmd := exec.Command("lsof", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN")
-		if err := cmd.Run(); err == nil {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return fmt.Errorf("port %d not listening after %v", port, timeout)
 }
 
 // TestSSHConnection verifies SSH connectivity through the proxy.

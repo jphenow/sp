@@ -343,10 +343,11 @@ func (d *Daemon) pollSpriteHealth() {
 			continue
 		}
 
+		oldStatus := existing.Status
 		changed := false
 
 		// Update status
-		if existing.Status != info.Status {
+		if oldStatus != info.Status {
 			if err := d.db.UpdateSpriteStatus(info.Name, info.Status); err != nil {
 				continue
 			}
@@ -377,6 +378,32 @@ func (d *Daemon) pollSpriteHealth() {
 				Type:       "sprite_status",
 				SpriteName: info.Name,
 			})
+		}
+
+		// Sync lifecycle management based on status transitions.
+		// Only act on sprites that have local+remote paths (i.e., sync was configured).
+		syncConfigured := existing.LocalPath != "" && existing.RemotePath != ""
+		if !syncConfigured || oldStatus == info.Status {
+			continue
+		}
+
+		if info.Status == "running" && oldStatus != "running" {
+			// Sprite woke up — start sync in the background
+			slog.Info("health_poll: sprite woke up, starting sync",
+				"sprite", info.Name, "from", oldStatus, "to", info.Status)
+			go func(name, org, local, remote string) {
+				if err := d.restartSync(name); err != nil {
+					slog.Error("health_poll: auto-sync failed", "sprite", name, "error", err)
+				}
+			}(info.Name, existing.Org, existing.LocalPath, existing.RemotePath)
+
+		} else if info.Status != "running" && oldStatus == "running" {
+			// Sprite went to sleep — tear down sync cleanly (not an error)
+			slog.Info("health_poll: sprite sleeping, stopping sync",
+				"sprite", info.Name, "from", oldStatus, "to", info.Status)
+			d.stopSyncForSprite(info.Name)
+			d.db.UpdateSyncStatus(info.Name, "idle", "")
+			d.broadcast(StateUpdate{Type: "sync_status", SpriteName: info.Name})
 		}
 	}
 }
@@ -851,6 +878,12 @@ func (d *Daemon) handleStartSync(params json.RawMessage) Response {
 	log.Info("start_sync: stopping any existing sync")
 	d.stopSyncForSprite(req.SpriteName)
 
+	// 0. Wake the sprite if it's warm/cold — proxy can't connect otherwise
+	if err := mgr.WakeSprite(req.SpriteName); err != nil {
+		log.Error("start_sync: failed to wake sprite", "error", err)
+		return respondError(fmt.Sprintf("waking sprite: %v", err))
+	}
+
 	// 1. Setup SSH server on the sprite
 	log.Info("start_sync: setting up SSH server on sprite")
 	if err := mgr.SetupSSHServer(req.SpriteName); err != nil {
@@ -992,8 +1025,9 @@ func (d *Daemon) killProxy(spriteName string) {
 	}
 }
 
-// monitorProxy watches a proxy process and marks sync as disconnected if it
-// exits unexpectedly. This runs as a goroutine for each active proxy.
+// monitorProxy watches a proxy process and handles its exit. If the sprite
+// went warm/cold, this is expected and sync is marked "idle". If the sprite
+// is still running, the proxy died unexpectedly and sync is "disconnected".
 func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 	pid := cmd.Process.Pid
 	slog.Debug("monitor_proxy: watching", "sprite", spriteName, "pid", pid)
@@ -1010,17 +1044,33 @@ func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 		return
 	}
 
-	// Unexpected exit — clean up and mark disconnected
+	// Clean up the tracked proxy
 	d.proxiesMu.Lock()
 	delete(d.proxies, spriteName)
 	d.proxiesMu.Unlock()
 
+	// Check if the sprite went to sleep — that's expected, not an error
+	info, apiErr := d.client.Get(spriteName)
+	if apiErr == nil && info != nil && info.Status != "running" {
+		slog.Info("monitor_proxy: proxy exited because sprite is sleeping",
+			"sprite", spriteName, "pid", pid, "status", info.Status)
+		// Clean teardown — sprite is asleep, we'll re-sync when it wakes
+		spSync.TerminateMutagenSession(spriteName)
+		spSync.RemoveSSHConfig(spriteName)
+		d.db.DeleteSyncSession(spriteName)
+		d.db.UpdateSyncStatus(spriteName, "idle", "")
+		d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
+		return
+	}
+
+	// Sprite is still running but proxy died — unexpected
 	errMsg := "proxy exited unexpectedly"
 	if err != nil {
 		errMsg = fmt.Sprintf("proxy exited: %v", err)
 	}
 
-	slog.Error("monitor_proxy: unexpected exit", "sprite", spriteName, "pid", pid, "error", errMsg)
+	slog.Error("monitor_proxy: unexpected exit while sprite running",
+		"sprite", spriteName, "pid", pid, "error", errMsg)
 	d.db.UpdateSyncStatus(spriteName, "disconnected", errMsg)
 	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
 }
@@ -1049,6 +1099,13 @@ func (d *Daemon) restartSync(spriteName string) error {
 	// Re-create with the sprite's org
 	client := sprite.NewClient(s.Org)
 	mgr := spSync.NewManager(client)
+
+	// Wake the sprite first
+	log.Info("restart_sync: waking sprite")
+	if err := mgr.WakeSprite(spriteName); err != nil {
+		log.Error("restart_sync: wake failed", "error", err)
+		return fmt.Errorf("waking sprite: %w", err)
+	}
 
 	// Setup SSH
 	log.Info("restart_sync: setting up SSH server")

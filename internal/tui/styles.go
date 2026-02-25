@@ -39,6 +39,10 @@ func SyncStatusStyle(status string) string {
 		return lipgloss.NewStyle().Foreground(colorWarning).Render("connecting")
 	case "error":
 		return lipgloss.NewStyle().Foreground(colorDanger).Render("error")
+	case "idle":
+		return lipgloss.NewStyle().Foreground(colorCold).Render("idle")
+	case "recovering":
+		return lipgloss.NewStyle().Foreground(colorWarning).Render("recover")
 	case "disconnected":
 		return lipgloss.NewStyle().Foreground(colorMuted).Render("disconn")
 	case "none", "":

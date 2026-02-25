@@ -32,8 +32,10 @@ var daemonStartCmd = &cobra.Command{
 			return nil
 		}
 
-		// Set up file + stderr logging so we can debug daemon issues
-		if err := logging.SetupMulti(os.Stderr); err != nil {
+		// Set up file-only logging. When backgrounded by EnsureRunning,
+		// stderr is already redirected to the log file, so SetupMulti would
+		// double every line. Use file-only logging unconditionally.
+		if err := logging.Setup(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: log setup failed: %v\n", err)
 		}
 		defer logging.Close()

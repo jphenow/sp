@@ -1,6 +1,7 @@
 package sprite
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -152,6 +153,7 @@ func (c *Client) BuildExecArgs(opts ExecOptions) []string {
 
 // StartProxy starts a sprite proxy for port forwarding and returns the command
 // (which runs as a background process). Caller is responsible for managing the process.
+// Stderr is captured in a buffer so callers can read proxy error output if it exits.
 func (c *Client) StartProxy(opts ProxyOptions) (*exec.Cmd, error) {
 	args := []string{"proxy"}
 	org := opts.Org
@@ -167,10 +169,23 @@ func (c *Client) StartProxy(opts ProxyOptions) (*exec.Cmd, error) {
 	args = append(args, opts.Ports...)
 
 	cmd := exec.Command("sprite", args...)
+	// Capture stderr so we can diagnose proxy failures
+	cmd.Stderr = &bytes.Buffer{}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting proxy for sprite %q: %w", opts.Sprite, err)
 	}
 	return cmd, nil
+}
+
+// ProxyStderr returns the captured stderr from a proxy command, if available.
+func ProxyStderr(cmd *exec.Cmd) string {
+	if cmd == nil || cmd.Stderr == nil {
+		return ""
+	}
+	if buf, ok := cmd.Stderr.(*bytes.Buffer); ok {
+		return buf.String()
+	}
+	return ""
 }
 
 // GetURL returns the public URL for a sprite.
