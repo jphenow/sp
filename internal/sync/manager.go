@@ -110,31 +110,42 @@ func (m *Manager) SetupSSHServer(spriteName string) error {
 
 	// Install openssh-server if needed, configure auth, add key
 	setupCmd := `
+		set -e
+
 		# Install sshd if missing
 		if ! command -v sshd >/dev/null 2>&1; then
 			sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server 2>/dev/null || true
 		fi
 
-		# Add the uploaded key to authorized_keys (dedup with sort -u)
-		cat /home/sprite/.ssh/sp_pubkey.pub >> /home/sprite/.ssh/authorized_keys
-		sort -u /home/sprite/.ssh/authorized_keys -o /home/sprite/.ssh/authorized_keys
+		# Fix permissions on home dir and .ssh (sshd is strict about these)
+		chmod 755 /home/sprite
+		chmod 700 /home/sprite/.ssh
+
+		# Write authorized_keys fresh from the uploaded key (avoid append duplicates)
+		cp /home/sprite/.ssh/sp_pubkey.pub /home/sprite/.ssh/authorized_keys
 		chmod 600 /home/sprite/.ssh/authorized_keys
 		chown -R sprite:sprite /home/sprite/.ssh
 
-		# Enable pubkey auth in sshd config
+		# Configure sshd
 		sudo mkdir -p /run/sshd
 		sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
 		sudo sed -i 's/PubkeyAuthentication no/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
 
-		# Restart sshd to pick up config changes (restart, not just start)
+		# Clear any auth log so we get fresh entries
+		sudo truncate -s 0 /var/log/auth.log 2>/dev/null || true
+
+		# Restart sshd to pick up config changes
 		sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd 2>/dev/null
 
-		# Verify sshd is listening and show authorized_keys for diagnostics
+		# Verify and dump diagnostics
 		sleep 1
-		echo "OWNER: $(ls -la /home/sprite/.ssh/authorized_keys)"
+		echo "HOME_PERMS: $(ls -ld /home/sprite)"
+		echo "SSH_DIR_PERMS: $(ls -ld /home/sprite/.ssh)"
+		echo "AUTH_KEYS_PERMS: $(ls -la /home/sprite/.ssh/authorized_keys)"
 		echo "WHOAMI: $(whoami)"
-		echo "KEYS: $(wc -l < /home/sprite/.ssh/authorized_keys) lines"
-		echo "KEY_FINGERPRINT: $(ssh-keygen -lf /home/sprite/.ssh/sp_pubkey.pub 2>/dev/null || echo unknown)"
+		echo "KEY_FINGERPRINT: $(ssh-keygen -lf /home/sprite/.ssh/authorized_keys 2>/dev/null || echo unknown)"
+		echo "SSHD_CONFIG_AUTHKEYS: $(grep -i AuthorizedKeysFile /etc/ssh/sshd_config 2>/dev/null || echo default)"
+		echo "SSHD_CONFIG_PUBKEY: $(grep -i PubkeyAuthentication /etc/ssh/sshd_config 2>/dev/null || echo default)"
 		if ss -tlnp 2>/dev/null | grep -q ':22 '; then
 			echo "SSHD_OK"
 		elif netstat -tlnp 2>/dev/null | grep -q ':22 '; then
