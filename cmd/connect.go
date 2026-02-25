@@ -169,46 +169,37 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Register with daemon — in web mode, the daemon is required for
-	// persistent sync, so treat failure as a hard error.
+	// Register with daemon. The daemon owns the sync lifecycle — it will
+	// auto-start sync when the sprite is running and has local/remote paths.
+	// In web mode the daemon is required; in console mode it's best-effort.
 	if err := registerWithDaemon(resolved, client); err != nil {
 		if webMode {
-			return fmt.Errorf("daemon required for --web sync persistence: %w", err)
+			return fmt.Errorf("daemon required for --web: %w", err)
 		}
-		if verbose {
-			fmt.Fprintf(os.Stderr, "Warning: daemon registration failed: %v\n", err)
-		}
-	}
+		fmt.Fprintf(os.Stderr, "Warning: daemon registration failed, sync will not persist: %v\n", err)
 
-	// Start sync
-	if !noSync && resolved.LocalPath != "" {
-		if webMode {
-			// In web mode, run sync synchronously so it's established before
-			// we return. The daemon keeps it healthy after that.
-			fmt.Println("Starting file sync...")
-			if err := startSync(client, resolved); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: sync setup failed: %v\n", err)
-			}
-		} else {
-			// In console mode, start sync in the background so the shell
-			// is available immediately.
-			fmt.Println("Starting file sync...")
+		// Fallback: inline sync for console mode when daemon is unavailable.
+		// The proxy dies with this process, so it only works while sp is running.
+		if !noSync && resolved.LocalPath != "" {
+			fmt.Println("Starting inline file sync (no daemon)...")
 			go func() {
-				if err := startSync(client, resolved); err != nil {
+				if err := startSyncInline(client, resolved); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: sync setup failed: %v\n", err)
 				}
 			}()
 		}
+	} else if !noSync && resolved.LocalPath != "" {
+		fmt.Println("Daemon will manage file sync.")
 	}
 
 	// In web mode, don't open a console — just return after setup.
-	// The daemon monitors sync health from here.
+	// The daemon manages sync from here.
 	if webMode {
 		info, _ := client.Get(resolved.SpriteName)
 		if info != nil {
 			fmt.Printf("\nSprite ready: %s\n", info.URL)
 		}
-		fmt.Println("Sync is running. The daemon will keep it healthy.")
+		fmt.Println("The daemon will keep sync healthy while the sprite is running.")
 		return nil
 	}
 
@@ -494,35 +485,6 @@ func registerWithDaemon(resolved *setup.ResolvedTarget, client *sprite.Client) e
 	}
 
 	return dc.UpsertSprite(s)
-}
-
-// startSync delegates sync setup to the daemon so the proxy process is owned
-// by the long-running daemon rather than the short-lived `sp` CLI. This is
-// critical for --web mode where sp exits immediately after setup.
-//
-// If the daemon is unreachable, falls back to inline sync (proxy is a child of
-// this process — fine for interactive console sessions but won't survive exit).
-func startSync(client *sprite.Client, resolved *setup.ResolvedTarget) error {
-	// Try daemon-managed sync first
-	dc, err := daemon.Connect()
-	if err == nil {
-		defer dc.Close()
-		result, err := dc.StartSync(daemon.StartSyncRequest{
-			SpriteName: resolved.SpriteName,
-			LocalPath:  resolved.LocalPath,
-			RemotePath: resolved.RemotePath,
-			Org:        resolved.Org,
-		})
-		if err != nil {
-			return fmt.Errorf("daemon start_sync: %w", err)
-		}
-		fmt.Printf("Sync started via daemon (mutagen: %s, proxy pid: %d)\n", result.MutagenID, result.ProxyPID)
-		return nil
-	}
-
-	// Fallback: inline sync (proxy dies with this process)
-	fmt.Fprintf(os.Stderr, "Warning: daemon not available, sync proxy will not persist after exit\n")
-	return startSyncInline(client, resolved)
 }
 
 // startSyncInline runs sync setup directly in this process. The proxy is a

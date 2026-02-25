@@ -676,6 +676,30 @@ func (d *Daemon) handleUpsert(params json.RawMessage) Response {
 		return respondError(err.Error())
 	}
 	d.broadcast(StateUpdate{Type: "sprite_added", SpriteName: s.Name})
+
+	// Auto-start sync if the sprite is running and has sync paths configured,
+	// and sync isn't already active. The daemon owns the sync lifecycle — callers
+	// just register the sprite and the daemon takes it from there.
+	syncNeeded := s.LocalPath != "" && s.RemotePath != "" &&
+		s.Status == "running" &&
+		s.SyncStatus != "watching" && s.SyncStatus != "connecting"
+	if syncNeeded {
+		// Also check if there's already a proxy tracked (sync in progress)
+		d.proxiesMu.RLock()
+		_, hasProxy := d.proxies[s.Name]
+		d.proxiesMu.RUnlock()
+
+		if !hasProxy {
+			slog.Info("upsert: auto-starting sync for running sprite",
+				"sprite", s.Name, "local", s.LocalPath, "remote", s.RemotePath)
+			go func(name string) {
+				if err := d.restartSync(name); err != nil {
+					slog.Error("upsert: auto-sync failed", "sprite", name, "error", err)
+				}
+			}(s.Name)
+		}
+	}
+
 	return respondOK("ok")
 }
 
