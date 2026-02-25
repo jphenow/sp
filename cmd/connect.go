@@ -219,6 +219,10 @@ const defaultOpencodePort = 8080
 // defaultProxyPort is the port the sp serve proxy listens on when --web-proxy is used.
 const defaultProxyPort = 9000
 
+// opencodeBin is the full path to the opencode binary on the sprite.
+// sprite exec / sprite-env don't source .bashrc, so we can't rely on PATH.
+const opencodeBin = "/home/sprite/.opencode/bin/opencode"
+
 // setupWebService configures a sprite-env service for the opencode web UI with
 // auto-wake on HTTP access. There are two modes:
 //
@@ -230,10 +234,12 @@ const defaultProxyPort = 9000
 // --http-port 9000. This lets /opencode route to opencode and /* fall through
 // to a dev server.
 func setupWebService(client *sprite.Client, spriteName string) error {
-	// Ensure opencode is installed
+	// Ensure opencode is installed. sprite exec doesn't source .bashrc, so
+	// command -v opencode fails even when it's installed. Check the known
+	// install path directly.
 	_, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Command: []string{"sh", "-c", "command -v opencode || (curl -fsSL https://opencode.ai/install | bash)"},
+		Command: []string{"sh", "-c", fmt.Sprintf("test -x %s || (curl -fsSL https://opencode.ai/install | bash)", opencodeBin)},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: opencode install check failed: %v\n", err)
@@ -257,13 +263,17 @@ func setupWebService(client *sprite.Client, spriteName string) error {
 
 // setupWebServiceDirect creates a sprite service running opencode web directly
 // on the HTTP port. The sprite proxy routes all traffic to opencode.
+// Uses the full opencode binary path because sprite-env doesn't source .bashrc,
+// and binds to 0.0.0.0 because the sprite proxy routes from outside localhost.
 func setupWebServiceDirect(client *sprite.Client, spriteName string) error {
 	port := defaultOpencodePort
 
-	// Create the service with http-port for auto-wake
+	// Create the service with http-port for auto-wake.
+	// --hostname 0.0.0.0 is required because the sprite proxy connects from
+	// outside localhost; without it opencode binds to 127.0.0.1 only.
 	createCmd := fmt.Sprintf(
-		"sprite-env services create opencode --cmd opencode --args web,--port,%d --http-port %d --duration 10s",
-		port, port,
+		"sprite-env services create opencode --cmd %s --args web,--port,%d,--hostname,0.0.0.0 --http-port %d --duration 10s",
+		opencodeBin, port, port,
 	)
 
 	out, err := client.Exec(sprite.ExecOptions{

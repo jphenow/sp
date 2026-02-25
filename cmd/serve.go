@@ -65,6 +65,6 @@ func init() {
 	serveCmd.Flags().IntVar(&opencodePort, "opencode-port", 8080, "port for opencode web UI")
 	serveCmd.Flags().IntVar(&devPort, "dev-port", 0, "port for development server (0 = disabled)")
 	serveCmd.Flags().IntVar(&proxyPort, "proxy-port", 0, "port for the reverse proxy (0 = direct opencode)")
-	serveCmd.Flags().StringVar(&opencodeCmd, "opencode-cmd", "opencode web", "command to start opencode")
+	serveCmd.Flags().StringVar(&opencodeCmd, "opencode-cmd", "/home/sprite/.opencode/bin/opencode web", "command to start opencode")
 	rootCmd.AddCommand(serveCmd)
 }

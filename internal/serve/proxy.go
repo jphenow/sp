@@ -121,10 +121,13 @@ func (s *Server) handleNoDev() http.HandlerFunc {
 }
 
 // startOpencode launches the opencode web process as a child.
+// Defaults to the full install path (/home/sprite/.opencode/bin/opencode)
+// because sprite-env doesn't source .bashrc. Binds to 0.0.0.0 so the
+// sprite proxy (which connects from outside localhost) can reach it.
 func (s *Server) startOpencode(ctx context.Context) error {
 	cmdStr := s.config.OpencodeCmd
 	if cmdStr == "" {
-		cmdStr = "opencode web"
+		cmdStr = "/home/sprite/.opencode/bin/opencode web"
 	}
 
 	parts := strings.Fields(cmdStr)
@@ -132,8 +135,12 @@ func (s *Server) startOpencode(ctx context.Context) error {
 		return fmt.Errorf("empty opencode command")
 	}
 
-	// Add port flag
-	args := append(parts[1:], "--port", fmt.Sprintf("%d", s.config.OpencodePort))
+	// Add port and hostname flags. --hostname 0.0.0.0 is required because
+	// the sprite proxy routes from outside localhost.
+	args := append(parts[1:],
+		"--port", fmt.Sprintf("%d", s.config.OpencodePort),
+		"--hostname", "0.0.0.0",
+	)
 	cmd := exec.CommandContext(ctx, parts[0], args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
