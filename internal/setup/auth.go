@@ -151,6 +151,51 @@ chmod 600 ~/.ssh/config`, sshConfig)},
 	return nil
 }
 
+// InstallOpenWrapper installs a ~/bin/open script inside the sprite that emits
+// the OSC 9999 browser-open escape sequence. When running inside tmux, the
+// script wraps the sequence in a DCS passthrough envelope so the local sprite
+// client can intercept it. Without this, tmux swallows unknown OSC sequences.
+func InstallOpenWrapper(client *sprite.Client, spriteName string) error {
+	// The open wrapper script:
+	// - Detects $TMUX to determine if we need DCS passthrough wrapping
+	// - Emits OSC 9999;browser-open;<url> BEL, optionally inside DCS tmux envelope
+	script := `#!/bin/sh
+# sp-managed open wrapper — emits OSC 9999 browser-open for the sprite client.
+# When running inside tmux, wraps in DCS passthrough envelope.
+url="$1"
+if [ -z "$url" ]; then
+  echo "Usage: open <url>" >&2
+  exit 1
+fi
+
+if [ -n "$TMUX" ]; then
+  # DCS passthrough: ESC P tmux; <inner with ESC doubled> ESC backslash
+  printf '\033Ptmux;\033\033]9999;browser-open;%s\007\033\\' "$url"
+else
+  printf '\033]9999;browser-open;%s\007' "$url"
+fi
+`
+
+	// Install to ~/bin/open with PATH addition
+	installCmd := `
+		mkdir -p ~/bin
+		cat > ~/bin/open << 'OPENEOF'
+` + script + `OPENEOF
+		chmod +x ~/bin/open
+		# Ensure ~/bin is in PATH via .bashrc (idempotent)
+		grep -q 'export PATH="$HOME/bin:$PATH"' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+	`
+
+	if _, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", installCmd},
+	}); err != nil {
+		return fmt.Errorf("installing open wrapper: %w", err)
+	}
+
+	return nil
+}
+
 // SetupGitConfig copies the local user's git config (name, email) to the sprite.
 func SetupGitConfig(client *sprite.Client, spriteName string) error {
 	name, _ := gitConfigValue("user.name")

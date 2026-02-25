@@ -181,6 +181,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// Clean up stale SSH config entries from prior sessions
+	if removed, err := spSync.CleanupStaleSSHConfigs(); err != nil {
+		slog.Debug("startup: ssh config cleanup error", "error", err)
+	} else if len(removed) > 0 {
+		slog.Info("startup: cleaned up stale SSH config entries", "count", len(removed), "entries", removed)
+	}
+
 	// Start background workers
 	go d.healthPoller(ctx)
 	go d.idleWatcher(ctx)
@@ -308,6 +315,8 @@ func (d *Daemon) dispatch(ctx context.Context, clientID string, req *Request) Re
 		return d.handleStartSync(req.Params)
 	case "stop_sync":
 		return d.handleStopSync(req.Params)
+	case "resync":
+		return d.handleResync(req.Params)
 	case "restart":
 		return d.handleRestart()
 	case "ping":
@@ -869,6 +878,41 @@ func (d *Daemon) handleImport(params json.RawMessage) Response {
 
 	d.broadcast(StateUpdate{Type: "sprite_added", SpriteName: info.Name})
 	return respondJSON(s)
+}
+
+// handleResync flushes pending Mutagen changes, tears down sync, and restarts
+// the full sync pipeline. This is the RPC handler for `sp resync`.
+func (d *Daemon) handleResync(params json.RawMessage) Response {
+	var req struct {
+		Name       string `json:"name"`
+		LocalPath  string `json:"local_path"`
+		RemotePath string `json:"remote_path"`
+		Org        string `json:"org"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		return respondError(fmt.Sprintf("invalid params: %v", err))
+	}
+
+	log := slog.With("sprite", req.Name)
+	log.Info("resync: beginning")
+
+	// 1. Flush pending changes (best-effort, 15s timeout)
+	log.Info("resync: flushing pending mutagen changes")
+	if err := spSync.FlushMutagenSession(req.Name); err != nil {
+		log.Warn("resync: flush failed (continuing)", "error", err)
+	}
+
+	// 2. Tear down existing sync
+	d.stopSyncForSprite(req.Name)
+
+	// 3. Restart sync via the standard pipeline
+	go func() {
+		if err := d.restartSync(req.Name); err != nil {
+			log.Error("resync: restart failed", "error", err)
+		}
+	}()
+
+	return respondOK("resyncing")
 }
 
 // handleRestart sends back an "ok" and then triggers a graceful restart.

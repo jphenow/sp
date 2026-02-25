@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
@@ -360,6 +361,47 @@ func RemoveSSHConfig(spriteName string) error {
 	return removeSSHConfigEntry(configPath, alias)
 }
 
+// CleanupStaleSSHConfigs removes SSH config entries for sprites that no longer
+// have active Mutagen sessions. Called during daemon startup or periodic cleanup.
+func CleanupStaleSSHConfigs() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("getting home directory: %w", err)
+	}
+	configPath := filepath.Join(home, ".ssh", "config")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find all sp-managed aliases
+	var managedAliases []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# sp-managed: ") {
+			alias := strings.TrimPrefix(line, "# sp-managed: ")
+			managedAliases = append(managedAliases, alias)
+		}
+	}
+
+	// Check each alias — if the corresponding Mutagen session doesn't exist,
+	// the SSH config entry is stale and should be removed
+	var removed []string
+	for _, alias := range managedAliases {
+		// Alias format is "sprite-mutagen-<name>", sprite name is after that prefix
+		spriteName := strings.TrimPrefix(alias, "sprite-mutagen-")
+		if !MutagenSessionExists(spriteName) {
+			if err := removeSSHConfigEntry(configPath, alias); err == nil {
+				removed = append(removed, alias)
+				slog.Info("ssh_cleanup: removed stale config entry", "alias", alias)
+			}
+		}
+	}
+
+	return removed, nil
+}
+
 // removeSSHConfigEntry removes a managed SSH config block identified by the alias marker.
 func removeSSHConfigEntry(configPath, alias string) error {
 	data, err := os.ReadFile(configPath)
@@ -423,6 +465,20 @@ func (m *Manager) StartMutagenSession(spriteName, localDir, remoteDir string) (s
 	}
 
 	return id, nil
+}
+
+// FlushMutagenSession flushes pending changes for a Mutagen sync session with
+// a 15-second timeout. This ensures both sides agree before tearing down the session.
+func FlushMutagenSession(spriteName string) error {
+	sessionName := SessionName(spriteName)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "mutagen", "sync", "flush", sessionName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("flushing mutagen session %q: %w\n%s", sessionName, err, string(out))
+	}
+	return nil
 }
 
 // TerminateMutagenSession stops and removes a Mutagen sync session.
@@ -559,7 +615,7 @@ func TestSSHConnection(spriteName string, port int, done <-chan struct{}) error 
 			}
 		}
 
-		cmd := exec.Command("ssh", "-v", "-o", "ConnectTimeout=5",
+		cmd := exec.Command("ssh", "-o", "ConnectTimeout=5",
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "UserKnownHostsFile=/dev/null",
 			alias, "echo", "ok")

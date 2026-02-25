@@ -28,6 +28,7 @@ type view int
 const (
 	viewDashboard view = iota
 	viewDetail
+	viewTagInput
 )
 
 // FilterOptions holds the TUI's initial filter configuration.
@@ -57,6 +58,12 @@ type Model struct {
 	// Detail state
 	selectedSprite *store.Sprite
 	selectedTags   []string
+
+	// Tag input state
+	tagInput    textinput.Model
+	tagging     bool   // when true, the tag text input is active
+	tagTarget   string // sprite name being tagged
+	tagRemoving bool   // true if the 'T' (remove) variant was pressed
 
 	// Delete confirmation state
 	confirmDelete bool   // when true, waiting for y/n to confirm delete
@@ -132,9 +139,15 @@ func NewModel(client *daemon.Client, opts FilterOptions) Model {
 
 	hash, _ := daemon.BinaryHash()
 
+	tagTi := textinput.New()
+	tagTi.Placeholder = "tag name..."
+	tagTi.CharLimit = 50
+	tagTi.Width = 30
+
 	return Model{
 		client:          client,
 		filterInput:     ti,
+		tagInput:        tagTi,
 		filterOpts:      opts,
 		tags:            make(map[string][]string),
 		startBinaryHash: hash,
@@ -258,6 +271,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Update tag input if tagging
+	if m.tagging {
+		var cmd tea.Cmd
+		m.tagInput, cmd = m.tagInput.Update(msg)
+		return m, cmd
+	}
+
 	return m, nil
 }
 
@@ -266,6 +286,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Delete confirmation intercepts all keys
 	if m.confirmDelete {
 		return m.handleDeleteConfirm(msg)
+	}
+
+	// Tag input intercepts all keys
+	if m.tagging {
+		return m.handleTagKey(msg)
 	}
 
 	// Global keys
@@ -321,9 +346,24 @@ func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		return m, m.fetchSprites
 	case "t":
-		// Tag the selected sprite
-		if len(m.sprites) > 0 && m.cursor < len(m.sprites) {
-			return m, m.promptTag(m.sprites[m.cursor].Name)
+		// Add a tag to the selected sprite
+		if s := m.selectedDashboardSprite(); s != nil {
+			m.tagging = true
+			m.tagTarget = s.Name
+			m.tagRemoving = false
+			m.tagInput.SetValue("")
+			m.tagInput.Focus()
+			return m, textinput.Blink
+		}
+	case "T":
+		// Remove a tag from the selected sprite
+		if s := m.selectedDashboardSprite(); s != nil {
+			m.tagging = true
+			m.tagTarget = s.Name
+			m.tagRemoving = true
+			m.tagInput.SetValue("")
+			m.tagInput.Focus()
+			return m, textinput.Blink
 		}
 	case "o":
 		// Open sprite URL in browser
@@ -447,6 +487,17 @@ func (m Model) viewDashboard() string {
 		b.WriteString("\n\n")
 	}
 
+	// Tag input
+	if m.tagging {
+		action := "Add tag to"
+		if m.tagRemoving {
+			action = "Remove tag from"
+		}
+		b.WriteString(fmt.Sprintf("%s %s: ", action, m.tagTarget))
+		b.WriteString(m.tagInput.View())
+		b.WriteString("\n\n")
+	}
+
 	// Table header
 	headerRow := fmt.Sprintf("  %-35s %-10s %-12s %-40s %s",
 		"NAME", "STATUS", "SYNC", "LOCAL PATH", "TAGS")
@@ -511,7 +562,7 @@ func (m Model) viewDashboard() string {
 
 	// Help bar
 	b.WriteString("\n")
-	help := "[↑↓/jk] navigate  [enter] details  [o] open  [c] console  [s] sync  [d] delete  [f] filter  [t] tag  [r] refresh  [q] quit"
+	help := "[↑↓/jk] navigate  [enter] details  [o] open  [c] console  [s] sync  [d] delete  [f] filter  [t/T] tag/untag  [r] refresh  [q] quit"
 	b.WriteString(HelpStyle.Render(help))
 
 	return b.String()
@@ -661,35 +712,41 @@ func (m Model) reExec() tea.Msg {
 	return errMsg{err: fmt.Errorf("re-exec failed: %w", execErr)}
 }
 
-// promptTag is a tea.Cmd that would open a tag input prompt.
-// For now it just toggles a "work" tag for demonstration.
-func (m Model) promptTag(name string) tea.Cmd {
-	return func() tea.Msg {
-		tags, err := m.client.GetTags(name)
-		if err != nil {
-			return errMsg{err: err}
+// handleTagKey processes keys when the tag text input is active.
+func (m Model) handleTagKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		tag := strings.TrimSpace(m.tagInput.Value())
+		if tag == "" {
+			m.tagging = false
+			m.tagInput.Blur()
+			return m, nil
 		}
-
-		// Toggle "work" tag
-		hasWork := false
-		for _, t := range tags {
-			if t == "work" {
-				hasWork = true
-				break
+		m.tagging = false
+		m.tagInput.Blur()
+		name := m.tagTarget
+		removing := m.tagRemoving
+		return m, func() tea.Msg {
+			if removing {
+				if err := m.client.UntagSprite(name, tag); err != nil {
+					return errMsg{err: err}
+				}
+				return msgMsg(fmt.Sprintf("Removed tag %q from %s", tag, name))
 			}
-		}
-
-		if hasWork {
-			if err := m.client.UntagSprite(name, "work"); err != nil {
+			if err := m.client.TagSprite(name, tag); err != nil {
 				return errMsg{err: err}
 			}
-			return msgMsg(fmt.Sprintf("Removed 'work' tag from %s", name))
+			return msgMsg(fmt.Sprintf("Added tag %q to %s", tag, name))
 		}
-		if err := m.client.TagSprite(name, "work"); err != nil {
-			return errMsg{err: err}
-		}
-		return msgMsg(fmt.Sprintf("Added 'work' tag to %s", name))
+	case "esc":
+		m.tagging = false
+		m.tagInput.Blur()
+		return m, nil
 	}
+
+	var cmd tea.Cmd
+	m.tagInput, cmd = m.tagInput.Update(msg)
+	return m, cmd
 }
 
 // selectedDashboardSprite returns the sprite at the current cursor position, or nil.
@@ -737,6 +794,8 @@ func (m Model) connectConsole(s *store.Sprite) tea.Cmd {
 
 	c := exec.Command("sprite", args...)
 	return tea.ExecProcess(c, func(err error) tea.Msg {
+		// Reset terminal mouse tracking modes that tmux may have left enabled
+		fmt.Fprintf(os.Stderr, "\033[?1000l\033[?1003l\033[?1006l")
 		return consoleFinishedMsg{err: err}
 	})
 }

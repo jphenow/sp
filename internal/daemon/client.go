@@ -179,6 +179,18 @@ func (c *Client) ImportSprite(name, localPath string, tags []string) (*store.Spr
 	return &s, nil
 }
 
+// Resync flushes pending Mutagen changes, tears down sync, and restarts it
+// fresh for a sprite. This is the equivalent of the Bash script's resync command.
+func (c *Client) Resync(name, localPath, remotePath, org string) error {
+	_, err := c.call("resync", map[string]string{
+		"name":        name,
+		"local_path":  localPath,
+		"remote_path": remotePath,
+		"org":         org,
+	})
+	return err
+}
+
 // Restart asks the daemon to gracefully restart (re-exec the new binary).
 // The daemon will respond, then asynchronously shut down and exec.
 func (c *Client) Restart() error {

@@ -161,6 +161,11 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Install the OSC 9999 open wrapper for tmux passthrough (idempotent)
+	if err := setup.InstallOpenWrapper(client, resolved.SpriteName); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: open wrapper install failed: %v\n", err)
+	}
+
 	// Setup web service if requested — always reconfigure to ensure correct state
 	if webMode {
 		fmt.Println("Setting up web service...")
@@ -579,5 +584,22 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	return cmd.Run()
+	runErr := cmd.Run()
+
+	// Reset terminal after disconnect. Remote tmux may have enabled SGR mouse
+	// tracking modes (1000/1003/1006) which persist after the connection drops,
+	// causing raw escape sequences to appear on scroll/click.
+	resetTerminal()
+
+	return runErr
+}
+
+// resetTerminal disables mouse tracking modes that may have been left enabled
+// by the remote tmux session. Without this, scrolling and clicking in the local
+// terminal produces raw escape sequences like "65;40;62M".
+func resetTerminal() {
+	// Disable X10 mouse reporting (mode 1000)
+	// Disable any-event mouse tracking (mode 1003)
+	// Disable SGR extended mouse mode (mode 1006)
+	fmt.Fprintf(os.Stderr, "\033[?1000l\033[?1003l\033[?1006l")
 }
