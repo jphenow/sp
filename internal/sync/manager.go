@@ -124,14 +124,35 @@ func (m *Manager) SetupSSHServer(spriteName string) error {
 		return fmt.Errorf("configuring SSH server: %w", err)
 	}
 
-	// Start sshd
-	startCmd := `sudo systemctl start ssh 2>/dev/null || sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd 2>/dev/null`
-	if _, err := m.client.Exec(sprite.ExecOptions{
+	// Start sshd and verify it's running
+	startCmd := `
+		sudo systemctl start ssh 2>/dev/null || sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd 2>/dev/null
+		# Verify sshd is actually listening on port 22
+		sleep 1
+		if ss -tlnp 2>/dev/null | grep -q ':22 '; then
+			echo "SSHD_OK"
+		elif netstat -tlnp 2>/dev/null | grep -q ':22 '; then
+			echo "SSHD_OK"
+		else
+			echo "SSHD_FAIL: port 22 not listening"
+			# Try to get sshd status for diagnostics
+			sudo systemctl status ssh 2>/dev/null || sudo service ssh status 2>/dev/null || true
+			ps aux | grep sshd 2>/dev/null || true
+		fi
+	`
+	out, err := m.client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
 		Command: []string{"sh", "-c", startCmd},
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("starting SSH server: %w", err)
 	}
+	outStr := strings.TrimSpace(string(out))
+	if !strings.Contains(outStr, "SSHD_OK") {
+		slog.Error("ssh_setup: sshd may not be running", "sprite", spriteName, "output", outStr)
+		return fmt.Errorf("sshd verification failed: %s", outStr)
+	}
+	slog.Info("ssh_setup: sshd running on port 22", "sprite", spriteName)
 
 	return nil
 }
@@ -259,17 +280,23 @@ func AddSSHConfig(spriteName string, port int) error {
 	configPath := filepath.Join(home, ".ssh", "config")
 	alias := SSHHostAlias(spriteName)
 
+	// Include IdentityFile so SSH uses the right key even without an agent
+	identityFile := filepath.Join(home, ".ssh", "id_ed25519")
+
 	entry := fmt.Sprintf(`
 # sp-managed: %s
 Host %s
   HostName localhost
   Port %d
   User sprite
+  IdentityFile %s
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
   LogLevel ERROR
 # sp-end: %s
-`, alias, alias, port, alias)
+`, alias, alias, port, identityFile, alias)
+
+	slog.Debug("ssh_config: writing entry", "alias", alias, "port", port, "identity", identityFile)
 
 	// Remove old entry if present, then append new one
 	if err := removeSSHConfigEntry(configPath, alias); err != nil {
@@ -500,15 +527,19 @@ func TestSSHConnection(spriteName string, port int, done <-chan struct{}) error 
 			}
 		}
 
-		cmd := exec.Command("ssh", "-o", "ConnectTimeout=5",
+		cmd := exec.Command("ssh", "-v", "-o", "ConnectTimeout=5",
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "UserKnownHostsFile=/dev/null",
 			alias, "echo", "ok")
-		if out, err := cmd.CombinedOutput(); err == nil {
-			if strings.Contains(string(out), "ok") {
-				return nil
-			}
+		out, err := cmd.CombinedOutput()
+		if err == nil && strings.Contains(string(out), "ok") {
+			slog.Info("ssh_test: connection succeeded", "sprite", spriteName, "attempt", attempt+1)
+			return nil
 		}
+		// Log the SSH error output for diagnostics
+		slog.Debug("ssh_test: attempt failed",
+			"sprite", spriteName, "attempt", attempt+1,
+			"error", err, "output", string(out))
 
 		// Sleep with early abort on proxy death
 		sleepDur := time.Duration(attempt+1) * time.Second
