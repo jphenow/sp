@@ -161,7 +161,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Setup web service if requested
+	// Setup web service if requested — always reconfigure to ensure correct state
 	if webMode {
 		fmt.Println("Setting up web service...")
 		if err := setupWebService(client, resolved.SpriteName); err != nil {
@@ -177,14 +177,36 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Start sync in background
+	// Start sync
 	if !noSync && resolved.LocalPath != "" {
-		fmt.Println("Starting file sync...")
-		go func() {
+		if webMode {
+			// In web mode, run sync synchronously so it's established before
+			// we return. The daemon keeps it healthy after that.
+			fmt.Println("Starting file sync...")
 			if err := startSync(client, resolved); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: sync setup failed: %v\n", err)
 			}
-		}()
+		} else {
+			// In console mode, start sync in the background so the shell
+			// is available immediately.
+			fmt.Println("Starting file sync...")
+			go func() {
+				if err := startSync(client, resolved); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: sync setup failed: %v\n", err)
+				}
+			}()
+		}
+	}
+
+	// In web mode, don't open a console — just return after setup.
+	// The daemon monitors sync health from here.
+	if webMode {
+		info, _ := client.Get(resolved.SpriteName)
+		if info != nil {
+			fmt.Printf("\nSprite ready: %s\n", info.URL)
+		}
+		fmt.Println("Sync is running. The daemon will keep it healthy.")
+		return nil
 	}
 
 	// Connect to sprite shell
