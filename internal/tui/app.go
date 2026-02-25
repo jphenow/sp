@@ -2,7 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -11,6 +13,9 @@ import (
 	"github.com/jphenow/sp/internal/daemon"
 	"github.com/jphenow/sp/internal/store"
 )
+
+// binaryCheckInterval is how often the TUI checks if the sp binary has changed.
+const binaryCheckInterval = 10 * time.Second
 
 // pollInterval is how often the TUI re-fetches the sprite list from the daemon
 // to pick up newly added/imported sprites and status changes.
@@ -52,6 +57,10 @@ type Model struct {
 	selectedSprite *store.Sprite
 	selectedTags   []string
 
+	// Binary change detection
+	startBinaryHash string // hash at TUI startup
+	binaryChanged   bool   // true if we detected a new binary
+
 	// Error display
 	err     error
 	message string
@@ -79,6 +88,12 @@ type msgMsg string
 // tickMsg is sent periodically to trigger a sprite list refresh.
 type tickMsg time.Time
 
+// binaryCheckMsg is sent periodically to check if the sp binary has changed.
+type binaryCheckMsg time.Time
+
+// binaryChangedMsg indicates the on-disk binary differs from what's running.
+type binaryChangedMsg struct{}
+
 // NewModel creates a new TUI model connected to the daemon.
 func NewModel(client *daemon.Client, opts FilterOptions) Model {
 	ti := textinput.New()
@@ -91,11 +106,14 @@ func NewModel(client *daemon.Client, opts FilterOptions) Model {
 		ti.SetValue(opts.NameFilter)
 	}
 
+	hash, _ := daemon.BinaryHash()
+
 	return Model{
-		client:      client,
-		filterInput: ti,
-		filterOpts:  opts,
-		tags:        make(map[string][]string),
+		client:          client,
+		filterInput:     ti,
+		filterOpts:      opts,
+		tags:            make(map[string][]string),
+		startBinaryHash: hash,
 	}
 }
 
@@ -105,7 +123,15 @@ func (m Model) Init() tea.Cmd {
 		m.fetchSprites,
 		tea.SetWindowTitle("sp"),
 		tickCmd(),
+		binaryCheckCmd(),
 	)
+}
+
+// binaryCheckCmd returns a tea.Cmd that sends a binaryCheckMsg after the check interval.
+func binaryCheckCmd() tea.Cmd {
+	return tea.Tick(binaryCheckInterval, func(t time.Time) tea.Msg {
+		return binaryCheckMsg(t)
+	})
 }
 
 // tickCmd returns a tea.Cmd that sends a tickMsg after pollInterval.
@@ -138,6 +164,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Periodic poll: re-fetch the sprite list and schedule the next tick.
 		// This ensures new imports and status changes always appear.
 		return m, tea.Batch(m.fetchSprites, tickCmd())
+
+	case binaryCheckMsg:
+		return m, tea.Batch(m.checkBinaryChanged, binaryCheckCmd())
+
+	case binaryChangedMsg:
+		m.binaryChanged = true
+		// Auto re-exec: the TUI replaces itself with the new binary
+		return m, m.reExec
 
 	case stateUpdateMsg:
 		// Refresh sprite list on any state change
@@ -453,6 +487,43 @@ func (m Model) fetchSprites() tea.Msg {
 	}
 
 	return spriteListMsg{sprites: sprites, tags: tags}
+}
+
+// checkBinaryChanged is a tea.Cmd that compares the current binary hash to
+// the one at startup. Sends binaryChangedMsg if they differ.
+func (m Model) checkBinaryChanged() tea.Msg {
+	if m.startBinaryHash == "" {
+		return nil
+	}
+	current, err := daemon.BinaryHash()
+	if err != nil {
+		return nil
+	}
+	if current != m.startBinaryHash {
+		return binaryChangedMsg{}
+	}
+	return nil
+}
+
+// reExec replaces the current TUI process with the new binary. It first tells
+// the daemon to restart (so both pick up the new code), then execs itself.
+func (m Model) reExec() tea.Msg {
+	// Tell the daemon to restart too
+	if m.client != nil {
+		m.client.Restart()
+	}
+
+	// Re-exec ourselves with the same args
+	exePath, err := os.Executable()
+	if err != nil {
+		return errMsg{err: fmt.Errorf("re-exec: %w", err)}
+	}
+
+	// syscall.Exec replaces the process — Bubbletea cleanup happens via the
+	// alt screen restore that the terminal does on exec.
+	execErr := syscall.Exec(exePath, os.Args, os.Environ())
+	// If we get here, exec failed
+	return errMsg{err: fmt.Errorf("re-exec failed: %w", execErr)}
 }
 
 // promptTag is a tea.Cmd that would open a tag input prompt.

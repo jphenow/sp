@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -115,8 +116,11 @@ func (h *HealthMonitor) checkNetwork() {
 		resp.Body.Close()
 	}
 
-	// If we came back online, reset all backoffs
-	if !wasOnline && h.IsOnline() {
+	// Log transitions
+	if wasOnline && !h.IsOnline() {
+		slog.Warn("health: network went offline", "error", err)
+	} else if !wasOnline && h.IsOnline() {
+		slog.Info("health: network came back online")
 		h.resetAllBackoffs()
 	}
 }
@@ -176,8 +180,8 @@ func (h *HealthMonitor) checkSpriteSync(s *store.Sprite) {
 		since, exists := h.connectingSince[s.Name]
 		h.connectingSinceMu.RUnlock()
 		if exists && time.Since(since) > connectingRecoveryTimeout {
-			fmt.Printf("health: sync for %q stuck in connecting for %v, attempting recovery\n",
-				s.Name, time.Since(since).Round(time.Second))
+			slog.Warn("health: sync stuck in connecting, attempting recovery",
+				"sprite", s.Name, "duration", time.Since(since).Round(time.Second))
 			h.connectingSinceMu.Lock()
 			delete(h.connectingSince, s.Name)
 			h.connectingSinceMu.Unlock()
@@ -189,6 +193,10 @@ func (h *HealthMonitor) checkSpriteSync(s *store.Sprite) {
 	}
 
 	if oldSyncStatus != newSyncStatus || s.SyncError != syncError {
+		slog.Info("health: sync status changed",
+			"sprite", s.Name,
+			"from", oldSyncStatus, "to", newSyncStatus,
+			"error", syncError)
 		if err := h.db.UpdateSyncStatus(s.Name, newSyncStatus, syncError); err != nil {
 			return
 		}
@@ -258,12 +266,14 @@ func (h *HealthMonitor) AttemptSyncRecovery(spriteName string) error {
 		return fmt.Errorf("no daemon reference for sync recovery")
 	}
 
+	slog.Info("recovery: attempting full sync recovery", "sprite", spriteName)
 	h.db.UpdateSyncStatus(spriteName, "recovering", "")
 	if h.onUpdate != nil {
 		h.onUpdate(StateUpdate{Type: "sync_status", SpriteName: spriteName})
 	}
 
 	if err := h.daemon.restartSync(spriteName); err != nil {
+		slog.Error("recovery: failed", "sprite", spriteName, "error", err)
 		h.db.UpdateSyncStatus(spriteName, "error", fmt.Sprintf("recovery failed: %v", err))
 		if h.onUpdate != nil {
 			h.onUpdate(StateUpdate{Type: "sync_status", SpriteName: spriteName})
@@ -271,6 +281,7 @@ func (h *HealthMonitor) AttemptSyncRecovery(spriteName string) error {
 		return fmt.Errorf("sync recovery for %q: %w", spriteName, err)
 	}
 
+	slog.Info("recovery: successful", "sprite", spriteName)
 	return nil
 }
 
@@ -315,14 +326,14 @@ func (h *HealthMonitor) checkAllProxyLiveness() {
 			}
 
 			// Proxy is dead but still tracked — clean up and attempt recovery
-			fmt.Printf("health: proxy for %q (pid %d) is dead, attempting recovery\n", s.Name, ss.ProxyPID)
+			slog.Warn("health: proxy is dead, attempting recovery", "sprite", s.Name, "pid", ss.ProxyPID)
 			h.daemon.proxiesMu.Lock()
 			delete(h.daemon.proxies, s.Name)
 			h.daemon.proxiesMu.Unlock()
 
 			if err := h.AttemptSyncRecovery(s.Name); err != nil {
 				h.recordFailure(s.Name)
-				fmt.Printf("health: recovery failed for %q: %v\n", s.Name, err)
+				slog.Error("health: recovery failed", "sprite", s.Name, "error", err)
 			}
 		}
 	}

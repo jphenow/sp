@@ -2,8 +2,12 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -26,6 +30,9 @@ type Config struct {
 	PIDPath     string        // PID file path
 	IdleTimeout time.Duration // Auto-stop after this idle duration (0 = no auto-stop)
 }
+
+// binaryCheckInterval is how often we check if the sp binary has been updated.
+const binaryCheckInterval = 10 * time.Second
 
 // DefaultConfig returns the default daemon configuration.
 func DefaultConfig() Config {
@@ -59,6 +66,11 @@ type Daemon struct {
 	// Key is sprite name, value is the proxy exec.Cmd.
 	proxiesMu sync.RWMutex
 	proxies   map[string]*exec.Cmd
+
+	// startBinaryHash is the SHA-256 of the sp binary at daemon startup.
+	// Used to detect when a new binary has been installed.
+	startBinaryHash string
+	exePath         string // absolute path to the running binary
 }
 
 // StateUpdate is broadcast to all connected subscribers when sprite state changes.
@@ -88,16 +100,46 @@ type Response struct {
 }
 
 // New creates a new daemon instance. Does not start it.
+// Computes the hash of the current binary so we can detect updates.
 func New(config Config, db *store.DB) *Daemon {
+	exePath, _ := os.Executable()
+	hash, _ := hashFile(exePath)
+
 	return &Daemon{
-		config:  config,
-		db:      db,
-		client:  sprite.NewClient(""),
-		clients: make(map[string]*clientConn),
-		subs:    make(map[string]chan StateUpdate),
-		proxies: make(map[string]*exec.Cmd),
-		done:    make(chan struct{}),
+		config:          config,
+		db:              db,
+		client:          sprite.NewClient(""),
+		clients:         make(map[string]*clientConn),
+		subs:            make(map[string]chan StateUpdate),
+		proxies:         make(map[string]*exec.Cmd),
+		done:            make(chan struct{}),
+		startBinaryHash: hash,
+		exePath:         exePath,
 	}
+}
+
+// hashFile computes the SHA-256 hex digest of a file.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// BinaryHash returns the SHA-256 hex digest of the currently running binary.
+// Exported so the TUI and CLI can use the same logic.
+func BinaryHash() (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return hashFile(exePath)
 }
 
 // Start launches the daemon: binds the Unix socket, starts background workers,
@@ -135,6 +177,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Start background workers
 	go d.healthPoller(ctx)
 	go d.idleWatcher(ctx)
+	go d.binaryWatcher(ctx)
 
 	// Start the sync/proxy health monitor
 	monitor := NewHealthMonitor(d.db, d, d.broadcast)
@@ -156,10 +199,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}()
 
+	slog.Info("daemon started", "socket", d.config.SocketPath, "pid", os.Getpid())
+
 	select {
 	case <-ctx.Done():
 	case sig := <-sigCh:
-		fmt.Printf("Received signal %v, shutting down...\n", sig)
+		slog.Info("received signal, shutting down", "signal", sig)
 	}
 
 	// Kill all managed proxy processes on shutdown
@@ -256,6 +301,8 @@ func (d *Daemon) dispatch(ctx context.Context, clientID string, req *Request) Re
 		return d.handleStartSync(req.Params)
 	case "stop_sync":
 		return d.handleStopSync(req.Params)
+	case "restart":
+		return d.handleRestart()
 	case "ping":
 		return respondOK("pong")
 	default:
@@ -361,12 +408,81 @@ func (d *Daemon) idleWatcher(ctx context.Context) {
 			}
 
 			if time.Since(lastActivity) > d.config.IdleTimeout {
-				fmt.Println("Idle timeout reached, shutting down daemon...")
+				slog.Info("idle timeout reached, shutting down daemon")
 				d.Stop()
 				return
 			}
 		}
 	}
+}
+
+// binaryWatcher checks periodically whether the sp binary on disk has changed
+// since this daemon started. If a new binary is detected, performs a graceful
+// restart: cleans up proxies, closes the socket, and re-execs.
+func (d *Daemon) binaryWatcher(ctx context.Context) {
+	if d.startBinaryHash == "" || d.exePath == "" {
+		slog.Warn("binary_watcher: skipping — could not determine binary hash at startup")
+		return
+	}
+
+	ticker := time.NewTicker(binaryCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currentHash, err := hashFile(d.exePath)
+			if err != nil {
+				slog.Debug("binary_watcher: error hashing binary", "error", err)
+				continue
+			}
+			if currentHash != d.startBinaryHash {
+				slog.Info("binary_watcher: new binary detected, restarting daemon",
+					"old_hash", d.startBinaryHash[:12], "new_hash", currentHash[:12])
+				d.gracefulRestart()
+				return
+			}
+		}
+	}
+}
+
+// gracefulRestart cleanly shuts down the daemon and re-execs the new binary.
+// Proxies are killed (the new daemon will re-establish sync on demand),
+// the socket is closed, and we exec into the new binary.
+func (d *Daemon) gracefulRestart() {
+	slog.Info("graceful_restart: beginning shutdown for re-exec")
+
+	// Kill all managed proxy processes
+	d.proxiesMu.RLock()
+	names := make([]string, 0, len(d.proxies))
+	for name := range d.proxies {
+		names = append(names, name)
+	}
+	d.proxiesMu.RUnlock()
+	for _, name := range names {
+		d.killProxy(name)
+	}
+
+	// Close the listener so the new daemon can bind
+	if d.ln != nil {
+		d.ln.Close()
+	}
+
+	// Remove PID file so the new daemon can write its own
+	d.removePID()
+
+	// Remove socket so the new process can bind
+	os.Remove(d.config.SocketPath)
+
+	slog.Info("graceful_restart: exec-ing new binary", "path", d.exePath)
+
+	// Re-exec the daemon start command
+	err := syscall.Exec(d.exePath, []string{d.exePath, "daemon", "start"}, os.Environ())
+	// If exec fails, we're still running — log and cancel so we stop cleanly
+	slog.Error("graceful_restart: exec failed, shutting down", "error", err)
+	d.Stop()
 }
 
 // subscribe registers a client for state update broadcasts.
@@ -447,18 +563,32 @@ func EnsureRunning() (string, error) {
 		return "", fmt.Errorf("getting executable path: %w", err)
 	}
 
+	// Open log file for daemon stdout/stderr so output isn't lost when backgrounded
+	logPath := filepath.Join(filepath.Dir(config.SocketPath), "sp.log")
+	os.MkdirAll(filepath.Dir(logPath), 0o755)
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		logFile = os.Stderr // fallback
+	}
+
 	// Fork ourselves with the daemon subcommand
 	attr := &os.ProcAttr{
 		Dir:   "/",
 		Env:   os.Environ(),
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+		Files: []*os.File{os.Stdin, logFile, logFile},
 	}
 
 	proc, err := os.StartProcess(exe, []string{exe, "daemon", "start"}, attr)
 	if err != nil {
+		if logFile != os.Stderr {
+			logFile.Close()
+		}
 		return "", fmt.Errorf("starting daemon: %w", err)
 	}
 	proc.Release()
+	if logFile != os.Stderr {
+		logFile.Close() // daemon has its own handle now
+	}
 
 	// Wait for socket to appear
 	for i := 0; i < 50; i++ {
@@ -684,6 +814,18 @@ func (d *Daemon) handleImport(params json.RawMessage) Response {
 	return respondJSON(s)
 }
 
+// handleRestart sends back an "ok" and then triggers a graceful restart.
+// The restart happens asynchronously so the response can be sent first.
+func (d *Daemon) handleRestart() Response {
+	slog.Info("restart: triggered via RPC")
+	go func() {
+		// Small delay to let the response get sent
+		time.Sleep(100 * time.Millisecond)
+		d.gracefulRestart()
+	}()
+	return respondOK("restarting")
+}
+
 // handleStartSync sets up SSH, starts a proxy as a daemon child process, and
 // creates a Mutagen sync session. Because the proxy is a child of the daemon
 // (not the short-lived `sp` CLI), it survives after `sp . --web` returns.
@@ -698,23 +840,32 @@ func (d *Daemon) handleStartSync(params json.RawMessage) Response {
 		return respondError(fmt.Sprintf("invalid params: %v", err))
 	}
 
+	log := slog.With("sprite", req.SpriteName, "local", req.LocalPath, "remote", req.RemotePath)
+	log.Info("start_sync: beginning sync setup")
+
 	// Use a sprite client with the correct org for proxy commands
 	client := sprite.NewClient(req.Org)
 	mgr := spSync.NewManager(client)
 
 	// Stop any existing sync for this sprite first
+	log.Info("start_sync: stopping any existing sync")
 	d.stopSyncForSprite(req.SpriteName)
 
 	// 1. Setup SSH server on the sprite
+	log.Info("start_sync: setting up SSH server on sprite")
 	if err := mgr.SetupSSHServer(req.SpriteName); err != nil {
+		log.Error("start_sync: SSH server setup failed", "error", err)
 		return respondError(fmt.Sprintf("SSH server setup: %v", err))
 	}
 
 	// 2. Start proxy as a child of the daemon process
+	log.Info("start_sync: starting sprite proxy")
 	proxyCmd, port, err := mgr.StartProxy(req.SpriteName)
 	if err != nil {
+		log.Error("start_sync: proxy start failed", "error", err)
 		return respondError(fmt.Sprintf("starting proxy: %v", err))
 	}
+	log.Info("start_sync: proxy started", "port", port, "pid", proxyCmd.Process.Pid)
 
 	// Track the proxy process so we can monitor and restart it
 	d.proxiesMu.Lock()
@@ -725,21 +876,28 @@ func (d *Daemon) handleStartSync(params json.RawMessage) Response {
 	go d.monitorProxy(req.SpriteName, proxyCmd)
 
 	// 3. Add SSH config entry for Mutagen
+	log.Info("start_sync: adding SSH config", "port", port)
 	if err := spSync.AddSSHConfig(req.SpriteName, port); err != nil {
+		log.Error("start_sync: SSH config failed", "error", err)
 		d.killProxy(req.SpriteName)
 		return respondError(fmt.Sprintf("adding SSH config: %v", err))
 	}
 
 	// 4. Test SSH connectivity through the proxy
+	log.Info("start_sync: testing SSH connection")
 	if err := spSync.TestSSHConnection(req.SpriteName, port); err != nil {
+		log.Error("start_sync: SSH test failed", "error", err)
 		d.killProxy(req.SpriteName)
 		spSync.RemoveSSHConfig(req.SpriteName)
 		return respondError(fmt.Sprintf("SSH connection test: %v", err))
 	}
+	log.Info("start_sync: SSH connection verified")
 
 	// 5. Start Mutagen sync session
+	log.Info("start_sync: creating mutagen session")
 	mutagenID, err := mgr.StartMutagenSession(req.SpriteName, req.LocalPath, req.RemotePath)
 	if err != nil {
+		log.Error("start_sync: mutagen failed", "error", err)
 		d.killProxy(req.SpriteName)
 		spSync.RemoveSSHConfig(req.SpriteName)
 		return respondError(fmt.Sprintf("starting Mutagen: %v", err))
@@ -757,6 +915,7 @@ func (d *Daemon) handleStartSync(params json.RawMessage) Response {
 	d.db.UpdateSyncStatus(req.SpriteName, "watching", "")
 	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.SpriteName})
 
+	log.Info("start_sync: complete", "mutagen_id", mutagenID, "port", port, "proxy_pid", proxyCmd.Process.Pid)
 	return respondJSON(map[string]interface{}{
 		"mutagen_id": mutagenID,
 		"ssh_port":   port,
@@ -781,18 +940,25 @@ func (d *Daemon) handleStopSync(params json.RawMessage) Response {
 // stopSyncForSprite tears down all sync infrastructure for a sprite:
 // terminates Mutagen, kills the proxy, removes SSH config, cleans up DB.
 func (d *Daemon) stopSyncForSprite(spriteName string) {
+	slog.Info("stop_sync: tearing down sync", "sprite", spriteName)
+
 	// Terminate Mutagen session (if it exists)
-	spSync.TerminateMutagenSession(spriteName)
+	if err := spSync.TerminateMutagenSession(spriteName); err != nil {
+		slog.Debug("stop_sync: mutagen terminate", "sprite", spriteName, "error", err)
+	}
 
 	// Kill proxy
 	d.killProxy(spriteName)
 
 	// Remove SSH config
-	spSync.RemoveSSHConfig(spriteName)
+	if err := spSync.RemoveSSHConfig(spriteName); err != nil {
+		slog.Debug("stop_sync: remove SSH config", "sprite", spriteName, "error", err)
+	}
 
 	// Clean up DB
 	d.db.DeleteSyncSession(spriteName)
 	d.db.UpdateSyncStatus(spriteName, "none", "")
+	slog.Info("stop_sync: teardown complete", "sprite", spriteName)
 }
 
 // killProxy stops and removes the tracked proxy process for a sprite.
@@ -805,6 +971,8 @@ func (d *Daemon) killProxy(spriteName string) {
 	d.proxiesMu.Unlock()
 
 	if ok && cmd.Process != nil {
+		pid := cmd.Process.Pid
+		slog.Info("kill_proxy: sending SIGTERM", "sprite", spriteName, "pid", pid)
 		cmd.Process.Signal(syscall.SIGTERM)
 		// Give it a moment to exit cleanly, then force-kill
 		done := make(chan struct{})
@@ -814,15 +982,22 @@ func (d *Daemon) killProxy(spriteName string) {
 		}()
 		select {
 		case <-done:
+			slog.Info("kill_proxy: process exited cleanly", "sprite", spriteName, "pid", pid)
 		case <-time.After(3 * time.Second):
+			slog.Warn("kill_proxy: force-killing after timeout", "sprite", spriteName, "pid", pid)
 			cmd.Process.Kill()
 		}
+	} else if !ok {
+		slog.Debug("kill_proxy: no tracked proxy to kill", "sprite", spriteName)
 	}
 }
 
 // monitorProxy watches a proxy process and marks sync as disconnected if it
 // exits unexpectedly. This runs as a goroutine for each active proxy.
 func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
+	pid := cmd.Process.Pid
+	slog.Debug("monitor_proxy: watching", "sprite", spriteName, "pid", pid)
+
 	err := cmd.Wait()
 
 	// Check if we still own this proxy (it might have been intentionally killed)
@@ -831,7 +1006,8 @@ func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 	d.proxiesMu.RUnlock()
 
 	if !tracked || current != cmd {
-		return // Proxy was replaced or intentionally stopped
+		slog.Debug("monitor_proxy: proxy was replaced or stopped intentionally", "sprite", spriteName, "pid", pid)
+		return
 	}
 
 	// Unexpected exit — clean up and mark disconnected
@@ -844,6 +1020,7 @@ func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 		errMsg = fmt.Sprintf("proxy exited: %v", err)
 	}
 
+	slog.Error("monitor_proxy: unexpected exit", "sprite", spriteName, "pid", pid, "error", errMsg)
 	d.db.UpdateSyncStatus(spriteName, "disconnected", errMsg)
 	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
 }
@@ -851,6 +1028,9 @@ func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 // restartSync tears down and re-establishes sync for a sprite using the stored
 // session info. Called by the health monitor when recovery is needed.
 func (d *Daemon) restartSync(spriteName string) error {
+	log := slog.With("sprite", spriteName)
+	log.Info("restart_sync: beginning full sync restart")
+
 	// Look up sprite info from the database
 	s, err := d.db.GetSprite(spriteName)
 	if err != nil || s == nil {
@@ -861,6 +1041,8 @@ func (d *Daemon) restartSync(spriteName string) error {
 		return fmt.Errorf("sprite %q has no local/remote path configured", spriteName)
 	}
 
+	log = log.With("local", s.LocalPath, "remote", s.RemotePath, "org", s.Org)
+
 	// Stop existing sync
 	d.stopSyncForSprite(spriteName)
 
@@ -869,15 +1051,20 @@ func (d *Daemon) restartSync(spriteName string) error {
 	mgr := spSync.NewManager(client)
 
 	// Setup SSH
+	log.Info("restart_sync: setting up SSH server")
 	if err := mgr.SetupSSHServer(spriteName); err != nil {
+		log.Error("restart_sync: SSH setup failed", "error", err)
 		return fmt.Errorf("SSH setup: %w", err)
 	}
 
 	// Start proxy
+	log.Info("restart_sync: starting proxy")
 	proxyCmd, port, err := mgr.StartProxy(spriteName)
 	if err != nil {
+		log.Error("restart_sync: proxy failed", "error", err)
 		return fmt.Errorf("starting proxy: %w", err)
 	}
+	log.Info("restart_sync: proxy started", "port", port, "pid", proxyCmd.Process.Pid)
 
 	d.proxiesMu.Lock()
 	d.proxies[spriteName] = proxyCmd
@@ -885,21 +1072,27 @@ func (d *Daemon) restartSync(spriteName string) error {
 	go d.monitorProxy(spriteName, proxyCmd)
 
 	// SSH config
+	log.Info("restart_sync: adding SSH config", "port", port)
 	if err := spSync.AddSSHConfig(spriteName, port); err != nil {
+		log.Error("restart_sync: SSH config failed", "error", err)
 		d.killProxy(spriteName)
 		return fmt.Errorf("SSH config: %w", err)
 	}
 
 	// Test connection
+	log.Info("restart_sync: testing SSH connection")
 	if err := spSync.TestSSHConnection(spriteName, port); err != nil {
+		log.Error("restart_sync: SSH test failed", "error", err)
 		d.killProxy(spriteName)
 		spSync.RemoveSSHConfig(spriteName)
 		return fmt.Errorf("SSH test: %w", err)
 	}
 
 	// Mutagen
+	log.Info("restart_sync: creating mutagen session")
 	mutagenID, err := mgr.StartMutagenSession(spriteName, s.LocalPath, s.RemotePath)
 	if err != nil {
+		log.Error("restart_sync: mutagen failed", "error", err)
 		d.killProxy(spriteName)
 		spSync.RemoveSSHConfig(spriteName)
 		return fmt.Errorf("Mutagen: %w", err)
@@ -914,6 +1107,7 @@ func (d *Daemon) restartSync(spriteName string) error {
 	d.db.UpdateSyncStatus(spriteName, "watching", "")
 	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
 
+	log.Info("restart_sync: complete", "mutagen_id", mutagenID, "port", port, "proxy_pid", proxyCmd.Process.Pid)
 	return nil
 }
 

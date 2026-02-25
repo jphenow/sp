@@ -179,6 +179,13 @@ func (c *Client) ImportSprite(name, localPath string, tags []string) (*store.Spr
 	return &s, nil
 }
 
+// Restart asks the daemon to gracefully restart (re-exec the new binary).
+// The daemon will respond, then asynchronously shut down and exec.
+func (c *Client) Restart() error {
+	_, err := c.call("restart", nil)
+	return err
+}
+
 // StartSyncRequest contains the parameters for starting sync via the daemon.
 type StartSyncRequest struct {
 	SpriteName string `json:"sprite_name"`
