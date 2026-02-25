@@ -80,6 +80,8 @@ func (m *Manager) WakeSprite(spriteName string) error {
 
 // SetupSSHServer installs and configures openssh-server on the sprite,
 // adds the local user's public key to authorized_keys, and starts sshd.
+// Uses explicit /home/sprite paths since sprite exec may run as a different user
+// or ~ may not resolve as expected.
 func (m *Manager) SetupSSHServer(spriteName string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -89,70 +91,73 @@ func (m *Manager) SetupSSHServer(spriteName string) error {
 	pubKeyPath := filepath.Join(home, ".ssh", "id_ed25519.pub")
 	pubKey, err := os.ReadFile(pubKeyPath)
 	if err != nil {
-		return fmt.Errorf("reading SSH public key: %w", err)
+		return fmt.Errorf("reading SSH public key %s: %w", pubKeyPath, err)
+	}
+	pubKeyStr := strings.TrimSpace(string(pubKey))
+	slog.Info("ssh_setup: using public key", "sprite", spriteName,
+		"path", pubKeyPath, "key_prefix", pubKeyStr[:min(40, len(pubKeyStr))]+"...")
+
+	// Upload the public key file directly to the sprite, then install sshd
+	// and configure authorized_keys. Using file upload avoids shell quoting issues.
+	// Use /home/sprite explicitly since ~ may not resolve correctly in sprite exec.
+	if _, err := m.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "mkdir -p /home/sprite/.ssh && chmod 700 /home/sprite/.ssh"},
+		Files:   map[string]string{pubKeyPath: "/home/sprite/.ssh/sp_pubkey.pub"},
+	}); err != nil {
+		return fmt.Errorf("uploading public key to sprite: %w", err)
 	}
 
-	// Install openssh-server if needed
-	installCmd := `
+	// Install openssh-server if needed, configure auth, add key
+	setupCmd := `
+		# Install sshd if missing
 		if ! command -v sshd >/dev/null 2>&1; then
 			sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server 2>/dev/null || true
 		fi
-	`
-	if _, err := m.client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", installCmd},
-	}); err != nil {
-		return fmt.Errorf("installing openssh-server: %w", err)
-	}
 
-	// Configure sshd for pubkey auth and add our key
-	setupCmd := fmt.Sprintf(`
-		mkdir -p ~/.ssh && chmod 700 ~/.ssh
-		echo '%s' >> ~/.ssh/authorized_keys
-		sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys
-		chmod 600 ~/.ssh/authorized_keys
-		chown -R $(whoami) ~/.ssh
+		# Add the uploaded key to authorized_keys (dedup with sort -u)
+		cat /home/sprite/.ssh/sp_pubkey.pub >> /home/sprite/.ssh/authorized_keys
+		sort -u /home/sprite/.ssh/authorized_keys -o /home/sprite/.ssh/authorized_keys
+		chmod 600 /home/sprite/.ssh/authorized_keys
+		chown -R sprite:sprite /home/sprite/.ssh
+
+		# Enable pubkey auth in sshd config
 		sudo mkdir -p /run/sshd
 		sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
 		sudo sed -i 's/PubkeyAuthentication no/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
-	`, strings.TrimSpace(string(pubKey)))
 
-	if _, err := m.client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", setupCmd},
-	}); err != nil {
-		return fmt.Errorf("configuring SSH server: %w", err)
-	}
+		# Restart sshd to pick up config changes (restart, not just start)
+		sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd 2>/dev/null
 
-	// Start sshd and verify it's running
-	startCmd := `
-		sudo systemctl start ssh 2>/dev/null || sudo service ssh start 2>/dev/null || sudo /usr/sbin/sshd 2>/dev/null
-		# Verify sshd is actually listening on port 22
+		# Verify sshd is listening and show authorized_keys for diagnostics
 		sleep 1
+		echo "OWNER: $(ls -la /home/sprite/.ssh/authorized_keys)"
+		echo "WHOAMI: $(whoami)"
+		echo "KEYS: $(wc -l < /home/sprite/.ssh/authorized_keys) lines"
+		echo "KEY_FINGERPRINT: $(ssh-keygen -lf /home/sprite/.ssh/sp_pubkey.pub 2>/dev/null || echo unknown)"
 		if ss -tlnp 2>/dev/null | grep -q ':22 '; then
 			echo "SSHD_OK"
 		elif netstat -tlnp 2>/dev/null | grep -q ':22 '; then
 			echo "SSHD_OK"
 		else
 			echo "SSHD_FAIL: port 22 not listening"
-			# Try to get sshd status for diagnostics
 			sudo systemctl status ssh 2>/dev/null || sudo service ssh status 2>/dev/null || true
 			ps aux | grep sshd 2>/dev/null || true
 		fi
 	`
 	out, err := m.client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Command: []string{"sh", "-c", startCmd},
+		Command: []string{"sh", "-c", setupCmd},
 	})
 	if err != nil {
-		return fmt.Errorf("starting SSH server: %w", err)
+		return fmt.Errorf("configuring SSH server: %w", err)
 	}
 	outStr := strings.TrimSpace(string(out))
+	slog.Info("ssh_setup: configuration result", "sprite", spriteName, "output", outStr)
+
 	if !strings.Contains(outStr, "SSHD_OK") {
-		slog.Error("ssh_setup: sshd may not be running", "sprite", spriteName, "output", outStr)
 		return fmt.Errorf("sshd verification failed: %s", outStr)
 	}
-	slog.Info("ssh_setup: sshd running on port 22", "sprite", spriteName)
 
 	return nil
 }
