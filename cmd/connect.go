@@ -169,9 +169,12 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Register with daemon
+	// Register with daemon — in web mode, the daemon is required for
+	// persistent sync, so treat failure as a hard error.
 	if err := registerWithDaemon(resolved); err != nil {
-		// Non-fatal: daemon might not be running
+		if webMode {
+			return fmt.Errorf("daemon required for --web sync persistence: %w", err)
+		}
 		if verbose {
 			fmt.Fprintf(os.Stderr, "Warning: daemon registration failed: %v\n", err)
 		}
@@ -480,8 +483,39 @@ func registerWithDaemon(resolved *setup.ResolvedTarget) error {
 	})
 }
 
-// startSync sets up the SSH tunnel and Mutagen sync session.
+// startSync delegates sync setup to the daemon so the proxy process is owned
+// by the long-running daemon rather than the short-lived `sp` CLI. This is
+// critical for --web mode where sp exits immediately after setup.
+//
+// If the daemon is unreachable, falls back to inline sync (proxy is a child of
+// this process — fine for interactive console sessions but won't survive exit).
 func startSync(client *sprite.Client, resolved *setup.ResolvedTarget) error {
+	// Try daemon-managed sync first
+	dc, err := daemon.Connect()
+	if err == nil {
+		defer dc.Close()
+		result, err := dc.StartSync(daemon.StartSyncRequest{
+			SpriteName: resolved.SpriteName,
+			LocalPath:  resolved.LocalPath,
+			RemotePath: resolved.RemotePath,
+			Org:        resolved.Org,
+		})
+		if err != nil {
+			return fmt.Errorf("daemon start_sync: %w", err)
+		}
+		fmt.Printf("Sync started via daemon (mutagen: %s, proxy pid: %d)\n", result.MutagenID, result.ProxyPID)
+		return nil
+	}
+
+	// Fallback: inline sync (proxy dies with this process)
+	fmt.Fprintf(os.Stderr, "Warning: daemon not available, sync proxy will not persist after exit\n")
+	return startSyncInline(client, resolved)
+}
+
+// startSyncInline runs sync setup directly in this process. The proxy is a
+// child of sp, so it dies when sp exits. Only suitable for interactive console
+// sessions where sp stays running.
+func startSyncInline(client *sprite.Client, resolved *setup.ResolvedTarget) error {
 	mgr := spSync.NewManager(client)
 
 	// Setup SSH server on sprite
@@ -513,7 +547,7 @@ func startSync(client *sprite.Client, resolved *setup.ResolvedTarget) error {
 
 	fmt.Printf("Sync started (mutagen: %s)\n", mutagenID)
 
-	// Update daemon with sync info
+	// Update daemon with sync info (best-effort)
 	dc, dcErr := daemon.Connect()
 	if dcErr == nil {
 		dc.UpdateSyncStatus(resolved.SpriteName, "watching", "")

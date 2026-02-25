@@ -179,6 +179,42 @@ func (c *Client) ImportSprite(name, localPath string, tags []string) (*store.Spr
 	return &s, nil
 }
 
+// StartSyncRequest contains the parameters for starting sync via the daemon.
+type StartSyncRequest struct {
+	SpriteName string `json:"sprite_name"`
+	LocalPath  string `json:"local_path"`
+	RemotePath string `json:"remote_path"`
+	Org        string `json:"org"`
+}
+
+// StartSyncResult contains the result of a successful start_sync call.
+type StartSyncResult struct {
+	MutagenID string `json:"mutagen_id"`
+	SSHPort   int    `json:"ssh_port"`
+	ProxyPID  int    `json:"proxy_pid"`
+}
+
+// StartSync asks the daemon to set up SSH, start a proxy, and create a Mutagen
+// session. The proxy runs as a child of the daemon so it survives after the
+// calling `sp` process exits.
+func (c *Client) StartSync(req StartSyncRequest) (*StartSyncResult, error) {
+	result, err := c.call("start_sync", req)
+	if err != nil {
+		return nil, err
+	}
+	var res StartSyncResult
+	if err := json.Unmarshal(result, &res); err != nil {
+		return nil, fmt.Errorf("decoding start_sync result: %w", err)
+	}
+	return &res, nil
+}
+
+// StopSync asks the daemon to tear down sync for a sprite (proxy, Mutagen, SSH config).
+func (c *Client) StopSync(name string) error {
+	_, err := c.call("stop_sync", map[string]string{"name": name})
+	return err
+}
+
 // Subscribe registers for real-time state updates from the daemon.
 // Returns a channel that receives updates. The channel is closed when
 // the connection ends.
