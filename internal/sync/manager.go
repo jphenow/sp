@@ -78,6 +78,19 @@ func (m *Manager) WakeSprite(spriteName string) error {
 	return fmt.Errorf("waking sprite %q: %w", spriteName, lastErr)
 }
 
+// FetchAuthLog retrieves the sshd authentication log from the sprite.
+// Called after SSH test failures to get the server-side rejection reason.
+func (m *Manager) FetchAuthLog(spriteName string) (string, error) {
+	out, err := m.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "sudo cat /var/log/auth.log 2>/dev/null | tail -30 || echo 'no auth log'"},
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // SetupSSHServer installs and configures openssh-server on the sprite,
 // adds the local user's public key to authorized_keys, and starts sshd.
 // Uses explicit /home/sprite paths since sprite exec may run as a different user

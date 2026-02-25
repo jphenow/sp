@@ -177,6 +177,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh sprite list on any state change
 		return m, m.fetchSprites
 
+	case reconnectedMsg:
+		// Daemon connection was broken and we reconnected. Swap the client
+		// and immediately re-fetch sprites.
+		if m.client != nil {
+			m.client.Close()
+		}
+		m.client = msg.client
+		m.err = nil
+		m.message = "reconnected to daemon"
+		return m, m.fetchSprites
+
 	case errMsg:
 		m.err = msg.err
 		return m, nil
@@ -465,6 +476,11 @@ func (m Model) viewDetail() string {
 }
 
 // fetchSprites is a tea.Cmd that queries the daemon for the current sprite list.
+// reconnectedMsg carries a new daemon client after a successful reconnect.
+type reconnectedMsg struct {
+	client *daemon.Client
+}
+
 func (m Model) fetchSprites() tea.Msg {
 	opts := store.ListOptions{
 		Tags:       m.filterOpts.Tags,
@@ -474,7 +490,13 @@ func (m Model) fetchSprites() tea.Msg {
 
 	sprites, err := m.client.ListSprites(opts)
 	if err != nil {
-		return errMsg{err: err}
+		// Connection may be broken (daemon restarted). Try to reconnect.
+		newClient, reconErr := daemon.Connect()
+		if reconErr != nil {
+			return errMsg{err: fmt.Errorf("daemon unavailable: %v (reconnect: %v)", err, reconErr)}
+		}
+		// Send reconnect message so Update can swap the client
+		return reconnectedMsg{client: newClient}
 	}
 
 	// Fetch tags for each sprite

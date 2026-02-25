@@ -992,6 +992,11 @@ func (d *Daemon) attemptSyncSetup(
 	log.Info("attempt_sync: testing SSH connection")
 	if err := spSync.TestSSHConnection(spriteName, port, deathCh); err != nil {
 		log.Warn("attempt_sync: SSH test failed", "error", err)
+		// Fetch the sshd auth log from the sprite for server-side diagnostics
+		authLog, authErr := mgr.FetchAuthLog(spriteName)
+		if authErr == nil && authLog != "" {
+			log.Error("attempt_sync: sprite sshd auth log", "output", authLog)
+		}
 		d.killProxy(spriteName)
 		spSync.RemoveSSHConfig(spriteName)
 		return nil, fmt.Errorf("SSH test: %w", err)
