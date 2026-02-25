@@ -63,13 +63,17 @@ Usage:
   sp owner/repo [--no-sync] [--name NAME] [-- COMMAND...]
   sp . [--no-sync] [--name NAME] [-- COMMAND...]
   sp info owner/repo|. [--name NAME]
+  sp status owner/repo|.
   sp sessions owner/repo|.
+  sp resync .
   sp conf {init|edit|show}
 
 Subcommands:
   info       Show sprite metadata (name, existence, target dir, command, session)
              without connecting
+  status     Show sync health, conflicts, proxy state, and active users
   sessions   List active tmux sessions in a sprite
+  resync     Tear down and restart Mutagen sync (re-reads .gitignore rules)
   conf       Manage setup config (~/.config/sprite/setup.conf)
 
 Options:
@@ -109,6 +113,8 @@ Examples:
   sp . --name debug -- bash             # Named tmux session
   sp info .                             # Show sprite info without connecting
   sp sessions owner/repo                # List tmux sessions in a sprite
+  sp status .                              # Check sync health and conflicts
+  sp resync .                             # Reset sync (re-reads .gitignore)
   sp conf init                          # Create setup config
   sp conf edit                          # Edit setup config
 EOF
@@ -178,12 +184,22 @@ msg() {
 setup_ssh_server() {
     local sprite_name="$1"
 
-    # Fast path: if sshd is running and our key is already authorized, skip setup entirely.
-    # This avoids ~6 sprite exec round trips on every reconnect.
+    # Fast path: if sshd is running and our key is already authorized, skip
+    # full setup. Always fix ownership regardless — sprite exec -file uploads
+    # as ubuntu:ubuntu and can clobber /home/sprite and ~/.ssh ownership at
+    # any time (e.g. copy_always_files on reconnect), which causes sshd
+    # StrictModes to reject pubkey auth even though the key is present.
     if [[ -f "$SSH_PUB_KEY" ]]; then
         local pubkey_content
         pubkey_content=$(cat "$SSH_PUB_KEY")
-        if sprite exec -s "$sprite_name" sh -c "pgrep -x sshd >/dev/null 2>&1 && grep -qF '$pubkey_content' ~/.ssh/authorized_keys 2>/dev/null"; then
+        if sprite exec -s "$sprite_name" sh -c "
+            # Fix ownership unconditionally (cheap, prevents StrictModes failures)
+            chown sprite:sprite /home/sprite 2>/dev/null
+            chown -R sprite:sprite ~/.ssh 2>/dev/null
+            chmod 700 ~/.ssh 2>/dev/null
+            # Then check if sshd is running and key is authorized
+            pgrep -x sshd >/dev/null 2>&1 && grep -qF '$pubkey_content' ~/.ssh/authorized_keys 2>/dev/null
+        "; then
             info "SSH server already configured"
             return 0
         fi
@@ -442,19 +458,47 @@ Host sprite-mutagen-${sprite_name}
     IdentityFile ~/.ssh/id_ed25519
 EOF
 
+    # Verify SSH actually works through the proxy before creating the
+    # Mutagen session. The proxy process may be alive but the underlying
+    # connection to the sprite could be stale (sprite restarted, sshd
+    # stopped, etc.). Clear stale host keys first.
+    ssh-keygen -R "[localhost]:${port}" 2>/dev/null || true
+
+    local ssh_ok=false
+    local ssh_attempt=0
+    while [[ $ssh_attempt -lt 3 ]]; do
+        if ssh -p "$port" -o ConnectTimeout=2 -o StrictHostKeyChecking=no \
+               -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
+               sprite@localhost echo "ready" >/dev/null 2>&1; then
+            ssh_ok=true
+            break
+        fi
+        ssh_attempt=$((ssh_attempt + 1))
+        sleep 1
+    done
+
+    if [[ "$ssh_ok" != "true" ]]; then
+        warn "SSH connection through existing proxy failed — proxy is stale"
+        return 1
+    fi
+
     # Terminate any leftover session with this name (shouldn't exist, but be safe)
     mutagen sync terminate "$sync_name" 2>/dev/null || true
 
-    # Create the sync session
+    # Build dynamic ignore flags from .gitignore (or hardcoded fallback)
+    local -a ignore_args=()
+    while IFS= read -r _flag; do
+        ignore_args+=("$_flag")
+    done < <(build_mutagen_ignore_args "$local_dir")
+
+    # Create the sync session.
+    # two-way-safe ensures conflicts are flagged rather than silently resolved
+    # in favor of alpha (local). This prevents sprite-side changes from being
+    # overwritten when a session is recreated and the merge baseline is lost.
     mutagen sync create \
         --name "$sync_name" \
-        --sync-mode two-way-resolved \
-        --ignore "node_modules" \
-        --ignore ".next" \
-        --ignore "dist" \
-        --ignore "build" \
-        --ignore ".DS_Store" \
-        --ignore "._*" \
+        --sync-mode two-way-safe \
+        "${ignore_args[@]}" \
         "$local_dir" \
         "sprite-mutagen-${sprite_name}:${remote_dir}" || {
         warn "Failed to recreate Mutagen sync session"
@@ -695,6 +739,146 @@ test_ssh_connection() {
     return 1
 }
 
+# Collect ignore patterns from all .gitignore files in a git repository.
+# Walks the repo to find .gitignore files, reads each one, strips comments
+# and blank lines, and prefixes patterns from nested .gitignore files with
+# their relative directory path so Mutagen applies them correctly.
+# Outputs one pattern per line to stdout.
+collect_gitignore_patterns() {
+    local repo_dir="$1"
+
+    # Only works for git repos
+    if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Find all .gitignore files in the repo, excluding dirs that are
+    # themselves typically gitignored (avoid descending into huge trees).
+    local gitignore_files
+    gitignore_files=$(find "$repo_dir" \
+        -name .git -prune -o \
+        -name node_modules -prune -o \
+        -name _build -prune -o \
+        -name deps -prune -o \
+        -name .elixir_ls -prune -o \
+        -name .gitignore -print 2>/dev/null | sort)
+
+    local gitignore_file
+    while IFS= read -r gitignore_file; do
+        [[ -z "$gitignore_file" ]] && continue
+
+        # Compute the directory containing this .gitignore, relative to repo root.
+        local gitignore_dir
+        gitignore_dir=$(dirname "$gitignore_file")
+        local rel_dir
+        # Compute relative path without python dependency.
+        # realpath --relative-to is available on macOS 13+ and GNU coreutils.
+        if rel_dir=$(realpath --relative-to="$repo_dir" "$gitignore_dir" 2>/dev/null); then
+            : # success
+        elif [[ "$gitignore_dir" == "$repo_dir" ]]; then
+            rel_dir="."
+        else
+            # Fallback: strip the repo_dir prefix
+            rel_dir="${gitignore_dir#"$repo_dir"/}"
+        fi
+
+        # Read patterns from this .gitignore
+        local line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            # Trim leading/trailing whitespace
+            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [[ -z "$line" ]] && continue
+
+            local is_negation=false
+            local pattern="$line"
+
+            # Handle negation patterns (! prefix)
+            if [[ "$pattern" == !* ]]; then
+                is_negation=true
+                pattern="${pattern#!}"
+            fi
+
+            # Strip leading / (Mutagen paths are relative to sync root)
+            pattern="${pattern#/}"
+            # Strip trailing / (Mutagen matches dirs by name without trailing slash)
+            pattern="${pattern%/}"
+
+            # Skip empty patterns after stripping
+            [[ -z "$pattern" ]] && continue
+
+            # For nested .gitignore files, prefix pattern with relative dir
+            if [[ "$rel_dir" != "." ]]; then
+                pattern="${rel_dir}/${pattern}"
+            fi
+
+            # Reassemble with negation prefix if needed
+            if [[ "$is_negation" == true ]]; then
+                echo "!${pattern}"
+            else
+                echo "$pattern"
+            fi
+        done < "$gitignore_file"
+    done <<< "$gitignore_files"
+}
+
+# Build an array of --ignore flags for mutagen sync create.
+# For git repos, reads .gitignore patterns and merges them with a baseline
+# set of hardcoded ignores. Always adds !.git to ensure the .git directory
+# is synced (for branch state). For non-git dirs, uses only the hardcoded set.
+# Outputs the flags space-separated to stdout, suitable for eval.
+build_mutagen_ignore_args() {
+    local local_dir="$1"
+
+    # Baseline ignores that apply regardless of .gitignore
+    local -a patterns=(
+        "node_modules"
+        ".next"
+        "dist"
+        "build"
+        ".DS_Store"
+        "._*"
+    )
+
+    # If it's a git repo, collect .gitignore patterns
+    if git -C "$local_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        local gitignore_pattern
+        while IFS= read -r gitignore_pattern; do
+            [[ -z "$gitignore_pattern" ]] && continue
+            # Avoid duplicates with baseline patterns
+            local is_dup=false
+            local existing
+            for existing in "${patterns[@]}"; do
+                if [[ "$existing" == "$gitignore_pattern" ]]; then
+                    is_dup=true
+                    break
+                fi
+            done
+            if [[ "$is_dup" == false ]]; then
+                patterns+=("$gitignore_pattern")
+            fi
+        done < <(collect_gitignore_patterns "$local_dir")
+
+        # Ensure .git is never ignored — we want branch state to sync
+        patterns+=("!.git")
+    else
+        # Non-git directories: add common build artifact patterns
+        patterns+=(
+            "_build"
+            "deps"
+            ".elixir_ls"
+        )
+    fi
+
+    # Build the --ignore flag string
+    local p
+    for p in "${patterns[@]}"; do
+        printf -- '--ignore\n%s\n' "$p"
+    done
+}
+
 # Start Mutagen sync session
 # Creates bidirectional sync between local and remote directory
 start_mutagen_sync() {
@@ -737,16 +921,20 @@ Host sprite-mutagen-${sprite_name}
     IdentityFile ~/.ssh/id_ed25519
 EOF
 
-    # Create sync session
+    # Build dynamic ignore flags from .gitignore (or hardcoded fallback)
+    local -a ignore_args=()
+    while IFS= read -r _flag; do
+        ignore_args+=("$_flag")
+    done < <(build_mutagen_ignore_args "$local_dir")
+
+    # Create sync session.
+    # two-way-safe ensures conflicts are flagged rather than silently resolved
+    # in favor of alpha (local). This prevents sprite-side changes from being
+    # overwritten when a session is recreated and the merge baseline is lost.
     mutagen sync create \
         --name "$SYNC_SESSION_NAME" \
-        --sync-mode two-way-resolved \
-        --ignore "node_modules" \
-        --ignore ".next" \
-        --ignore "dist" \
-        --ignore "build" \
-        --ignore ".DS_Store" \
-        --ignore "._*" \
+        --sync-mode two-way-safe \
+        "${ignore_args[@]}" \
         "$local_dir" \
         "sprite-mutagen-${sprite_name}:${remote_dir}" || {
         warn "Failed to create Mutagen sync session"
@@ -864,9 +1052,55 @@ setup_sync_session() {
 
     if [[ "$sync_ok" == "true" ]]; then
         info "✓ Sync is active — changes will be bidirectional"
+        # Check for conflicts after sync stabilizes
+        check_sync_conflicts "$sprite_name"
     else
         warn "Bidirectional sync failed to start. File changes will not sync automatically."
     fi
+}
+
+# Check for sync conflicts and warn the user.
+# With two-way-safe mode, conflicts are flagged rather than auto-resolved.
+# This function checks for them and prints a visible warning so the user
+# knows to intervene.
+check_sync_conflicts() {
+    local sprite_name="$1"
+    local sync_name="sprite-${sprite_name}"
+
+    local sync_output
+    sync_output=$(mutagen sync list "$sync_name" 2>/dev/null || echo "")
+
+    # Short format shows "Conflicts: <N>" where N > 0.
+    # Guard every pipeline with || true — set -euo pipefail will kill
+    # the script if grep finds no matches (exit 1) in any pipeline.
+    local conflict_count
+    conflict_count=$(echo "$sync_output" | grep "^Conflicts:" | sed 's/^Conflicts: *//' | tr -d ' ' || true)
+
+    # No conflicts line or zero — nothing to report
+    [[ -n "$conflict_count" ]] || return 0
+    [[ "$conflict_count" -gt 0 ]] 2>/dev/null || return 0
+
+    # Get conflict details from long format
+    local long_output
+    long_output=$(mutagen sync list -l "$sync_name" 2>/dev/null || echo "")
+
+    # Extract the (alpha)/(beta) conflict paths
+    local conflict_paths
+    conflict_paths=$(echo "$long_output" | grep -E '\(alpha\)|\(beta\)' | sed 's/^[[:space:]]*/  /' | head -20 || true)
+
+    echo ""
+    echo -e "\033[1;33m━━━ Sync conflicts ($conflict_count) ━━━\033[0m"
+    if [[ -n "$conflict_paths" ]]; then
+        echo "$conflict_paths"
+        if [[ "$conflict_count" -gt 10 ]]; then
+            echo "  ... and more"
+        fi
+    fi
+    echo ""
+    echo -e "\033[1;33mTo resolve:\033[0m"
+    echo -e "\033[1;33m  mutagen sync list -l $sync_name   # see all conflicts\033[0m"
+    echo -e "\033[1;33m  mutagen sync reset $sync_name     # accept current state as baseline\033[0m"
+    echo ""
 }
 
 # Reset terminal mouse tracking modes.
@@ -1165,6 +1399,215 @@ handle_sessions() {
     fi
 
     sprite exec -s "$RESOLVED_SPRITE_NAME" tmux list-sessions 2>/dev/null || echo "No active tmux sessions"
+}
+
+# Handle 'sp status' subcommand — show sync health, conflicts, and session state.
+handle_status() {
+    local target="$1"
+    resolve_sprite_info "$target"
+
+    local sprite_name="$RESOLVED_SPRITE_NAME"
+
+    echo "Sprite: $sprite_name"
+
+    if ! sprite_exists "$sprite_name"; then
+        echo "State:  does not exist"
+        return
+    fi
+    echo "State:  exists"
+
+    # Check sync infrastructure
+    local sync_name="sprite-${sprite_name}"
+    local lock_dir
+    lock_dir=$(sync_lock_dir "$sprite_name")
+
+    # Proxy status
+    local proxy_pid_file="${lock_dir}/proxy.pid"
+    if [[ -f "$proxy_pid_file" ]]; then
+        local proxy_pid
+        proxy_pid=$(cat "$proxy_pid_file" 2>/dev/null || echo "")
+        if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
+            local port
+            port=$(cat "${lock_dir}/port" 2>/dev/null || echo "?")
+            echo "Proxy:  running (pid $proxy_pid, port $port)"
+        else
+            echo "Proxy:  dead (stale pid file)"
+        fi
+    else
+        echo "Proxy:  not running"
+    fi
+
+    # Mutagen session status
+    local sync_output
+    sync_output=$(mutagen sync list "$sync_name" 2>/dev/null || echo "")
+
+    if echo "$sync_output" | grep -q "Name: ${sync_name}$"; then
+        local status_line
+        status_line=$(echo "$sync_output" | grep "^Status:" | head -1 || true)
+        echo "Sync:   ${status_line#Status: }"
+
+        # Show mode from long format
+        local long_output
+        long_output=$(mutagen sync list -l "$sync_name" 2>/dev/null || echo "")
+        local mode_line
+        mode_line=$(echo "$long_output" | grep "Synchronization mode:" | head -1 || true)
+        if [[ -n "$mode_line" ]]; then
+            echo "Mode:   $(echo "$mode_line" | sed 's/.*: //')"
+        fi
+
+        # Show last error if any
+        local last_error
+        last_error=$(echo "$sync_output" | grep "^Last error:" | head -1 || true)
+        if [[ -n "$last_error" ]]; then
+            echo -e "\033[1;33m${last_error}\033[0m"
+        fi
+
+        # Check for conflicts
+        check_sync_conflicts "$sprite_name"
+    else
+        echo "Sync:   no session"
+    fi
+
+    # Active users
+    local user_count=0
+    if [[ -d "$lock_dir" ]]; then
+        for pid_file in "${lock_dir}"/*.user; do
+            [[ -f "$pid_file" ]] || continue
+            local pid
+            pid=$(cat "$pid_file" 2>/dev/null || echo "")
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                user_count=$((user_count + 1))
+            fi
+        done
+    fi
+    echo "Users:  $user_count active sp process(es)"
+}
+
+# Handle 'sp resync' subcommand — tear down and restart the Mutagen sync session.
+# Terminates the existing proxy + Mutagen session, cleans up state, and
+# relaunches the sync pipeline in a detached background process. Returns
+# immediately so the caller's terminal is not blocked.
+handle_resync() {
+    local target="$1"
+    resolve_sprite_info "$target"
+
+    local sprite_name="$RESOLVED_SPRITE_NAME"
+    local target_dir="$RESOLVED_TARGET_DIR"
+
+    if ! sprite_exists "$sprite_name"; then
+        error "Sprite '$sprite_name' does not exist"
+    fi
+
+    # Resolve the local directory for sync (needed for .gitignore reading
+    # and as the Mutagen alpha endpoint).
+    local local_dir
+    if [[ "$target" == "." ]]; then
+        local_dir=$(pwd)
+    else
+        error "resync only works with '.' (current directory mode)"
+    fi
+
+    local sync_name="sprite-${sprite_name}"
+    local lock_dir
+    lock_dir=$(sync_lock_dir "$sprite_name")
+
+    # If an existing Mutagen session is running, flush pending changes first
+    # so both sides are in agreement before we destroy the baseline.
+    # This prevents the new session from treating sprite-side changes as
+    # conflicts (which alpha/local would win, silently overwriting them).
+    if mutagen sync list "$sync_name" 2>/dev/null | grep -q "Name: ${sync_name}$"; then
+        echo "Flushing pending sync changes..."
+        # Flush with a timeout — it can block indefinitely if the remote
+        # is unreachable. Run in a background subshell and wait with a
+        # deadline for portability (macOS lacks coreutils timeout).
+        (mutagen sync flush "$sync_name" 2>/dev/null) &
+        local flush_pid=$!
+        local flush_ok=false
+        local flush_waited=0
+        while [[ $flush_waited -lt 15 ]]; do
+            if ! kill -0 "$flush_pid" 2>/dev/null; then
+                wait "$flush_pid" 2>/dev/null && flush_ok=true
+                break
+            fi
+            sleep 1
+            flush_waited=$((flush_waited + 1))
+        done
+        if [[ "$flush_ok" == "true" ]]; then
+            echo "  Flush complete"
+        else
+            kill "$flush_pid" 2>/dev/null || true
+            wait "$flush_pid" 2>/dev/null || true
+            echo "  Flush timed out or failed (continuing anyway)"
+        fi
+    fi
+
+    echo "Tearing down existing sync for $sprite_name..."
+
+    # 1. Terminate Mutagen session
+    if mutagen sync list "$sync_name" 2>/dev/null | grep -q "Name: ${sync_name}$"; then
+        mutagen sync terminate "$sync_name" 2>/dev/null || true
+        echo "  Mutagen session terminated"
+    else
+        echo "  No Mutagen session found"
+    fi
+
+    # 2. Kill the proxy if running
+    local proxy_pid_file="${lock_dir}/proxy.pid"
+    if [[ -f "$proxy_pid_file" ]]; then
+        local proxy_pid
+        proxy_pid=$(cat "$proxy_pid_file" 2>/dev/null || echo "")
+        if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
+            kill "$proxy_pid" 2>/dev/null || true
+            echo "  Proxy stopped (pid $proxy_pid)"
+        fi
+    fi
+
+    # 3. Clean up SSH config entries for this sprite
+    local ssh_config_marker="# mutagen-sprite-temp-${sprite_name}"
+    if [[ -f ~/.ssh/config ]]; then
+        sed -i.bak "/${ssh_config_marker}/,+7d" ~/.ssh/config 2>/dev/null || true
+    fi
+
+    # 4. Remove the lock directory (stale state)
+    rm -rf "$lock_dir" 2>/dev/null || true
+    echo "  Lock directory cleaned"
+
+    # 5. Restart the sync pipeline in a fully detached subprocess.
+    #    We avoid setting global SYNC_SPRITE_NAME / SYNC_SESSION_NAME so the
+    #    cleanup trap doesn't interfere. The detached process registers itself
+    #    as a sync user while it runs, and the next 'sp .' will inherit the
+    #    infra via has_active_sync().
+    echo "Starting fresh sync..."
+
+    local sync_log="/tmp/sprite-sync-${sprite_name}.log"
+    local ssh_port
+    ssh_port=$(sprite_ssh_port "$sprite_name")
+
+    (
+        # Export state that setup_sync_session / start_mutagen_sync need
+        SSH_PORT="$ssh_port"
+        SYNC_SPRITE_NAME="$sprite_name"
+        SYNC_SESSION_NAME="$sync_name"
+        VERBOSE=true
+
+        # Register so the infra isn't orphaned during startup.
+        # A subsequent 'sp .' will see the live user file and join.
+        register_sync_user "$sprite_name"
+
+        setup_sync_session "$sprite_name" "$local_dir" "$target_dir"
+        local rc=$?
+
+        # If setup failed, unregister so stale state doesn't linger.
+        # On success, leave the registration — the next 'sp .' will
+        # take over, and cleanup's grace period handles the gap.
+        if [[ $rc -ne 0 ]]; then
+            unregister_sync_user "$sprite_name"
+        fi
+    ) > "$sync_log" 2>&1 &
+    disown $! 2>/dev/null || true
+
+    echo "Sync restarting in background (log: $sync_log)"
+    echo "Run 'sp .' to reconnect and inherit the new session."
 }
 
 # Handle 'sp conf' subcommand — manage ~/.config/sprite/setup.conf
@@ -1762,6 +2205,14 @@ run_sprite_setup() {
                 ;;
         esac
     done 3< "$SPRITE_SETUP_CONF"
+
+    # sprite exec -file clobbers parent directory ownership to ubuntu:ubuntu.
+    # After all setup file copies, fix /home/sprite and ~/.ssh so SSH works.
+    if [[ "$has_work" == "true" ]]; then
+        sprite exec -s "$sprite_name" sh -c \
+            'chown sprite:sprite /home/sprite 2>/dev/null; chown -R sprite:sprite ~/.ssh 2>/dev/null; chmod 700 ~/.ssh 2>/dev/null' \
+            || true
+    fi
 }
 
 # Install a tmux-aware `open` wrapper inside the sprite.
@@ -1815,6 +2266,7 @@ copy_always_files() {
 
     [[ -f "$SPRITE_SETUP_CONF" ]] || return 0
 
+    local copied_any=false
     local section=""
     while IFS= read -r line <&3 || [[ -n "$line" ]]; do
         [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
@@ -1826,8 +2278,18 @@ copy_always_files() {
 
         if [[ "$section" == "files" ]] && [[ "$line" =~ \[always\] ]]; then
             copy_setup_file "$sprite_name" "$line"
+            copied_any=true
         fi
     done 3< "$SPRITE_SETUP_CONF"
+
+    # sprite exec -file clobbers parent directory ownership to ubuntu:ubuntu
+    # via mkdirParents. After all file copies, fix /home/sprite and ~/.ssh
+    # ownership so SSH StrictModes doesn't reject pubkey auth.
+    if [[ "$copied_any" == "true" ]]; then
+        sprite exec -s "$sprite_name" sh -c \
+            'chown sprite:sprite /home/sprite 2>/dev/null; chown -R sprite:sprite ~/.ssh 2>/dev/null; chmod 700 ~/.ssh 2>/dev/null' \
+            || true
+    fi
 }
 
 # Sync current directory to sprite
@@ -1966,6 +2428,8 @@ handle_current_dir_mode() {
             # Set session name so cleanup can terminate it if we're the last user.
             SYNC_SESSION_NAME="sprite-${sprite_name}"
             register_sync_user "$sprite_name"
+            # Warn about any existing conflicts before user enters the shell
+            check_sync_conflicts "$sprite_name"
         else
             # Start sync pipeline in background so user gets a shell immediately
             SYNC_SESSION_NAME="sprite-${sprite_name}"
@@ -2012,7 +2476,7 @@ main() {
             handle_conf "$@"
             exit 0
             ;;
-        info|sessions)
+        info|sessions|resync|status)
             subcommand="$1"
             shift
             if [[ $# -eq 0 ]]; then
@@ -2087,6 +2551,13 @@ main() {
             ;;
         sessions)
             handle_sessions "$target"
+            ;;
+        resync)
+            check_mutagen
+            handle_resync "$target"
+            ;;
+        status)
+            handle_status "$target"
             ;;
         "")
             # No subcommand — launch mode
