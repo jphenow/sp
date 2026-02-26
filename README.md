@@ -1,420 +1,340 @@
-# sp - Sprite Repository Manager
+# sp — Sprite Repository Manager
 
-A command-line tool for managing Fly.io sprites with GitHub repositories or local directories. Automatically handles authentication, repository syncing, and Claude Code CLI sessions.
+`sp` gives you isolated cloud dev environments powered by [Fly.io Sprites](https://sprites.dev) with real-time bidirectional file sync, persistent tmux sessions, and a TUI dashboard. Edit locally, run remotely — your files stay in lockstep.
 
-## Features
+## Quickstart
 
-- Automatically creates or connects to sprites based on GitHub repository names
-- Works with any local directory, even without a GitHub repository
-- Copies Claude authentication tokens and SSH keys to sprites
-- Syncs repositories with `git pull --recurse-submodules`
-- Opens persistent tmux sessions in the repository directory
-- Bidirectional file syncing with Mutagen in `two-way-safe` mode (on by default, disable with `--no-sync`)
-- `.gitignore`-aware sync — all `.gitignore` patterns are automatically converted to Mutagen exclusions
-- Conflict detection and reporting via `sp status`
-- Configurable setup: auto-copy files and run commands on first connect via `~/.config/sprite/setup.conf`
-
-## Prerequisites
-
-- [Fly.io sprite CLI](https://fly.io/docs/reference/sprites/) installed and authenticated
-- Git
-- Claude Code CLI (required for opening Claude sessions)
-- SSH key at `~/.ssh/id_ed25519` (for GitHub authentication)
-- Claude Code OAuth token (will be generated automatically on first run via `claude setup-token`)
-- [Mutagen](https://mutagen.io/) (required for bidirectional sync, disable with `--no-sync`): `brew install mutagen`
-
-## Installation
-
-### Option 1: Add to PATH
+### 1. Install the Sprite CLI and authenticate
 
 ```bash
-# Clone this repository
+curl -fsSL https://sprites.dev/install | sh
+sprite login
+```
+
+### 2. Install sp
+
+Requires Go 1.21+:
+
+```bash
+go install github.com/jphenow/sp@latest
+```
+
+Or clone and build:
+
+```bash
 git clone https://github.com/jphenow/sp.git
 cd sp
-
-# Make executable
-chmod +x sp
-
-# Add to your PATH (example for ~/.local/bin)
-ln -s $(pwd)/sp ~/.local/bin/sp
+make install
 ```
 
-### Option 2: Shell Alias
-
-Add to your `~/.bashrc` or `~/.zshrc`:
+### 3. Install Mutagen (for file sync)
 
 ```bash
-alias sp='/path/to/sprite-repo/sp'
+brew install mutagen-io/mutagen/mutagen
 ```
 
-## Usage
-
-### Work with a GitHub Repository
+### 4. Boot a sprite with the web UI
 
 ```bash
-sp owner/repo [--no-sync] [--verbose] [--name NAME] [-- COMMAND...]
+cd ~/projects/my-app
+sp . --web
 ```
 
-This will:
-1. Create a sprite named `gh-owner--repo` (if it doesn't exist)
-2. Set up authentication, git config, and run setup.conf entries
-3. Clone the repository (or pull latest changes if already cloned)
-4. Start bidirectional file sync via Mutagen (respecting `.gitignore` patterns)
-5. Open a tmux session running the command (default: `bash`) in the repository directory
+This creates a sprite for your project, syncs your files, and prints a URL where opencode's web UI is running. The sprite auto-wakes on HTTP access — no need to keep a terminal open.
 
-Example:
-```bash
-sp superfly/flyctl
-```
+That's it. Your local edits sync to the sprite in real-time, and the opencode web UI is accessible from your browser.
 
-### Work with Current Directory
+---
 
-```bash
-cd /path/to/your/project
-sp . [--no-sync] [--verbose] [--name NAME] [-- COMMAND...]
-```
+## Why sp?
 
-This will:
-1. Detect the GitHub repository from the current directory's git remote (if available)
-2. If no GitHub repo is found, use the directory name with a `local-` prefix
-3. Create or connect to the appropriate sprite
-4. Sync your local directory contents to the sprite
-5. Open a tmux session running the command (default: `bash`) in the synced directory
+**Real-time bidirectional file sync.** Edit in your local editor, run in the cloud. Changes flow both ways instantly via [Mutagen](https://mutagen.io) in `two-way-safe` mode — neither side silently overwrites the other.
 
-Works with any directory -- no GitHub repository required.
+**`.gitignore`-aware.** All `.gitignore` patterns (including nested ones) are automatically converted to Mutagen exclusion rules. `node_modules`, `_build`, `dist` — all excluded without configuration.
 
-### Custom Commands (`--`)
+**Persistent sessions.** Everything runs inside tmux. Disconnect and reconnect freely — your processes keep running. The daemon manages sync lifecycle independently, starting and stopping as sprites wake and sleep.
 
-By default, `sp` launches `bash` inside the sprite. Use `--` to run a different command:
+**Auto-wake.** Sprites go to sleep when idle and wake automatically on access. The `--web` flag configures a sprite-env service so your web UI wakes the sprite on HTTP request.
+
+**Dashboard.** `sp tui` gives you a live view of all your sprites — status, sync health, tags — with keyboard shortcuts to open, connect, sync, and delete.
+
+---
+
+## Core Workflows
+
+### Connect to a sprite (console)
 
 ```bash
-# Open claude instead of bash
-sp . -- claude
-
-# Run a command with flags
-sp . -- claude -f foo bar baz
-
-# Alternative: use --cmd
-sp owner/repo --cmd vim
-```
-
-### Custom Session Names (`--name`)
-
-By default, the tmux session is named after the command (e.g., `bash`). Use `--name` to set a custom session name:
-
-```bash
-# Launch bash in a session named "feature"
-sp . --name feature
-
-# Launch claude and bash simultaneously in the same sprite
-sp . -- claude --name claude-session   # Terminal 1
-sp . --name debug                      # Terminal 2
-```
-
-### tmux Session Behavior
-
-Each `sp` invocation runs its command inside a persistent tmux session within the sprite. This provides:
-
-- **Persistence** — if you disconnect or your terminal closes, the session keeps running. Reconnecting with the same `sp` command reattaches to the existing session.
-- **Detach/reattach** — press `Ctrl-b d` inside tmux to detach without stopping the session. Run `sp` again to reattach.
-- **Multiple sessions** — use `--name` to run multiple independent sessions in the same sprite (e.g., `claude` + `bash` side by side).
-- **Command exits = session exits** — if the command finishes (e.g., `claude -c` with no conversation), the session ends. Use interactive commands for persistence.
-
-### Help
-
-```bash
-sp --help
-sp -h
-```
-
-Shows full usage information including all options and examples.
-
-### Sprite Info (`sp info`)
-
-Inspect sprite metadata without connecting:
-
-```bash
-sp info .
-sp info owner/repo
-sp info owner/repo --cmd bash --name debug
-```
-
-Prints sprite name, existence, repository, target directory, command, and session name.
-
-### List Sessions (`sp sessions`)
-
-List active tmux sessions in a sprite:
-
-```bash
-sp sessions .
-sp sessions owner/repo
-```
-
-### Sync Status (`sp status`)
-
-Check the health of your Mutagen sync session, proxy state, and any conflicts:
-
-```bash
-sp status .
-sp status owner/repo
-```
-
-Displays:
-- Sync session state (watching, scanning, etc.)
-- Proxy process status
-- Sync mode (`two-way-safe`)
-- Any errors or conflicts
-- Active user sessions
-
-If conflicts are detected, `sp status` shows the conflicting files and instructions for resolving them (e.g., `mutagen sync reset`).
-
-### Resync (`sp resync`)
-
-Tear down the current Mutagen sync session and restart it from scratch. Useful when:
-- You've added or changed `.gitignore` rules and want them picked up
-- Sync is stuck or in an error state
-- You want a clean sync baseline
-
-```bash
-sp resync .
-sp resync owner/repo
-```
-
-The resync runs in a detached background process so it doesn't block your terminal. Reconnect with `sp .` to use the new session.
-
-### Bidirectional File Syncing
-
-Sync is **on by default**. Real-time bidirectional file syncing via Mutagen keeps your local files and the sprite in lockstep:
-
-- Changes you make locally are automatically synced to the sprite
-- Changes made in the sprite are automatically synced back to your machine
-- Uses **`two-way-safe` mode** — neither side silently overwrites the other when conflicts arise
-- Sync session is active while `sp` is running
-- On exit, sync infrastructure stays alive for 30 seconds to allow quick reconnection — if you run `sp .` again within that window, mutagen resumes without restarting
-- Initial file upload (tar) only happens when a sprite is **first created** — reconnecting to an existing sprite relies entirely on Mutagen for incremental sync, so remote edits are never clobbered
-
-**Prerequisites:**
-- Mutagen installed locally: `brew install mutagen`
-- SSH key at `~/.ssh/id_ed25519` (used for SSH authentication to sprite)
-
-**What gets synced:**
-All files including `.git` (to keep branches in lockstep), minus anything excluded. Exclusions are determined by:
-
-1. **`.gitignore` patterns** — `sp` reads all `.gitignore` files in the repo tree (including nested ones) and converts them into Mutagen ignore rules. This means `node_modules`, `_build`, `deps`, `dist`, and any other gitignored paths are automatically excluded.
-2. **Baseline exclusions** — A small set of patterns are always excluded regardless of `.gitignore`: `.DS_Store`, `._*`.
-3. **`.git` is always included** — Even though `.gitignore` doesn't mention it, `.git/` is explicitly un-ignored so branch state stays synced.
-
-When you add or change `.gitignore` rules, run `sp resync .` to pick up the new patterns.
-
-**Conflict handling:**
-With `two-way-safe` mode, if both sides modify the same file before syncing, Mutagen flags a conflict instead of silently choosing a winner. Use `sp status .` to see conflicts and `mutagen sync reset` to resolve them.
-
-**Disable sync:**
-```bash
-sp . --no-sync
-```
-
-**Verbose output:**
-```bash
-sp . --verbose
-```
-Shows detailed Mutagen sync progress, `.gitignore` pattern collection, and SSH proxy setup information.
-
-**Example workflow:**
-```bash
+# From a git repo — sprite name derived from GitHub remote
 cd ~/projects/my-app
 sp .
 
-# Edit locally → changes appear in sprite instantly
-# Edit in sprite → changes appear locally instantly
-# Exit → sync stops and cleans up
-```
-
-### Setup Config (`sp conf`)
-
-Manage `~/.config/sprite/setup.conf` to auto-copy files and run commands on first connect:
-
-```bash
-sp conf init    # Create starter config
-sp conf edit    # Edit in $EDITOR
-sp conf show    # Print contents
-```
-
-**Config format:**
-```ini
-[files]
-# Copy files to the sprite. ~ expands to $HOME locally, /home/sprite remotely.
-# Default mode: [newest] — only copies when local file is newer than remote (or remote is missing).
-~/.tmux.conf
-~/.local/share/opencode/auth.json
-
-# Append [always] to always overwrite, even if remote is newer:
-~/.config/opencode/config.toml [always]
-
-# Use "source -> dest" when local and remote paths differ:
-~/.config/sprite/tmux.conf.local -> ~/.tmux.conf.local
-
-[commands]
-# condition :: command — runs on the sprite when condition succeeds (exits 0).
-! command -v opencode :: curl -fsSL https://opencode.ai/install | bash
-```
-
-Setup runs once per sprite (cached in `/tmp`). Edit setup.conf to re-trigger on next connect.
-
-## Sprite Naming Convention
-
-Sprites are named using the following priority order:
-
-### 1. `.sprite` file (highest priority)
-
-If a `.sprite` file exists in the current directory, `sp` reads the sprite name from it:
-
-```json
-{
-  "organization": "your-org",
-  "sprite": "gh-owner--repo"
-}
-```
-
-This is useful when you want to use a specific sprite that differs from the auto-detected name, or when working with `sprite use` to set a default.
-
-### 2. GitHub remote
-
-If the current directory is a git repo with a GitHub remote, the sprite is named `gh-owner--repo`:
-- `superfly/flyctl` → `gh-superfly--flyctl`
-- `anthropics/claude-code` → `gh-anthropics--claude-code`
-
-### 3. Directory name (fallback)
-
-If no `.sprite` file exists and no GitHub remote is detected, the directory name is used with a `local-` prefix:
-- `~/projects/my-app` → `local-my-app`
-- `~/scratch/experiment` → `local-experiment`
-
-## Authentication
-
-The tool automatically sets up authentication in sprites:
-
-### Claude Code Authentication
-- On first run, the script will prompt you to generate a token
-- You'll need to run `claude setup-token` in a separate terminal
-- Copy and paste the token when prompted
-- The token is stored in `~/.claude-token` for future use
-- Sets `CLAUDE_CODE_OAUTH_TOKEN` environment variable in sprite shell
-
-### SSH Keys
-- Copies `~/.ssh/id_ed25519` (private key)
-- Copies `~/.ssh/id_ed25519.pub` (public key)
-- Configures SSH for GitHub with `StrictHostKeyChecking accept-new`
-
-## Directory Sync Exclusions
-
-When using `sp .`, exclusions are determined dynamically from your `.gitignore` files:
-
-- **All `.gitignore` patterns are respected** — `sp` walks the repo tree, reads every `.gitignore` file (including nested ones), and passes the patterns to Mutagen. This means `node_modules`, `_build`, `deps`, `dist`, and any other gitignored paths are automatically excluded.
-- **Baseline exclusions** always apply: `.DS_Store`, `._*`
-- **`.git` is always included** — explicitly un-ignored so branch state stays in lockstep between local and sprite.
-
-To pick up new `.gitignore` rules after changing them, run:
-```bash
-sp resync .
-```
-
-## Token Setup
-
-On first run, `sp` will prompt you to set up authentication:
-
-1. The script will pause and show instructions
-2. Open a new terminal and run `claude setup-token`
-3. Copy the token (starts with `sk-ant-oat01-`)
-4. Paste it back into the `sp` prompt
-5. The token is saved to `~/.claude-token` and reused for all sprites
-
-Alternatively, you can set up the token beforehand:
-
-```bash
-# Generate a token
-claude setup-token
-
-# Copy the token and save it
-echo "sk-ant-oat01-YOUR_TOKEN_HERE" > ~/.claude-token
-chmod 600 ~/.claude-token
-```
-
-## Troubleshooting
-
-### "sprite: command not found"
-Install the Fly.io sprite CLI: https://fly.io/docs/reference/sprites/
-
-### SSH authentication issues
-Ensure your SSH key is added to your GitHub account:
-```bash
-ssh -T git@github.com
-```
-
-### Sync not working or stuck
-```bash
-# Check sync health, errors, and conflicts
-sp status .
-
-# Reset sync session (re-reads .gitignore, restarts Mutagen)
-sp resync .
-```
-
-### Gitignored files still syncing
-If files that should be excluded are still syncing, your `.gitignore` patterns may have been added after the sync session started. Run `sp resync .` to pick up the new patterns.
-
-### Sync conflicts
-If both sides modified the same file, Mutagen flags a conflict instead of choosing a winner. Check with `sp status .` and resolve with `mutagen sync reset`.
-
-## Examples
-
-```bash
-# Work on the flyctl repository
+# Or specify owner/repo directly
 sp superfly/flyctl
 
-# Work on your local changes before committing
-cd ~/projects/my-app
-sp .
-
-# Work on a directory without a GitHub repo
-cd ~/scratch/prototype
-sp .
-
-# Quick access to any public GitHub repo
-sp torvalds/linux
-
-# Open claude in a sprite
+# Run a specific command instead of bash
 sp . -- claude
+```
 
-# Run claude with flags
-sp . -- claude -f foo bar baz
+This creates the sprite if needed, sets up auth and SSH keys, starts file sync, and drops you into a tmux session.
 
-# Run multiple sessions in the same sprite
-sp . -- claude --name claude-session   # Terminal 1
-sp . --name debug                      # Terminal 2
+### Boot the web UI
 
-# Disable file sync
-sp . --no-sync
+```bash
+# Direct mode — opencode web UI accessible at the sprite's public URL
+sp . --web
 
-# Verbose output (shows sync details, .gitignore patterns, SSH proxy info)
-sp . --verbose
+# Proxy mode — /opencode routes to opencode, /* falls through to your dev server
+sp . --web --web-proxy --web-dev-port 3000
+```
 
+In `--web` mode, `sp` configures a sprite-env service and returns immediately. The daemon keeps sync running in the background.
+
+### Monitor with the TUI
+
+```bash
+sp tui
+```
+
+The dashboard shows all tracked sprites with live status and sync health. Key bindings:
+
+| Key | Action |
+|-----|--------|
+| `j/k` or `↑/↓` | Navigate |
+| `enter` | View details |
+| `o` | Open sprite URL in browser |
+| `c` | Connect via console (suspends TUI) |
+| `s` | Start/stop sync |
+| `d` | Delete sprite (with confirmation) |
+| `t` / `T` | Add / remove tag |
+| `f` | Filter by name |
+| `r` | Refresh |
+| `q` | Quit |
+
+### Run with proxy mode
+
+For projects with a dev server, proxy mode puts opencode and your app behind a single URL:
+
+```bash
+sp . --web --web-proxy --web-dev-port 4000
+```
+
+This uploads the `sp` binary to the sprite and runs a reverse proxy:
+- `/opencode` routes to the opencode web UI
+- `/*` routes to your dev server on port 4000
+
+### Connect to a sync'd console session
+
+When `--web` is running, your files are already syncing. Open a console alongside it:
+
+```bash
+# Open a bash session in the same sprite
+sp .
+
+# Or run claude directly
+sp . -- claude
+```
+
+The daemon manages sync — it persists across all your sessions. Multiple terminal windows can connect to the same sprite simultaneously using `--name`:
+
+```bash
+sp . -- claude --name claude-main    # Terminal 1
+sp . --name debug                    # Terminal 2
+sp . --name tests                    # Terminal 3
+```
+
+---
+
+## File Sync
+
+### How it works
+
+`sp` uses [Mutagen](https://mutagen.io) for bidirectional file sync between your local machine and the sprite. A background daemon manages the sync lifecycle:
+
+1. **On connect**, the daemon starts an SSH proxy to the sprite and creates a Mutagen session
+2. **While running**, changes flow both ways in real-time
+3. **When the sprite sleeps**, sync stops cleanly and restarts automatically when the sprite wakes
+4. **The daemon persists** — sync survives after `sp` exits, across terminal sessions, and through sprite sleep/wake cycles
+
+### Sync mode
+
+Sync uses `two-way-safe` — if both sides modify the same file before syncing, Mutagen flags a conflict instead of choosing a winner. Check with `sp status .` and resolve with `mutagen sync reset`.
+
+### What gets synced
+
+Everything except:
+- Files matching `.gitignore` patterns (all `.gitignore` files in the tree are parsed)
+- `.DS_Store` and `._*` files (always excluded)
+- `.git/` is **included** so branch state stays in lockstep
+
+### Managing sync
+
+```bash
 # Check sync health and conflicts
 sp status .
 
-# Reset sync (re-reads .gitignore, restarts Mutagen)
+# Reset sync (flush pending changes, re-read .gitignore, restart)
 sp resync .
-
-# Check sprite info before connecting
-sp info owner/repo
 
 # List active tmux sessions
 sp sessions .
 
-# Manage setup config
-sp conf init
-sp conf edit
+# Discover and import existing Mutagen sessions
+sp discover
 ```
+
+---
+
+## Setup Configuration
+
+`sp` automatically configures each sprite with:
+- Claude Code OAuth token (from `~/.claude-token` or interactive prompt)
+- SSH keys (`~/.ssh/id_ed25519`) for GitHub access
+- Git user name and email
+- OSC browser-open wrapper for tmux passthrough
+
+### Custom files and commands
+
+Create `~/.config/sprite/setup.conf` to auto-install tools and copy dotfiles:
+
+```bash
+sp conf init    # Create starter config with examples
+sp conf edit    # Open in $EDITOR
+sp conf show    # Print current config
+```
+
+**Config format:**
+
+```ini
+[files]
+# Copy dotfiles. Default mode: [newest] (only if local is newer).
+~/.tmux.conf
+~/.config/opencode/config.toml [always]
+
+# Different local/remote paths:
+~/.config/sprite/tmux.conf.local -> ~/.tmux.conf.local
+
+[commands]
+# Conditional: runs when condition succeeds (exits 0)
+! command -v opencode :: curl -fsSL https://opencode.ai/install | bash
+command -v npm :: npm install -g prettier
+```
+
+**How it runs:**
+- `[files]` entries copy local files to the sprite. `[newest]` (default) skips if the remote is the same age or newer. `[always]` overwrites every time.
+- `[commands]` entries run on the sprite. The condition before `::` is checked first — the command only runs if the condition passes. Use `!` prefix to negate (run when condition fails).
+- Setup runs on first connect to a new sprite. Files marked `[always]` are re-copied on every reconnect.
+
+---
+
+## The Daemon
+
+`sp` runs a background daemon that manages sync lifecycle, tracks sprite health, and serves the TUI. It starts automatically on first use.
+
+```bash
+sp daemon status    # Check if daemon is running
+sp daemon restart   # Restart (picks up new binary automatically)
+sp daemon logs      # Show recent log output
+sp daemon logs -f   # Follow logs in real-time
+```
+
+**Auto-restart:** The daemon checks its own binary hash every 10 seconds. When you rebuild and `make install`, the daemon and TUI automatically re-exec with the new code.
+
+**State:** Sprite metadata, sync sessions, and tags are stored in `~/.config/sp/sp.db` (SQLite). Logs go to `~/.config/sp/sp.log`.
+
+---
+
+## Command Reference
+
+| Command | Description |
+|---------|-------------|
+| `sp .` | Connect to sprite for current directory |
+| `sp owner/repo` | Connect to sprite for a GitHub repo |
+| `sp . --web` | Set up opencode web UI with auto-wake |
+| `sp . --web --web-proxy` | Proxy mode (opencode + dev server) |
+| `sp tui` | Open the dashboard |
+| `sp status [target]` | Show sprite and sync status |
+| `sp resync [target]` | Reset file sync |
+| `sp sessions [target]` | List tmux sessions |
+| `sp import <name>` | Import an existing sprite |
+| `sp discover` | Find and import untracked Mutagen sessions |
+| `sp conf init/edit/show` | Manage setup.conf |
+| `sp daemon status/restart/logs` | Manage the background daemon |
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--web` | Enable opencode web UI via sprite-env service |
+| `--web-proxy` | Reverse proxy mode (requires `--web`) |
+| `--web-dev-port N` | Dev server port for proxy fallthrough |
+| `--no-sync` | Disable file syncing |
+| `--name NAME` | Custom tmux session name |
+| `-- COMMAND` | Run a command instead of bash |
+
+---
+
+## Sprite Naming
+
+Sprites are named automatically based on what you connect to:
+
+| Source | Example | Sprite Name |
+|--------|---------|-------------|
+| `.sprite` file | `{"sprite": "my-sprite"}` | `my-sprite` |
+| GitHub remote | `superfly/flyctl` | `gh-superfly--flyctl` |
+| Directory name | `~/projects/my-app` | `local-my-app` |
+
+Priority: `.sprite` file > GitHub remote > directory name.
+
+---
+
+## Prerequisites
+
+| Tool | Required for | Install |
+|------|-------------|---------|
+| [Sprite CLI](https://sprites.dev) | Core functionality | `curl -fsSL https://sprites.dev/install \| sh` |
+| [Go](https://go.dev) | Building sp | `brew install go` |
+| [Mutagen](https://mutagen.io) | File sync | `brew install mutagen-io/mutagen/mutagen` |
+| SSH key | GitHub + sync | `ssh-keygen -t ed25519` |
+| Claude Code token | Claude integration | `claude setup-token` (prompted on first run) |
+
+---
+
+## Troubleshooting
+
+### Sync not working
+
+```bash
+sp status .          # Check sync health
+sp resync .          # Full reset
+sp daemon logs -n 20 # Check daemon logs for errors
+```
+
+### Sprite won't connect
+
+```bash
+sprite list          # Verify sprite exists
+sp daemon status     # Verify daemon is running
+sp daemon restart    # Restart daemon
+```
+
+### Stale SSH config entries
+
+The daemon cleans up stale SSH config entries (`~/.ssh/config`) on startup. If entries accumulate, restart the daemon:
+
+```bash
+sp daemon restart
+```
+
+### Mouse tracking garbage after disconnect
+
+If scrolling produces raw escape sequences after disconnecting from a sprite, `sp` automatically resets terminal mouse modes. If this still happens (e.g., after a crash), run:
+
+```bash
+printf '\e[?1000l\e[?1003l\e[?1006l'
+```
+
+---
 
 ## License
 
