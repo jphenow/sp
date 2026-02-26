@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jphenow/sp/internal/setup"
 	"github.com/jphenow/sp/internal/sprite"
 	"github.com/jphenow/sp/internal/store"
 	spSync "github.com/jphenow/sp/internal/sync"
@@ -317,6 +318,8 @@ func (d *Daemon) dispatch(ctx context.Context, clientID string, req *Request) Re
 		return d.handleStopSync(req.Params)
 	case "resync":
 		return d.handleResync(req.Params)
+	case "run_setup":
+		return d.handleRunSetup(req.Params)
 	case "restart":
 		return d.handleRestart()
 	case "ping":
@@ -913,6 +916,48 @@ func (d *Daemon) handleResync(params json.RawMessage) Response {
 	}()
 
 	return respondOK("resyncing")
+}
+
+// handleRunSetup re-runs setup.conf (files and commands) against a sprite.
+// This allows re-pushing auth tokens, dotfiles, and re-running setup commands
+// without tearing down sync or reconnecting.
+func (d *Daemon) handleRunSetup(params json.RawMessage) Response {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		return respondError(fmt.Sprintf("invalid params: %v", err))
+	}
+
+	// Look up the sprite to get its org
+	s, err := d.db.GetSprite(req.Name)
+	if err != nil {
+		return respondError(fmt.Sprintf("sprite %q not found: %v", req.Name, err))
+	}
+
+	log := slog.With("sprite", req.Name)
+	log.Info("run_setup: parsing setup.conf")
+
+	conf, err := setup.ParseSetupConf(setup.DefaultConfPath())
+	if err != nil {
+		return respondError(fmt.Sprintf("parsing setup.conf: %v", err))
+	}
+	if conf == nil {
+		return respondError("no setup.conf found — run 'sp conf init' to create one")
+	}
+
+	// Run setup.conf against the sprite in the background so we can respond immediately
+	go func() {
+		client := sprite.NewClient(s.Org)
+		log.Info("run_setup: executing setup.conf", "files", len(conf.Files), "commands", len(conf.Commands))
+		if err := setup.RunSetupConf(client, req.Name, conf); err != nil {
+			log.Error("run_setup: failed", "error", err)
+		} else {
+			log.Info("run_setup: completed successfully")
+		}
+	}()
+
+	return respondOK(fmt.Sprintf("running setup.conf (%d files, %d commands)", len(conf.Files), len(conf.Commands)))
 }
 
 // handleRestart sends back an "ok" and then triggers a graceful restart.

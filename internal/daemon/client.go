@@ -191,6 +191,21 @@ func (c *Client) Resync(name, localPath, remotePath, org string) error {
 	return err
 }
 
+// RunSetup re-runs setup.conf (files and commands) against a sprite.
+// This pushes auth tokens, dotfiles, and re-runs conditional commands
+// without tearing down sync or reconnecting.
+func (c *Client) RunSetup(name string) (string, error) {
+	result, err := c.call("run_setup", map[string]string{"name": name})
+	if err != nil {
+		return "", err
+	}
+	var msg string
+	if err := json.Unmarshal(result, &msg); err != nil {
+		return "", fmt.Errorf("decoding run_setup result: %w", err)
+	}
+	return msg, nil
+}
+
 // Restart asks the daemon to gracefully restart (re-exec the new binary).
 // The daemon will respond, then asynchronously shut down and exec.
 func (c *Client) Restart() error {

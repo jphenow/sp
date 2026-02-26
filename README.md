@@ -254,6 +254,8 @@ sp daemon logs -f   # Follow logs in real-time
 | `sp . --web --web-proxy` | Proxy mode (opencode + dev server) |
 | `sp tui` | Open the dashboard |
 | `sp status [target]` | Show sprite and sync status |
+| `sp setup [target]` | Re-run setup.conf on a sprite |
+| `sp setup --all` | Re-run setup.conf on all tracked running sprites |
 | `sp resync [target]` | Reset file sync |
 | `sp sessions [target]` | List tmux sessions |
 | `sp import <name>` | Import an existing sprite |

@@ -125,6 +125,13 @@ type deleteResultMsg struct {
 	err  error
 }
 
+// setupResultMsg is sent after a setup.conf push operation completes.
+type setupResultMsg struct {
+	name string // sprite name, or "all" for bulk
+	msg  string // success message from daemon
+	err  error
+}
+
 // NewModel creates a new TUI model connected to the daemon.
 func NewModel(client *daemon.Client, opts FilterOptions) Model {
 	ti := textinput.New()
@@ -243,6 +250,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, m.fetchSprites
+
+	case setupResultMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Setup: %s — %s", msg.name, msg.msg)
+		}
+		return m, nil
 
 	case reconnectedMsg:
 		// Daemon connection was broken and we reconnected. Swap the client
@@ -386,6 +401,14 @@ func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirmDelete = true
 			m.deleteName = s.Name
 		}
+	case "u":
+		// Run setup.conf on the selected sprite
+		if s := m.selectedDashboardSprite(); s != nil {
+			return m, m.runSetup(s)
+		}
+	case "U":
+		// Run setup.conf on all running sprites
+		return m, m.runSetupAll()
 	}
 	return m, nil
 }
@@ -418,6 +441,14 @@ func (m Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirmDelete = true
 			m.deleteName = m.selectedSprite.Name
 		}
+	case "u":
+		// Run setup.conf on this sprite
+		if m.selectedSprite != nil {
+			return m, m.runSetup(m.selectedSprite)
+		}
+	case "U":
+		// Run setup.conf on all running sprites
+		return m, m.runSetupAll()
 	}
 	return m, nil
 }
@@ -562,7 +593,7 @@ func (m Model) viewDashboard() string {
 
 	// Help bar
 	b.WriteString("\n")
-	help := "[↑↓/jk] navigate  [enter] details  [o] open  [c] console  [s] sync  [d] delete  [f] filter  [t/T] tag/untag  [r] refresh  [q] quit"
+	help := "[↑↓/jk] navigate  [enter] details  [o] open  [c] console  [s] sync  [u/U] setup/all  [d] delete  [f] filter  [t/T] tag/untag  [r] refresh  [q] quit"
 	b.WriteString(HelpStyle.Render(help))
 
 	return b.String()
@@ -633,7 +664,7 @@ func (m Model) viewDetail() string {
 
 	// Help
 	b.WriteString("\n")
-	help := "[esc] back  [o] open  [c] console  [s] sync  [d] delete  [r] refresh  [q] quit"
+	help := "[esc] back  [o] open  [c] console  [s] sync  [u/U] setup/all  [d] delete  [r] refresh  [q] quit"
 	b.WriteString(HelpStyle.Render(help))
 
 	return b.String()
@@ -828,6 +859,47 @@ func (m Model) toggleSync(s *store.Sprite) tea.Cmd {
 			}
 			return syncToggledMsg{name: name, action: "started"}
 		}
+	}
+}
+
+// runSetup pushes setup.conf (files and commands) to a single sprite via the daemon.
+func (m Model) runSetup(s *store.Sprite) tea.Cmd {
+	return func() tea.Msg {
+		msg, err := m.client.RunSetup(s.Name)
+		if err != nil {
+			return setupResultMsg{name: s.Name, err: err}
+		}
+		return setupResultMsg{name: s.Name, msg: msg}
+	}
+}
+
+// runSetupAll pushes setup.conf to every tracked running sprite via the daemon.
+func (m Model) runSetupAll() tea.Cmd {
+	return func() tea.Msg {
+		sprites, err := m.client.ListSprites(store.ListOptions{})
+		if err != nil {
+			return setupResultMsg{name: "all", err: fmt.Errorf("listing sprites: %w", err)}
+		}
+
+		var count int
+		var lastErr error
+		for _, s := range sprites {
+			if s.Status != "running" {
+				continue
+			}
+			count++
+			if _, err := m.client.RunSetup(s.Name); err != nil {
+				lastErr = err
+			}
+		}
+
+		if count == 0 {
+			return setupResultMsg{name: "all", msg: "no tracked running sprites found"}
+		}
+		if lastErr != nil {
+			return setupResultMsg{name: "all", err: fmt.Errorf("setup ran on %d sprite(s), last error: %w", count, lastErr)}
+		}
+		return setupResultMsg{name: "all", msg: fmt.Sprintf("setup pushed to %d sprite(s)", count)}
 	}
 }
 
