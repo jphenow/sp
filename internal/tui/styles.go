@@ -33,6 +33,8 @@ func SyncStatusStyle(status string) string {
 	switch status {
 	case "watching":
 		return lipgloss.NewStyle().Foreground(colorSuccess).Render("watching")
+	case "conflicts":
+		return lipgloss.NewStyle().Foreground(colorWarning).Render("conflicts")
 	case "syncing":
 		return lipgloss.NewStyle().Foreground(colorSecondary).Render("syncing")
 	case "connecting":

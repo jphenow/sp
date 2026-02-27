@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -51,6 +52,17 @@ Multiple TUI instances can run simultaneously with different filters.`,
 		if _, err := p.Run(); err != nil {
 			return fmt.Errorf("running TUI: %w", err)
 		}
+
+		// Reset terminal state that Bubbletea's alt screen restore may not
+		// fully clean up. This prevents blank lines, displaced prompts, and
+		// leftover escape sequences from polluting the shell after exit.
+		//   \033[?1049l  — exit alt screen buffer (safe no-op if already done)
+		//   \033[?1000l  — disable mouse click tracking
+		//   \033[?1003l  — disable mouse all-motion tracking
+		//   \033[?1006l  — disable SGR mouse mode
+		//   \033[?25h    — ensure cursor is visible
+		//   \033[0m      — reset all text attributes/colors
+		fmt.Fprint(os.Stdout, "\033[?1049l\033[?1000l\033[?1003l\033[?1006l\033[?25h\033[0m")
 
 		return nil
 	},

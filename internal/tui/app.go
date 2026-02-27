@@ -65,6 +65,10 @@ type Model struct {
 	tagTarget   string // sprite name being tagged
 	tagRemoving bool   // true if the 'T' (remove) variant was pressed
 
+	// Sync menu state
+	syncMenu       bool          // when true, the sync action submenu is visible
+	syncMenuTarget *store.Sprite // sprite the sync menu applies to
+
 	// Delete confirmation state
 	confirmDelete bool   // when true, waiting for y/n to confirm delete
 	deleteName    string // name of sprite pending deletion
@@ -117,6 +121,13 @@ type syncToggledMsg struct {
 	name   string
 	action string // "started" or "stopped"
 	err    error
+}
+
+// syncResyncMsg is sent after a resync-with-mode operation is dispatched.
+type syncResyncMsg struct {
+	name string
+	mode string // human-readable description of the mode
+	err  error
 }
 
 // deleteResultMsg is sent after a sprite delete operation completes.
@@ -236,6 +247,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.fetchSprites
 
+	case syncResyncMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Resync (%s) started for %s", msg.mode, msg.name)
+		}
+		return m, m.fetchSprites
+
 	case deleteResultMsg:
 		m.confirmDelete = false
 		m.deleteName = ""
@@ -298,6 +317,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKey processes keyboard input based on current view.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Sync menu intercepts all keys
+	if m.syncMenu {
+		return m.handleSyncMenuKey(msg)
+	}
+
 	// Delete confirmation intercepts all keys
 	if m.confirmDelete {
 		return m.handleDeleteConfirm(msg)
@@ -391,9 +415,10 @@ func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.connectConsole(s)
 		}
 	case "s":
-		// Toggle sync start/stop
+		// Open sync action menu
 		if s := m.selectedDashboardSprite(); s != nil {
-			return m, m.toggleSync(s)
+			m.syncMenu = true
+			m.syncMenuTarget = s
 		}
 	case "d":
 		// Delete sprite (enter confirmation mode)
@@ -431,9 +456,10 @@ func (m Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.connectConsole(m.selectedSprite)
 		}
 	case "s":
-		// Toggle sync start/stop
+		// Open sync action menu
 		if m.selectedSprite != nil {
-			return m, m.toggleSync(m.selectedSprite)
+			m.syncMenu = true
+			m.syncMenuTarget = m.selectedSprite
 		}
 	case "d":
 		// Delete sprite (enter confirmation mode)
@@ -585,6 +611,12 @@ func (m Model) viewDashboard() string {
 		b.WriteString(m.message)
 	}
 
+	// Sync menu
+	if m.syncMenu && m.syncMenuTarget != nil {
+		b.WriteString("\n")
+		b.WriteString(m.renderSyncMenu())
+	}
+
 	// Delete confirmation banner
 	if m.confirmDelete {
 		b.WriteString("\n")
@@ -654,6 +686,12 @@ func (m Model) viewDetail() string {
 		b.WriteString(DetailLabelStyle.Render("Tags:") + "  ")
 		b.WriteString(TagStyle.Render(strings.Join(m.selectedTags, ", ")))
 		b.WriteString("\n")
+	}
+
+	// Sync menu
+	if m.syncMenu && m.syncMenuTarget != nil {
+		b.WriteString("\n")
+		b.WriteString(m.renderSyncMenu())
 	}
 
 	// Delete confirmation banner
@@ -736,8 +774,11 @@ func (m Model) reExec() tea.Msg {
 		return errMsg{err: fmt.Errorf("re-exec: %w", err)}
 	}
 
-	// syscall.Exec replaces the process — Bubbletea cleanup happens via the
-	// alt screen restore that the terminal does on exec.
+	// Restore terminal state before exec. syscall.Exec replaces the process
+	// so Bubbletea never gets to clean up. Without this, the new process
+	// starts inside an orphaned alt screen buffer.
+	fmt.Fprint(os.Stdout, "\033[?1049l\033[?1000l\033[?1003l\033[?1006l\033[?25h\033[0m")
+
 	execErr := syscall.Exec(exePath, os.Args, os.Environ())
 	// If we get here, exec failed
 	return errMsg{err: fmt.Errorf("re-exec failed: %w", execErr)}
@@ -836,7 +877,7 @@ func (m Model) toggleSync(s *store.Sprite) tea.Cmd {
 	return func() tea.Msg {
 		name := s.Name
 		switch s.SyncStatus {
-		case "watching", "syncing", "connecting", "recovering":
+		case "watching", "syncing", "connecting", "recovering", "conflicts":
 			// Sync is active — stop it
 			if err := m.client.StopSync(name); err != nil {
 				return syncToggledMsg{name: name, action: "stopped", err: err}
@@ -854,11 +895,97 @@ func (m Model) toggleSync(s *store.Sprite) tea.Cmd {
 				RemotePath: s.RemotePath,
 				Org:        s.Org,
 			}
-			if _, err := m.client.StartSync(req); err != nil {
+			if err := m.client.StartSync(req); err != nil {
 				return syncToggledMsg{name: name, action: "started", err: err}
 			}
 			return syncToggledMsg{name: name, action: "started"}
 		}
+	}
+}
+
+// renderSyncMenu renders the sync action submenu for the current target sprite.
+func (m Model) renderSyncMenu() string {
+	s := m.syncMenuTarget
+	var b strings.Builder
+
+	b.WriteString(HeaderStyle.Render(fmt.Sprintf("Sync: %s", s.Name)))
+	b.WriteString("\n")
+
+	if isSyncActive(s) {
+		b.WriteString("  [1] Stop sync\n")
+	} else {
+		b.WriteString("  [1] Start sync (two-way)\n")
+	}
+	b.WriteString("  [2] Force push  local -> sprite  (overwrites sprite)\n")
+	b.WriteString("  [3] Force pull  sprite -> local  (overwrites local)\n")
+	b.WriteString("  [4] Safe push   local -> sprite  (skip conflicts)\n")
+	b.WriteString("  [5] Safe pull   sprite -> local  (skip conflicts)\n")
+	b.WriteString(HelpStyle.Render("  [esc] cancel"))
+
+	return b.String()
+}
+
+// isSyncActive returns true if the sprite's sync status indicates an active session.
+func isSyncActive(s *store.Sprite) bool {
+	switch s.SyncStatus {
+	case "watching", "syncing", "connecting", "recovering", "conflicts":
+		return true
+	default:
+		return false
+	}
+}
+
+// handleSyncMenuKey processes keys when the sync action submenu is visible.
+// The menu shows numbered options for the available sync actions.
+func (m Model) handleSyncMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	s := m.syncMenuTarget
+	if s == nil {
+		m.syncMenu = false
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "esc", "q":
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, nil
+	case "1":
+		// Start or stop sync (toggle)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.toggleSync(s)
+	case "2":
+		// Force push: local -> sprite (one-way-replica)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWayReplicaToRemote, "force local -> sprite")
+	case "3":
+		// Force pull: sprite -> local (one-way-replica)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWayReplicaToLocal, "force sprite -> local")
+	case "4":
+		// Safe push: local -> sprite (one-way-safe)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWaySafeToRemote, "safe local -> sprite")
+	case "5":
+		// Safe pull: sprite -> local (one-way-safe)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWaySafeToLocal, "safe sprite -> local")
+	}
+	return m, nil
+}
+
+// resyncWithMode dispatches a one-shot resync in the given mode, then restores two-way-safe.
+func (m Model) resyncWithMode(s *store.Sprite, mode daemon.SyncMode, desc string) tea.Cmd {
+	name := s.Name
+	return func() tea.Msg {
+		if err := m.client.ResyncWithMode(name, mode); err != nil {
+			return syncResyncMsg{name: name, mode: desc, err: err}
+		}
+		return syncResyncMsg{name: name, mode: desc}
 	}
 }
 
