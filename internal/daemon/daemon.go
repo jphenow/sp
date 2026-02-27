@@ -74,6 +74,13 @@ type Daemon struct {
 	proxyDeathChs   map[string]chan struct{}
 	proxyDeathChsMu sync.Mutex
 
+	// syncLocks provides per-sprite mutual exclusion for sync setup/teardown.
+	// All code paths that call attemptSyncSetup or restartSync must acquire
+	// the lock for the sprite first. This prevents the race where two
+	// goroutines (e.g., health poller + upsert auto-start) concurrently set
+	// up proxies for the same sprite, each killing the other's resources.
+	syncLocks sync.Map // map[string]*sync.Mutex
+
 	// startBinaryHash is the SHA-256 of the sp binary at daemon startup.
 	// Used to detect when a new binary has been installed.
 	startBinaryHash string
@@ -124,6 +131,14 @@ func New(config Config, db *store.DB) *Daemon {
 		startBinaryHash: hash,
 		exePath:         exePath,
 	}
+}
+
+// spriteSyncLock returns the per-sprite mutex for sync operations, creating
+// one if it doesn't exist yet. Callers should Lock() this before starting
+// any sync setup/teardown and Unlock() when done.
+func (d *Daemon) spriteSyncLock(spriteName string) *sync.Mutex {
+	val, _ := d.syncLocks.LoadOrStore(spriteName, &sync.Mutex{})
+	return val.(*sync.Mutex)
 }
 
 // hashFile computes the SHA-256 hex digest of a file.
@@ -318,6 +333,8 @@ func (d *Daemon) dispatch(ctx context.Context, clientID string, req *Request) Re
 		return d.handleStopSync(req.Params)
 	case "resync":
 		return d.handleResync(req.Params)
+	case "resync_with_mode":
+		return d.handleResyncWithMode(req.Params)
 	case "run_setup":
 		return d.handleRunSetup(req.Params)
 	case "restart":
@@ -417,12 +434,18 @@ func (d *Daemon) pollSpriteHealth() {
 			}(info.Name, existing.Org, existing.LocalPath, existing.RemotePath)
 
 		} else if info.Status != "running" && oldStatus == "running" {
-			// Sprite went to sleep — tear down sync cleanly (not an error)
+			// Sprite went to sleep — tear down sync cleanly (not an error).
+			// Acquire the per-sprite lock to prevent racing with a concurrent setup.
 			slog.Info("health_poll: sprite sleeping, stopping sync",
 				"sprite", info.Name, "from", oldStatus, "to", info.Status)
-			d.stopSyncForSprite(info.Name)
-			d.db.UpdateSyncStatus(info.Name, "idle", "")
-			d.broadcast(StateUpdate{Type: "sync_status", SpriteName: info.Name})
+			func(name string) {
+				mu := d.spriteSyncLock(name)
+				mu.Lock()
+				defer mu.Unlock()
+				d.stopSyncForSprite(name)
+				d.db.UpdateSyncStatus(name, "idle", "")
+				d.broadcast(StateUpdate{Type: "sync_status", SpriteName: name})
+			}(info.Name)
 		}
 	}
 }
@@ -899,18 +922,24 @@ func (d *Daemon) handleResync(params json.RawMessage) Response {
 	log := slog.With("sprite", req.Name)
 	log.Info("resync: beginning")
 
-	// 1. Flush pending changes (best-effort, 15s timeout)
-	log.Info("resync: flushing pending mutagen changes")
-	if err := spSync.FlushMutagenSession(req.Name); err != nil {
-		log.Warn("resync: flush failed (continuing)", "error", err)
-	}
-
-	// 2. Tear down existing sync
-	d.stopSyncForSprite(req.Name)
-
-	// 3. Restart sync via the standard pipeline
+	// Run the full resync pipeline in a background goroutine under the
+	// per-sprite sync lock so the flush+stop+restart are atomic.
 	go func() {
-		if err := d.restartSync(req.Name); err != nil {
+		mu := d.spriteSyncLock(req.Name)
+		mu.Lock()
+		defer mu.Unlock()
+
+		// 1. Flush pending changes (best-effort, 15s timeout)
+		log.Info("resync: flushing pending mutagen changes")
+		if err := spSync.FlushMutagenSession(req.Name); err != nil {
+			log.Warn("resync: flush failed (continuing)", "error", err)
+		}
+
+		// 2. Tear down existing sync
+		d.stopSyncForSprite(req.Name)
+
+		// 3. Restart sync via the standard pipeline (already hold the lock)
+		if err := d.restartSyncLocked(req.Name); err != nil {
 			log.Error("resync: restart failed", "error", err)
 		}
 	}()
@@ -983,58 +1012,69 @@ type syncSetupResult struct {
 // the proxy dies during setup (e.g., sprite cycling warm/cold).
 const maxSyncRetries = 3
 
-// handleStartSync sets up SSH, starts a proxy as a daemon child process, and
-// creates a Mutagen sync session. Because the proxy is a child of the daemon
-// (not the short-lived `sp` CLI), it survives after `sp . --web` returns.
-// Retries the full pipeline up to maxSyncRetries times if the proxy dies
-// during setup (which happens when the sprite is cycling).
+// handleStartSync kicks off sync setup in a background goroutine and returns
+// immediately so the RPC connection isn't blocked. The full pipeline (wake, SSH,
+// proxy, Mutagen) can take 30+ seconds; blocking the connection would starve
+// other requests (e.g., ListSprites from the TUI's poll ticker) since each
+// connection processes requests sequentially.
 func (d *Daemon) handleStartSync(params json.RawMessage) Response {
 	var req struct {
 		SpriteName string `json:"sprite_name"`
 		LocalPath  string `json:"local_path"`
 		RemotePath string `json:"remote_path"`
 		Org        string `json:"org"`
+		SyncMode   string `json:"sync_mode"`
 	}
 	if err := json.Unmarshal(params, &req); err != nil {
 		return respondError(fmt.Sprintf("invalid params: %v", err))
 	}
 
 	log := slog.With("sprite", req.SpriteName, "local", req.LocalPath, "remote", req.RemotePath)
-	log.Info("start_sync: beginning sync setup")
+	log.Info("start_sync: dispatching sync setup", "sync_mode", req.SyncMode)
 
-	client := sprite.NewClient(req.Org)
-	mgr := spSync.NewManager(client)
+	// Mark as "connecting" immediately so the TUI shows feedback
+	d.db.UpdateSyncStatus(req.SpriteName, "connecting", "")
+	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.SpriteName})
 
-	var lastErr error
-	for attempt := 1; attempt <= maxSyncRetries; attempt++ {
-		if attempt > 1 {
-			log.Info("start_sync: retrying", "attempt", attempt, "prev_error", lastErr)
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+	go func() {
+		mu := d.spriteSyncLock(req.SpriteName)
+		mu.Lock()
+		defer mu.Unlock()
+
+		client := sprite.NewClient(req.Org)
+		mgr := spSync.NewManager(client)
+
+		var lastErr error
+		for attempt := 1; attempt <= maxSyncRetries; attempt++ {
+			if attempt > 1 {
+				log.Info("start_sync: retrying", "attempt", attempt, "prev_error", lastErr)
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			}
+
+			result, err := d.attemptSyncSetup(req.SpriteName, req.LocalPath, req.RemotePath, req.SyncMode, mgr, log)
+			if err == nil {
+				log.Info("start_sync: complete",
+					"mutagen_id", result.MutagenID, "port", result.Port,
+					"proxy_pid", result.ProxyPID, "attempts", attempt)
+				return
+			}
+			lastErr = err
 		}
 
-		result, err := d.attemptSyncSetup(req.SpriteName, req.LocalPath, req.RemotePath, mgr, log)
-		if err == nil {
-			log.Info("start_sync: complete",
-				"mutagen_id", result.MutagenID, "port", result.Port,
-				"proxy_pid", result.ProxyPID, "attempts", attempt)
-			return respondJSON(map[string]interface{}{
-				"mutagen_id": result.MutagenID,
-				"ssh_port":   result.Port,
-				"proxy_pid":  result.ProxyPID,
-			})
-		}
-		lastErr = err
-	}
+		log.Error("start_sync: failed after retries", "attempts", maxSyncRetries, "error", lastErr)
+		d.db.UpdateSyncStatus(req.SpriteName, "error", lastErr.Error())
+		d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.SpriteName})
+	}()
 
-	log.Error("start_sync: failed after retries", "attempts", maxSyncRetries, "error", lastErr)
-	return respondError(fmt.Sprintf("sync setup failed after %d attempts: %v", maxSyncRetries, lastErr))
+	return respondOK("starting")
 }
 
 // attemptSyncSetup runs one attempt of the full sync pipeline: wake, SSH,
 // proxy, test, Mutagen. If the proxy dies mid-setup the function returns
-// quickly so the caller can retry.
+// quickly so the caller can retry. The syncMode parameter controls the Mutagen
+// sync mode; pass "" for the default two-way-safe.
 func (d *Daemon) attemptSyncSetup(
-	spriteName, localPath, remotePath string,
+	spriteName, localPath, remotePath, syncMode string,
 	mgr *spSync.Manager,
 	log *slog.Logger,
 ) (*syncSetupResult, error) {
@@ -1130,8 +1170,15 @@ func (d *Daemon) handleStopSync(params json.RawMessage) Response {
 		return respondError(fmt.Sprintf("invalid params: %v", err))
 	}
 
-	d.stopSyncForSprite(req.Name)
-	return respondOK("ok")
+	go func() {
+		mu := d.spriteSyncLock(req.Name)
+		mu.Lock()
+		defer mu.Unlock()
+
+		d.stopSyncForSprite(req.Name)
+	}()
+
+	return respondOK("stopping")
 }
 
 // stopSyncForSprite tears down all sync infrastructure for a sprite:
@@ -1267,10 +1314,23 @@ func (d *Daemon) monitorProxy(spriteName string, cmd *exec.Cmd) {
 	d.broadcast(StateUpdate{Type: "sync_status", SpriteName: spriteName})
 }
 
-// restartSync tears down and re-establishes sync for a sprite using the stored
-// session info. Called by the health monitor when recovery is needed.
-// Reuses attemptSyncSetup with retry logic.
+// restartSync acquires the per-sprite sync lock and re-establishes sync.
+// If another sync operation is already in progress for this sprite, it returns
+// immediately without error. Safe to call from multiple goroutines concurrently.
 func (d *Daemon) restartSync(spriteName string) error {
+	mu := d.spriteSyncLock(spriteName)
+	if !mu.TryLock() {
+		slog.Info("restart_sync: skipping, sync already in progress", "sprite", spriteName)
+		return nil
+	}
+	defer mu.Unlock()
+
+	return d.restartSyncLocked(spriteName)
+}
+
+// restartSyncLocked tears down and re-establishes sync for a sprite using the
+// stored session info. Caller MUST hold the per-sprite sync lock.
+func (d *Daemon) restartSyncLocked(spriteName string) error {
 	log := slog.With("sprite", spriteName)
 	log.Info("restart_sync: beginning full sync restart")
 

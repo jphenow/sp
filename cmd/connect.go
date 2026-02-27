@@ -520,7 +520,7 @@ func startSyncInline(client *sprite.Client, resolved *setup.ResolvedTarget) erro
 	}
 
 	// Start Mutagen sync
-	mutagenID, err := mgr.StartMutagenSession(resolved.SpriteName, resolved.LocalPath, resolved.RemotePath)
+	mutagenID, err := mgr.StartMutagenSession(resolved.SpriteName, resolved.LocalPath, resolved.RemotePath, "")
 	if err != nil {
 		return fmt.Errorf("starting Mutagen: %w", err)
 	}
