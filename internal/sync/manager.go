@@ -433,8 +433,27 @@ func removeSSHConfigEntry(configPath, alias string) error {
 	return os.WriteFile(configPath, []byte(strings.Join(result, "\n")), 0o600)
 }
 
+// MutagenSyncMode translates our sync mode constants into Mutagen CLI flags.
+// For directional modes it also returns whether to swap alpha/beta ordering.
+// Alpha is the first positional arg (normally local), beta is the second (normally remote).
+func MutagenSyncMode(mode string) (mutagenMode string, swapAlphaBeta bool) {
+	switch mode {
+	case "one-way-replica-to-remote":
+		return "one-way-replica", false // local (alpha) -> remote (beta)
+	case "one-way-replica-to-local":
+		return "one-way-replica", true // remote (alpha) -> local (beta)
+	case "one-way-safe-to-remote":
+		return "one-way-safe", false // local (alpha) -> remote (beta)
+	case "one-way-safe-to-local":
+		return "one-way-safe", true // remote (alpha) -> local (beta)
+	default:
+		return "two-way-safe", false
+	}
+}
+
 // StartMutagenSession creates a new Mutagen sync session between localDir and the sprite.
-func (m *Manager) StartMutagenSession(spriteName, localDir, remoteDir string) (string, error) {
+// The syncMode parameter controls the Mutagen sync mode; pass "" for the default two-way-safe.
+func (m *Manager) StartMutagenSession(spriteName, localDir, remoteDir, syncMode string) (string, error) {
 	sessionName := SessionName(spriteName)
 	alias := SSHHostAlias(spriteName)
 
@@ -445,13 +464,21 @@ func (m *Manager) StartMutagenSession(spriteName, localDir, remoteDir string) (s
 		ignoreArgs = append(ignoreArgs, "--ignore", p)
 	}
 
+	// Resolve Mutagen mode and alpha/beta ordering
+	mutagenMode, swapAlphaBeta := MutagenSyncMode(syncMode)
+	alpha := localDir
+	beta := fmt.Sprintf("%s:%s", alias, remoteDir)
+	if swapAlphaBeta {
+		alpha, beta = beta, alpha
+	}
+
 	// Build mutagen sync create command
 	args := []string{"sync", "create",
 		"--name", sessionName,
-		"--sync-mode", "two-way-safe",
+		"--sync-mode", mutagenMode,
 	}
 	args = append(args, ignoreArgs...)
-	args = append(args, localDir, fmt.Sprintf("%s:%s", alias, remoteDir))
+	args = append(args, alpha, beta)
 
 	cmd := exec.Command("mutagen", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -477,6 +504,22 @@ func FlushMutagenSession(spriteName string) error {
 	cmd := exec.CommandContext(ctx, "mutagen", "sync", "flush", sessionName)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("flushing mutagen session %q: %w\n%s", sessionName, err, string(out))
+	}
+	return nil
+}
+
+// ResetMutagenSession clears the internal snapshot for a Mutagen sync session,
+// forcing a full rescan of both alpha and beta on the next sync cycle. Use this
+// when Mutagen reports "watching" but files appear out of date — the reset
+// discards cached state so Mutagen re-evaluates every file.
+func ResetMutagenSession(spriteName string) error {
+	sessionName := SessionName(spriteName)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "mutagen", "sync", "reset", sessionName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("resetting mutagen session %q: %w\n%s", sessionName, err, string(out))
 	}
 	return nil
 }
