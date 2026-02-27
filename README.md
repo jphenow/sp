@@ -165,7 +165,11 @@ Sync uses `two-way-safe` — if both sides modify the same file before syncing, 
 Everything except:
 - Files matching `.gitignore` patterns (all `.gitignore` files in the tree are parsed)
 - `.DS_Store` and `._*` files (always excluded)
-- `.git/` is **included** so branch state stays in lockstep
+- `.git/` is **included** so branch state stays in lockstep, but volatile internals are excluded:
+  - `.git/index` (staging area) — prevents staged changes from being stomped by the other side
+  - `.git/*.lock` files — transient locks that should never cross machines
+  - `.git/FETCH_HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, etc. — transient merge/rebase state
+  - `.git/rebase-merge`, `.git/rebase-apply`, `.git/sequencer` — in-progress rebase/cherry-pick state
 
 ### Managing sync
 

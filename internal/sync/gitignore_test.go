@@ -70,6 +70,37 @@ func TestCollectIgnorePatterns(t *testing.T) {
 
 	// .git must NOT be ignored
 	assertContains(t, patterns, "!.git")
+
+	// Volatile .git internals must be ignored (after the !.git un-ignore)
+	assertContains(t, patterns, ".git/index")
+	assertContains(t, patterns, ".git/index.lock")
+	assertContains(t, patterns, ".git/FETCH_HEAD")
+	assertContains(t, patterns, ".git/MERGE_HEAD")
+	assertContains(t, patterns, ".git/rebase-merge")
+	assertContains(t, patterns, ".git/COMMIT_EDITMSG")
+	assertContains(t, patterns, ".git/logs")
+	assertContains(t, patterns, ".git/refs/remotes")
+
+	// Verify ordering: !.git must come BEFORE the volatile ignores
+	gitUnignoreIdx := -1
+	gitIndexIgnoreIdx := -1
+	for i, p := range patterns {
+		if p == "!.git" {
+			gitUnignoreIdx = i
+		}
+		if p == ".git/index" {
+			gitIndexIgnoreIdx = i
+		}
+	}
+	if gitUnignoreIdx < 0 {
+		t.Fatal("!.git not found in patterns")
+	}
+	if gitIndexIgnoreIdx < 0 {
+		t.Fatal(".git/index not found in patterns")
+	}
+	if gitUnignoreIdx >= gitIndexIgnoreIdx {
+		t.Errorf("!.git (idx %d) must come before .git/index (idx %d)", gitUnignoreIdx, gitIndexIgnoreIdx)
+	}
 }
 
 func TestDeduplicatePatterns(t *testing.T) {
