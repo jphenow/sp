@@ -4,15 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/jphenow/sp/internal/store"
 )
 
 // Client connects to the sp daemon over Unix socket to issue requests.
+// All RPC calls are serialized via mu since json.Encoder/Decoder are not
+// safe for concurrent use.
 type Client struct {
 	conn    net.Conn
 	encoder *json.Encoder
 	decoder *json.Decoder
+	mu      sync.Mutex
 }
 
 // Connect establishes a connection to the daemon, starting it if needed.
@@ -43,7 +47,11 @@ func (c *Client) Close() error {
 }
 
 // call sends a request to the daemon and returns the raw response.
+// Serialized via mutex since the encoder/decoder are not safe for concurrent use.
 func (c *Client) call(method string, params interface{}) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	var rawParams json.RawMessage
 	if params != nil {
 		var err error
@@ -191,6 +199,17 @@ func (c *Client) Resync(name, localPath, remotePath, org string) error {
 	return err
 }
 
+// ResyncWithMode tears down the current sync, performs a one-shot sync in the
+// given mode, then restores the default two-way-safe session. Use this to force
+// one side to match the other when files have drifted out of sync.
+func (c *Client) ResyncWithMode(name string, mode SyncMode) error {
+	_, err := c.call("resync_with_mode", map[string]interface{}{
+		"name":      name,
+		"sync_mode": string(mode),
+	})
+	return err
+}
+
 // RunSetup re-runs setup.conf (files and commands) against a sprite.
 // This pushes auth tokens, dotfiles, and re-runs conditional commands
 // without tearing down sync or reconnecting.
@@ -213,34 +232,47 @@ func (c *Client) Restart() error {
 	return err
 }
 
+// SyncMode describes the Mutagen synchronization mode to use.
+type SyncMode string
+
+const (
+	// SyncModeTwoWaySafe is the default bidirectional sync that won't overwrite
+	// conflicting changes on either side.
+	SyncModeTwoWaySafe SyncMode = "two-way-safe"
+
+	// SyncModeOneWayReplicaToRemote forces the remote (sprite) to become an exact
+	// mirror of the local directory. Destructive on the remote side.
+	SyncModeOneWayReplicaToRemote SyncMode = "one-way-replica-to-remote"
+
+	// SyncModeOneWayReplicaToLocal forces the local directory to become an exact
+	// mirror of the remote (sprite). Destructive on the local side.
+	SyncModeOneWayReplicaToLocal SyncMode = "one-way-replica-to-local"
+
+	// SyncModeOneWaySafeToRemote pushes local changes to the remote without
+	// overwriting files that have been independently modified on the remote.
+	SyncModeOneWaySafeToRemote SyncMode = "one-way-safe-to-remote"
+
+	// SyncModeOneWaySafeToLocal pulls remote changes to local without
+	// overwriting files that have been independently modified locally.
+	SyncModeOneWaySafeToLocal SyncMode = "one-way-safe-to-local"
+)
+
 // StartSyncRequest contains the parameters for starting sync via the daemon.
 type StartSyncRequest struct {
-	SpriteName string `json:"sprite_name"`
-	LocalPath  string `json:"local_path"`
-	RemotePath string `json:"remote_path"`
-	Org        string `json:"org"`
+	SpriteName string   `json:"sprite_name"`
+	LocalPath  string   `json:"local_path"`
+	RemotePath string   `json:"remote_path"`
+	Org        string   `json:"org"`
+	SyncMode   SyncMode `json:"sync_mode,omitempty"` // defaults to two-way-safe if empty
 }
 
-// StartSyncResult contains the result of a successful start_sync call.
-type StartSyncResult struct {
-	MutagenID string `json:"mutagen_id"`
-	SSHPort   int    `json:"ssh_port"`
-	ProxyPID  int    `json:"proxy_pid"`
-}
-
-// StartSync asks the daemon to set up SSH, start a proxy, and create a Mutagen
-// session. The proxy runs as a child of the daemon so it survives after the
-// calling `sp` process exits.
-func (c *Client) StartSync(req StartSyncRequest) (*StartSyncResult, error) {
-	result, err := c.call("start_sync", req)
-	if err != nil {
-		return nil, err
-	}
-	var res StartSyncResult
-	if err := json.Unmarshal(result, &res); err != nil {
-		return nil, fmt.Errorf("decoding start_sync result: %w", err)
-	}
-	return &res, nil
+// StartSync asks the daemon to begin sync setup in the background. The daemon
+// returns immediately; sync progress is tracked via the sprite's SyncStatus
+// field (visible in ListSprites). The full pipeline (wake, SSH, proxy, Mutagen)
+// runs asynchronously so the client connection isn't blocked.
+func (c *Client) StartSync(req StartSyncRequest) error {
+	_, err := c.call("start_sync", req)
+	return err
 }
 
 // StopSync asks the daemon to tear down sync for a sprite (proxy, Mutagen, SSH config).

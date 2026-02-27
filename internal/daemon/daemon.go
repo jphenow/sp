@@ -947,6 +947,145 @@ func (d *Daemon) handleResync(params json.RawMessage) Response {
 	return respondOK("resyncing")
 }
 
+// handleResyncWithMode tears down the current sync, creates a one-shot session
+// in the requested mode (e.g., one-way-replica), flushes it to completion, then
+// tears it down and restarts the default two-way-safe session. This lets users
+// force one side to match the other when files have drifted out of sync.
+func (d *Daemon) handleResyncWithMode(params json.RawMessage) Response {
+	var req struct {
+		Name     string `json:"name"`
+		SyncMode string `json:"sync_mode"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		return respondError(fmt.Sprintf("invalid params: %v", err))
+	}
+
+	// Look up sprite to get paths and org
+	s, err := d.db.GetSprite(req.Name)
+	if err != nil {
+		return respondError(fmt.Sprintf("sprite %q not found: %v", req.Name, err))
+	}
+	if s.LocalPath == "" {
+		return respondError(fmt.Sprintf("no local path configured for %s", req.Name))
+	}
+
+	log := slog.With("sprite", req.Name, "sync_mode", req.SyncMode)
+	log.Info("resync_with_mode: beginning")
+
+	// Run the resync-with-mode pipeline in the background under the per-sprite
+	// sync lock so the entire flush+teardown+one-shot+restart is atomic.
+	go func() {
+		mu := d.spriteSyncLock(req.Name)
+		mu.Lock()
+		defer mu.Unlock()
+
+		d.db.UpdateSyncStatus(req.Name, "syncing", "")
+		d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.Name})
+
+		// 1. Flush pending changes (best-effort)
+		log.Info("resync_with_mode: flushing pending changes")
+		if err := spSync.FlushMutagenSession(req.Name); err != nil {
+			log.Warn("resync_with_mode: flush failed (continuing)", "error", err)
+		}
+
+		// 2. Tear down existing sync (but keep the proxy/SSH alive if possible)
+		log.Info("resync_with_mode: terminating current mutagen session")
+		if err := spSync.TerminateMutagenSession(req.Name); err != nil {
+			log.Warn("resync_with_mode: terminate failed (continuing)", "error", err)
+		}
+
+		// 3. Create a temporary session with the requested mode
+		client := sprite.NewClient(s.Org)
+		mgr := spSync.NewManager(client)
+
+		// Check if we still have a live proxy; if not, do a full setup
+		d.proxiesMu.RLock()
+		_, hasProxy := d.proxies[req.Name]
+		d.proxiesMu.RUnlock()
+
+		if !hasProxy {
+			log.Info("resync_with_mode: no active proxy, doing full setup with mode")
+			// Full teardown + setup with the requested mode
+			d.stopSyncForSprite(req.Name)
+
+			var lastErr error
+			for attempt := 1; attempt <= maxSyncRetries; attempt++ {
+				if attempt > 1 {
+					log.Info("resync_with_mode: retrying one-shot setup", "attempt", attempt, "prev_error", lastErr)
+					time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				}
+				_, err := d.attemptSyncSetup(req.Name, s.LocalPath, s.RemotePath, req.SyncMode, mgr, log)
+				if err == nil {
+					break
+				}
+				lastErr = err
+			}
+			if lastErr != nil {
+				log.Error("resync_with_mode: one-shot setup failed", "error", lastErr)
+				d.db.UpdateSyncStatus(req.Name, "error", lastErr.Error())
+				d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.Name})
+				return
+			}
+		} else {
+			// Proxy is alive — just create a new Mutagen session with the requested mode
+			log.Info("resync_with_mode: creating one-shot session", "mode", req.SyncMode)
+			_, err := mgr.StartMutagenSession(req.Name, s.LocalPath, s.RemotePath, req.SyncMode)
+			if err != nil {
+				log.Error("resync_with_mode: one-shot session failed", "error", err)
+				d.db.UpdateSyncStatus(req.Name, "error", err.Error())
+				d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.Name})
+				return
+			}
+		}
+
+		// 4. Flush the one-shot session to completion (up to 60s for large syncs)
+		log.Info("resync_with_mode: flushing one-shot session")
+		if err := spSync.FlushMutagenSession(req.Name); err != nil {
+			log.Warn("resync_with_mode: one-shot flush failed", "error", err)
+		}
+
+		// 5. Tear down the one-shot session
+		log.Info("resync_with_mode: terminating one-shot session")
+		if err := spSync.TerminateMutagenSession(req.Name); err != nil {
+			log.Warn("resync_with_mode: one-shot terminate failed", "error", err)
+		}
+
+		// 6. Restart with the default two-way-safe mode (already hold the lock)
+		log.Info("resync_with_mode: restarting default two-way-safe session")
+		if hasProxy {
+			// Proxy is still alive, just create a new two-way-safe session
+			_, err := mgr.StartMutagenSession(req.Name, s.LocalPath, s.RemotePath, "")
+			if err != nil {
+				log.Error("resync_with_mode: restart session failed, falling back to full restart", "error", err)
+				d.stopSyncForSprite(req.Name)
+				if err := d.restartSyncLocked(req.Name); err != nil {
+					log.Error("resync_with_mode: full restart failed", "error", err)
+					d.db.UpdateSyncStatus(req.Name, "error", err.Error())
+					d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.Name})
+					return
+				}
+			} else {
+				d.db.UpdateSyncStatus(req.Name, "watching", "")
+				d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.Name})
+			}
+		} else {
+			// Full restart already set up the session with the one-shot mode,
+			// so we need a clean restart with default mode
+			d.stopSyncForSprite(req.Name)
+			if err := d.restartSyncLocked(req.Name); err != nil {
+				log.Error("resync_with_mode: final restart failed", "error", err)
+				d.db.UpdateSyncStatus(req.Name, "error", err.Error())
+				d.broadcast(StateUpdate{Type: "sync_status", SpriteName: req.Name})
+				return
+			}
+		}
+
+		log.Info("resync_with_mode: complete")
+	}()
+
+	return respondOK(fmt.Sprintf("resyncing with mode %s", req.SyncMode))
+}
+
 // handleRunSetup re-runs setup.conf (files and commands) against a sprite.
 // This allows re-pushing auth tokens, dotfiles, and re-running setup commands
 // without tearing down sync or reconnecting.
@@ -1134,7 +1273,7 @@ func (d *Daemon) attemptSyncSetup(
 
 	// 5. Start Mutagen sync session
 	log.Info("attempt_sync: creating mutagen session")
-	mutagenID, err := mgr.StartMutagenSession(spriteName, localPath, remotePath)
+	mutagenID, err := mgr.StartMutagenSession(spriteName, localPath, remotePath, syncMode)
 	if err != nil {
 		d.killProxy(spriteName)
 		spSync.RemoveSSHConfig(spriteName)
@@ -1160,8 +1299,9 @@ func (d *Daemon) attemptSyncSetup(
 	}, nil
 }
 
-// handleStopSync terminates the Mutagen session, kills the proxy, and cleans
-// up SSH config for a sprite.
+// handleStopSync dispatches sync teardown to a background goroutine and returns
+// immediately. Like handleStartSync, this avoids blocking the RPC connection
+// (which would starve the TUI's periodic ListSprites calls).
 func (d *Daemon) handleStopSync(params json.RawMessage) Response {
 	var req struct {
 		Name string `json:"name"`
@@ -1356,7 +1496,7 @@ func (d *Daemon) restartSyncLocked(spriteName string) error {
 			time.Sleep(time.Duration(attempt) * 2 * time.Second)
 		}
 
-		result, err := d.attemptSyncSetup(spriteName, s.LocalPath, s.RemotePath, mgr, log)
+		result, err := d.attemptSyncSetup(spriteName, s.LocalPath, s.RemotePath, "", mgr, log)
 		if err == nil {
 			log.Info("restart_sync: complete",
 				"mutagen_id", result.MutagenID, "port", result.Port,

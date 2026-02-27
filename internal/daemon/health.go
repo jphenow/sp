@@ -31,6 +31,12 @@ type HealthMonitor struct {
 	connectingSince   map[string]time.Time
 	connectingSinceMu sync.RWMutex
 
+	// Tracks when we last reset each sprite's Mutagen session to force a
+	// full rescan. Periodic resets catch file drift that filesystem watchers
+	// miss (e.g., atomic renames in .git/).
+	lastReset   map[string]time.Time
+	lastResetMu sync.RWMutex
+
 	// Callback when state changes
 	onUpdate func(StateUpdate)
 }
@@ -38,6 +44,13 @@ type HealthMonitor struct {
 // connectingRecoveryTimeout is how long we wait before attempting recovery
 // for a sync session stuck in "connecting" state.
 const connectingRecoveryTimeout = 60 * time.Second
+
+// syncResetInterval controls how often we reset a stable ("watching") Mutagen
+// session to force a full rescan. This catches file drift that filesystem
+// watchers miss — particularly atomic renames inside .git/ (e.g., git writing
+// a new packed-refs via tempfile + rename). Five minutes balances freshness
+// against unnecessary churn.
+const syncResetInterval = 5 * time.Minute
 
 // backoffState tracks exponential backoff for individual sprite polling.
 type backoffState struct {
@@ -55,6 +68,7 @@ func NewHealthMonitor(db *store.DB, daemon *Daemon, onUpdate func(StateUpdate)) 
 		online:          true,
 		backoffs:        make(map[string]*backoffState),
 		connectingSince: make(map[string]time.Time),
+		lastReset:       make(map[string]time.Time),
 		onUpdate:        onUpdate,
 	}
 }
@@ -192,11 +206,20 @@ func (h *HealthMonitor) checkSpriteSync(s *store.Sprite) {
 		}
 	}
 
+	// Surface conflicts: when Mutagen is "watching" but has unresolved conflicts,
+	// report the status as "conflicts" so the TUI can display it. Conflicts in
+	// two-way-safe mode mean files are stuck and won't sync until resolved.
+	if newSyncStatus == "watching" && state.Conflicts > 0 {
+		newSyncStatus = "conflicts"
+		syncError = fmt.Sprintf("%d conflicting file(s) — use sync menu to force-push or force-pull", state.Conflicts)
+	}
+
 	if oldSyncStatus != newSyncStatus || s.SyncError != syncError {
 		slog.Info("health: sync status changed",
 			"sprite", s.Name,
 			"from", oldSyncStatus, "to", newSyncStatus,
-			"error", syncError)
+			"error", syncError,
+			"conflicts", state.Conflicts)
 		if err := h.db.UpdateSyncStatus(s.Name, newSyncStatus, syncError); err != nil {
 			return
 		}
@@ -205,6 +228,27 @@ func (h *HealthMonitor) checkSpriteSync(s *store.Sprite) {
 				Type:       "sync_status",
 				SpriteName: s.Name,
 			})
+		}
+	}
+
+	// Periodic reset: if the session has been stable ("watching") long enough,
+	// reset it to force a full rescan. This catches drift from atomic file
+	// operations (common in .git/) that filesystem watchers can miss.
+	if newSyncStatus == "watching" {
+		h.lastResetMu.RLock()
+		last, exists := h.lastReset[s.Name]
+		h.lastResetMu.RUnlock()
+
+		if !exists || time.Since(last) > syncResetInterval {
+			slog.Info("health: periodic sync reset (forcing rescan)",
+				"sprite", s.Name, "last_reset", last)
+			if err := spSync.ResetMutagenSession(s.Name); err != nil {
+				slog.Warn("health: periodic reset failed", "sprite", s.Name, "error", err)
+			} else {
+				h.lastResetMu.Lock()
+				h.lastReset[s.Name] = time.Now()
+				h.lastResetMu.Unlock()
+			}
 		}
 	}
 }
