@@ -176,7 +176,6 @@ func NewModel(client *daemon.Client, opts FilterOptions) Model {
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.fetchSprites,
-		tea.SetWindowTitle("sp"),
 		tickCmd(),
 		binaryCheckCmd(),
 	)
