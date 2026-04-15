@@ -56,12 +56,18 @@ func TestSanitizeName(t *testing.T) {
 }
 
 func TestResolveRepo(t *testing.T) {
-	result, err := ResolveRepo("superfly/flyctl")
+	result, err := ResolveRepo("superfly/flyctl", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.SpriteName != "gh-superfly--flyctl" {
 		t.Errorf("sprite name = %q, want %q", result.SpriteName, "gh-superfly--flyctl")
+	}
+	if result.BaseName != "gh-superfly--flyctl" {
+		t.Errorf("base name = %q, want %q", result.BaseName, "gh-superfly--flyctl")
+	}
+	if result.Variant != "" {
+		t.Errorf("variant should be empty, got %q", result.Variant)
 	}
 	if result.RemotePath != "/home/sprite/flyctl" {
 		t.Errorf("remote path = %q, want %q", result.RemotePath, "/home/sprite/flyctl")
@@ -71,8 +77,27 @@ func TestResolveRepo(t *testing.T) {
 	}
 }
 
+func TestResolveRepoWithVariant(t *testing.T) {
+	result, err := ResolveRepo("superfly/flyctl", "Auth.Ideas")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.SpriteName != "gh-superfly--flyctl--auth-ideas" {
+		t.Errorf("sprite name = %q, want %q", result.SpriteName, "gh-superfly--flyctl--auth-ideas")
+	}
+	if result.BaseName != "gh-superfly--flyctl" {
+		t.Errorf("base name = %q, want %q", result.BaseName, "gh-superfly--flyctl")
+	}
+	if result.Variant != "auth-ideas" {
+		t.Errorf("variant = %q, want %q", result.Variant, "auth-ideas")
+	}
+	if result.RemotePath != "/home/sprite/flyctl" {
+		t.Errorf("remote path should be unchanged by variant, got %q", result.RemotePath)
+	}
+}
+
 func TestResolveRepoInvalid(t *testing.T) {
-	_, err := ResolveRepo("noslash")
+	_, err := ResolveRepo("noslash", "")
 	if err == nil {
 		t.Error("expected error for invalid repo format")
 	}
@@ -85,7 +110,7 @@ func TestResolvePathWithSpriteFile(t *testing.T) {
 		t.Fatalf("writing .sprite file: %v", err)
 	}
 
-	result, err := ResolvePath(dir)
+	result, err := ResolvePath(dir, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -97,6 +122,28 @@ func TestResolvePathWithSpriteFile(t *testing.T) {
 	}
 }
 
+func TestResolvePathWithSpriteFileAndVariant(t *testing.T) {
+	dir := t.TempDir()
+	spriteContent := `{"organization":"test-org","sprite":"my-custom-sprite"}`
+	if err := os.WriteFile(filepath.Join(dir, ".sprite"), []byte(spriteContent), 0o644); err != nil {
+		t.Fatalf("writing .sprite file: %v", err)
+	}
+
+	result, err := ResolvePath(dir, "scratch")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.SpriteName != "my-custom-sprite--scratch" {
+		t.Errorf("sprite name = %q, want %q", result.SpriteName, "my-custom-sprite--scratch")
+	}
+	if result.BaseName != "my-custom-sprite" {
+		t.Errorf("base name = %q, want %q", result.BaseName, "my-custom-sprite")
+	}
+	if result.Variant != "scratch" {
+		t.Errorf("variant = %q, want %q", result.Variant, "scratch")
+	}
+}
+
 func TestResolvePathFallbackToBasename(t *testing.T) {
 	// Create a directory that is NOT a git repo and has no .sprite file
 	dir := t.TempDir()
@@ -105,7 +152,7 @@ func TestResolvePathFallbackToBasename(t *testing.T) {
 		t.Fatalf("creating subdir: %v", err)
 	}
 
-	result, err := ResolvePath(subdir)
+	result, err := ResolvePath(subdir, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,5 +161,24 @@ func TestResolvePathFallbackToBasename(t *testing.T) {
 	}
 	if result.RemotePath != "/home/sprite/my-project" {
 		t.Errorf("remote path = %q, want %q", result.RemotePath, "/home/sprite/my-project")
+	}
+}
+
+func TestResolvePathFallbackWithVariant(t *testing.T) {
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "my-project")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("creating subdir: %v", err)
+	}
+
+	result, err := ResolvePath(subdir, "try-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.SpriteName != "local-my-project--try-1" {
+		t.Errorf("sprite name = %q, want %q", result.SpriteName, "local-my-project--try-1")
+	}
+	if result.BaseName != "local-my-project" {
+		t.Errorf("base name = %q, want %q", result.BaseName, "local-my-project")
 	}
 }

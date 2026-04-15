@@ -27,9 +27,18 @@ type Sprite struct {
 	Status     string // running, warm, cold, unknown
 	SyncStatus string // syncing, watching, error, disconnected, none
 	SyncError  string
-	LastSeen   time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// Variant is a free-form label appended to the sprite name when spawning
+	// a parallel experiment ("sp . scratch-idea"). Empty for regular sprites.
+	Variant string
+	// BaseName is the sprite name without the variant suffix. Equal to Name
+	// when Variant is empty. Indexed for "list all variants of this base" queries.
+	BaseName string
+	// Pinned marks a variant sprite as graduated from the throwaway pool;
+	// `sp prune` skips pinned variants. Meaningless for non-variant sprites.
+	Pinned    bool
+	LastSeen  time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // SyncSession tracks the state of a Mutagen sync session for a sprite.
@@ -143,7 +152,54 @@ func (d *DB) migrate() error {
 			return fmt.Errorf("migration failed: %w", err)
 		}
 	}
+
+	// Additive column migrations for the variant feature. These run after the
+	// base migrations so they work on both fresh and existing databases.
+	additions := []struct {
+		column string
+		ddl    string
+	}{
+		{"variant", `ALTER TABLE sprites ADD COLUMN variant TEXT DEFAULT ''`},
+		{"base_name", `ALTER TABLE sprites ADD COLUMN base_name TEXT DEFAULT ''`},
+		{"pinned", `ALTER TABLE sprites ADD COLUMN pinned BOOLEAN DEFAULT 0`},
+	}
+	for _, a := range additions {
+		if err := d.addColumnIfMissing("sprites", a.column, a.ddl); err != nil {
+			return fmt.Errorf("adding column %s: %w", a.column, err)
+		}
+	}
 	return nil
+}
+
+// addColumnIfMissing runs an ALTER TABLE only if the column doesn't already
+// exist. SQLite lacks ADD COLUMN IF NOT EXISTS, so we inspect PRAGMA table_info.
+func (d *DB) addColumnIfMissing(table, column, ddl string) error {
+	rows, err := d.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("inspecting %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			colType    string
+			notNull    int
+			dfltValue  sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = d.db.Exec(ddl)
+	return err
 }
 
 // SQL returns the underlying *sql.DB for advanced queries. Use sparingly.

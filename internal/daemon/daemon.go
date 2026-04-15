@@ -317,6 +317,8 @@ func (d *Daemon) dispatch(ctx context.Context, clientID string, req *Request) Re
 		return d.handleUpdateSyncStatus(req.Params)
 	case "delete":
 		return d.handleDelete(req.Params)
+	case "set_pinned":
+		return d.handleSetPinned(req.Params)
 	case "tag":
 		return d.handleTag(req.Params)
 	case "untag":
@@ -780,6 +782,24 @@ func (d *Daemon) handleDelete(params json.RawMessage) Response {
 		return respondError(err.Error())
 	}
 	d.broadcast(StateUpdate{Type: "sprite_removed", SpriteName: req.Name})
+	return respondOK("ok")
+}
+
+// handleSetPinned sets the pinned flag on a sprite. Pinning is the opt-in
+// signal that a variant sprite has graduated and should not be swept by
+// `sp prune`.
+func (d *Daemon) handleSetPinned(params json.RawMessage) Response {
+	var req struct {
+		Name   string `json:"name"`
+		Pinned bool   `json:"pinned"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		return respondError(fmt.Sprintf("invalid params: %v", err))
+	}
+	if err := d.db.SetPinned(req.Name, req.Pinned); err != nil {
+		return respondError(err.Error())
+	}
+	d.broadcast(StateUpdate{Type: "sprite_updated", SpriteName: req.Name})
 	return respondOK("ok")
 }
 

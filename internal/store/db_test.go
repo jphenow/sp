@@ -304,6 +304,111 @@ func TestDeleteSprite(t *testing.T) {
 	}
 }
 
+func TestVariantAndPinned(t *testing.T) {
+	db := testDB(t)
+
+	// Base sprite and two variants
+	base := &Sprite{Name: "gh-fly--flyctl", BaseName: "gh-fly--flyctl", Status: "running"}
+	v1 := &Sprite{Name: "gh-fly--flyctl--auth-ideas", BaseName: "gh-fly--flyctl", Variant: "auth-ideas", Status: "running"}
+	v2 := &Sprite{Name: "gh-fly--flyctl--retry-thing", BaseName: "gh-fly--flyctl", Variant: "retry-thing", Status: "running"}
+	other := &Sprite{Name: "gh-fly--proxy", BaseName: "gh-fly--proxy", Status: "running"}
+
+	for _, s := range []*Sprite{base, v1, v2, other} {
+		if err := db.UpsertSprite(s); err != nil {
+			t.Fatalf("upsert %q: %v", s.Name, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Round-trip variant/base_name/pinned
+	got, err := db.GetSprite("gh-fly--flyctl--auth-ideas")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Variant != "auth-ideas" {
+		t.Errorf("variant = %q, want %q", got.Variant, "auth-ideas")
+	}
+	if got.BaseName != "gh-fly--flyctl" {
+		t.Errorf("base_name = %q, want %q", got.BaseName, "gh-fly--flyctl")
+	}
+	if got.Pinned {
+		t.Error("pinned should default to false")
+	}
+
+	t.Run("OnlyVariants", func(t *testing.T) {
+		got, err := db.ListSprites(ListOptions{OnlyVariants: true})
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("expected 2 variants, got %d", len(got))
+		}
+	})
+
+	t.Run("VariantsOf", func(t *testing.T) {
+		got, err := db.ListSprites(ListOptions{VariantsOf: "gh-fly--flyctl", OnlyVariants: true})
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("expected 2 variants of flyctl, got %d", len(got))
+		}
+	})
+
+	t.Run("SetPinned and OnlyUnpinned", func(t *testing.T) {
+		if err := db.SetPinned("gh-fly--flyctl--auth-ideas", true); err != nil {
+			t.Fatalf("set pinned: %v", err)
+		}
+		got, err := db.GetSprite("gh-fly--flyctl--auth-ideas")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if !got.Pinned {
+			t.Error("pinned should be true after SetPinned")
+		}
+
+		// Only unpinned variants should exclude the pinned one
+		unpinned, err := db.ListSprites(ListOptions{OnlyVariants: true, OnlyUnpinned: true})
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(unpinned) != 1 {
+			t.Errorf("expected 1 unpinned variant, got %d", len(unpinned))
+		}
+		if len(unpinned) > 0 && unpinned[0].Variant != "retry-thing" {
+			t.Errorf("unexpected unpinned variant: %q", unpinned[0].Variant)
+		}
+	})
+
+	t.Run("SetPinned nonexistent", func(t *testing.T) {
+		if err := db.SetPinned("nonexistent", true); err == nil {
+			t.Error("expected error for nonexistent sprite")
+		}
+	})
+
+	t.Run("OlderThan", func(t *testing.T) {
+		// Everything is very recent; a far-future threshold catches all
+		future := time.Now().Add(1 * time.Hour)
+		got, err := db.ListSprites(ListOptions{OlderThan: future})
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 4 {
+			t.Errorf("expected 4 sprites older than future, got %d", len(got))
+		}
+
+		// A past threshold catches nothing
+		past := time.Now().Add(-1 * time.Hour)
+		got, err = db.ListSprites(ListOptions{OlderThan: past})
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("expected 0 sprites older than past, got %d", len(got))
+		}
+	})
+}
+
 func TestSyncSession(t *testing.T) {
 	db := testDB(t)
 

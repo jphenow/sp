@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -15,8 +16,8 @@ func (d *DB) UpsertSprite(s *Sprite) error {
 	}
 	now := time.Now()
 	_, err := d.db.Exec(`
-		INSERT INTO sprites (name, local_path, remote_path, repo, org, sprite_id, url, status, sync_status, sync_error, last_seen, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sprites (name, local_path, remote_path, repo, org, sprite_id, url, status, sync_status, sync_error, variant, base_name, pinned, last_seen, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			local_path = CASE WHEN excluded.local_path != '' THEN excluded.local_path ELSE sprites.local_path END,
 			remote_path = CASE WHEN excluded.remote_path != '' THEN excluded.remote_path ELSE sprites.remote_path END,
@@ -27,12 +28,29 @@ func (d *DB) UpsertSprite(s *Sprite) error {
 			status = CASE WHEN excluded.status != '' AND excluded.status != 'unknown' THEN excluded.status ELSE sprites.status END,
 			sync_status = CASE WHEN excluded.sync_status != '' AND excluded.sync_status != 'none' THEN excluded.sync_status ELSE sprites.sync_status END,
 			sync_error = CASE WHEN excluded.sync_error != '' THEN excluded.sync_error ELSE sprites.sync_error END,
+			variant = CASE WHEN excluded.variant != '' THEN excluded.variant ELSE sprites.variant END,
+			base_name = CASE WHEN excluded.base_name != '' THEN excluded.base_name ELSE sprites.base_name END,
 			last_seen = excluded.last_seen,
 			updated_at = excluded.updated_at
 	`, s.Name, s.LocalPath, s.RemotePath, s.Repo, s.Org, s.SpriteID, s.URL,
-		s.Status, s.SyncStatus, s.SyncError, now, now, now)
+		s.Status, s.SyncStatus, s.SyncError, s.Variant, s.BaseName, s.Pinned, now, now, now)
 	if err != nil {
 		return fmt.Errorf("upserting sprite %q: %w", s.Name, err)
+	}
+	return nil
+}
+
+// SetPinned updates the pinned flag on a sprite. Pinning is the opt-in signal
+// that a variant sprite has graduated and should not be swept by `sp prune`.
+func (d *DB) SetPinned(name string, pinned bool) error {
+	res, err := d.db.Exec(`UPDATE sprites SET pinned = ?, updated_at = ? WHERE name = ?`,
+		pinned, time.Now(), name)
+	if err != nil {
+		return fmt.Errorf("setting pinned on %q: %w", name, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("sprite %q not found", name)
 	}
 	return nil
 }
@@ -42,10 +60,12 @@ func (d *DB) GetSprite(name string) (*Sprite, error) {
 	s := &Sprite{}
 	err := d.db.QueryRow(`
 		SELECT name, local_path, remote_path, repo, org, sprite_id, url,
-		       status, sync_status, sync_error, last_seen, created_at, updated_at
+		       status, sync_status, sync_error, variant, base_name, pinned,
+		       last_seen, created_at, updated_at
 		FROM sprites WHERE name = ?
 	`, name).Scan(&s.Name, &s.LocalPath, &s.RemotePath, &s.Repo, &s.Org,
 		&s.SpriteID, &s.URL, &s.Status, &s.SyncStatus, &s.SyncError,
+		&s.Variant, &s.BaseName, &s.Pinned,
 		&s.LastSeen, &s.CreatedAt, &s.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -59,9 +79,10 @@ func (d *DB) GetSprite(name string) (*Sprite, error) {
 // ListSprites returns all sprites, optionally filtered by tags and/or path prefix.
 func (d *DB) ListSprites(opts ListOptions) ([]*Sprite, error) {
 	query := `SELECT s.name, s.local_path, s.remote_path, s.repo, s.org, s.sprite_id, s.url,
-	                 s.status, s.sync_status, s.sync_error, s.last_seen, s.created_at, s.updated_at
+	                 s.status, s.sync_status, s.sync_error, s.variant, s.base_name, s.pinned,
+	                 s.last_seen, s.created_at, s.updated_at
 	          FROM sprites s`
-	var args []interface{}
+	var args []any
 	var wheres []string
 
 	// Always exclude sprites with empty names (can be created by buggy upserts)
@@ -69,15 +90,15 @@ func (d *DB) ListSprites(opts ListOptions) ([]*Sprite, error) {
 
 	if len(opts.Tags) > 0 {
 		query += ` INNER JOIN tags t ON t.sprite_name = s.name`
-		placeholders := ""
+		var ph strings.Builder
 		for i, tag := range opts.Tags {
 			if i > 0 {
-				placeholders += ", "
+				ph.WriteString(", ")
 			}
-			placeholders += "?"
+			ph.WriteString("?")
 			args = append(args, tag)
 		}
-		wheres = append(wheres, fmt.Sprintf("t.tag IN (%s)", placeholders))
+		wheres = append(wheres, fmt.Sprintf("t.tag IN (%s)", ph.String()))
 	}
 
 	if opts.PathPrefix != "" {
@@ -90,17 +111,37 @@ func (d *DB) ListSprites(opts ListOptions) ([]*Sprite, error) {
 		args = append(args, "%"+opts.NameFilter+"%")
 	}
 
-	for i, w := range wheres {
-		if i == 0 {
-			query += " WHERE " + w
-		} else {
-			query += " AND " + w
-		}
+	if opts.OnlyVariants {
+		wheres = append(wheres, "s.variant != ''")
 	}
 
-	query += " ORDER BY s.updated_at DESC"
+	if opts.VariantsOf != "" {
+		wheres = append(wheres, "s.base_name = ?")
+		args = append(args, opts.VariantsOf)
+	}
 
-	rows, err := d.db.Query(query, args...)
+	if opts.OnlyUnpinned {
+		wheres = append(wheres, "s.pinned = 0")
+	}
+
+	if !opts.OlderThan.IsZero() {
+		wheres = append(wheres, "s.updated_at < ?")
+		args = append(args, opts.OlderThan)
+	}
+
+	var qb strings.Builder
+	qb.WriteString(query)
+	for i, w := range wheres {
+		if i == 0 {
+			qb.WriteString(" WHERE ")
+		} else {
+			qb.WriteString(" AND ")
+		}
+		qb.WriteString(w)
+	}
+	qb.WriteString(" ORDER BY s.updated_at DESC")
+
+	rows, err := d.db.Query(qb.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing sprites: %w", err)
 	}
@@ -111,6 +152,7 @@ func (d *DB) ListSprites(opts ListOptions) ([]*Sprite, error) {
 		s := &Sprite{}
 		if err := rows.Scan(&s.Name, &s.LocalPath, &s.RemotePath, &s.Repo, &s.Org,
 			&s.SpriteID, &s.URL, &s.Status, &s.SyncStatus, &s.SyncError,
+			&s.Variant, &s.BaseName, &s.Pinned,
 			&s.LastSeen, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scanning sprite row: %w", err)
 		}
@@ -121,9 +163,13 @@ func (d *DB) ListSprites(opts ListOptions) ([]*Sprite, error) {
 
 // ListOptions specifies filters for listing sprites.
 type ListOptions struct {
-	Tags       []string // filter by any of these tags
-	PathPrefix string   // filter by local_path prefix
-	NameFilter string   // filter by name substring
+	Tags         []string  // filter by any of these tags (store.Tag labels, not variants)
+	PathPrefix   string    // filter by local_path prefix
+	NameFilter   string    // filter by name substring
+	OnlyVariants bool      // only return sprites with a non-empty variant
+	VariantsOf   string    // only return sprites with this base_name
+	OnlyUnpinned bool      // only return sprites where pinned = false
+	OlderThan    time.Time // only return sprites whose updated_at is before this time (zero = no filter)
 }
 
 // UpdateSpriteStatus updates only the remote status fields of a sprite.

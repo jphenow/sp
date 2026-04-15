@@ -145,6 +145,16 @@ func (c *Client) DeleteSprite(name string) error {
 	return err
 }
 
+// SetPinned toggles the pinned flag on a sprite. Pinned variant sprites are
+// excluded from `sp prune`, letting a graduated experiment stick around.
+func (c *Client) SetPinned(name string, pinned bool) error {
+	_, err := c.call("set_pinned", map[string]any{
+		"name":   name,
+		"pinned": pinned,
+	})
+	return err
+}
+
 // TagSprite adds a tag to a sprite.
 func (c *Client) TagSprite(name, tag string) error {
 	_, err := c.call("tag", map[string]string{"name": name, "tag": tag})
