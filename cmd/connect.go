@@ -9,10 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/jphenow/sp/internal/daemon"
+	"github.com/jphenow/sp/internal/progress"
 	"github.com/jphenow/sp/internal/setup"
 	"github.com/jphenow/sp/internal/sprite"
 	"github.com/jphenow/sp/internal/store"
@@ -20,25 +23,34 @@ import (
 )
 
 var (
-	noSync      bool
-	sessionName string
-	webMode     bool
-	webProxy    bool
-	webDevPort  int
-	execCmd     string
+	noSync       bool
+	sessionName  string
+	webMode      bool
+	webProxy     bool
+	webDevPort   int
+	execCmd      string
+	keepWarmDur  time.Duration
 )
 
 // connectCmd handles `sp .` and `sp owner/repo` — the core connect flow.
 var connectCmd = &cobra.Command{
-	Use:   "connect [target]",
+	Use:   "connect [target] [variant]",
 	Short: "Connect to a sprite environment (default command for sp . or sp owner/repo)",
 	Long: `Connect to a sprite environment with file syncing and a tmux session.
 
 Target can be:
   .           Current directory (detects GitHub remote or uses dirname)
   owner/repo  A GitHub repository
-  <name>      An existing sprite by name`,
-	Args: cobra.MaximumNArgs(1),
+  <name>      An existing sprite by name
+
+Optional variant is a free-form label that spawns a parallel sprite (the same
+base repo/dir, under a distinct sprite name). Use variants to run short-run
+ideas without disrupting your main sprite:
+  sp .            scratch-idea      # fresh sprite for the current repo
+  sp owner/repo   new-approach      # fresh sprite for owner/repo
+For "sp . <variant>", the current dir is uploaded once at creation but no
+ongoing sync runs — edits in the variant sprite stay in the sprite.`,
+	Args: cobra.RangeArgs(0, 2),
 	RunE: runConnect,
 }
 
@@ -49,31 +61,42 @@ func init() {
 	connectCmd.Flags().BoolVar(&webProxy, "web-proxy", false, "enable reverse proxy in front of opencode (routes /opencode to opencode, /* to dev server)")
 	connectCmd.Flags().IntVar(&webDevPort, "web-dev-port", 0, "development server port for proxy fallthrough (requires --web-proxy)")
 	connectCmd.Flags().StringVar(&execCmd, "exec", "", "command to run instead of bash")
+	connectCmd.Flags().DurationVar(&keepWarmDur, "keep-warm", 0, "spawn a background sentinel that holds the sprite warm for up to this duration after disconnect, exiting early if claude is idle for 60s (e.g. 1h, 30m). Default off.")
 
 	// Register connect as both a subcommand and the default action
 	rootCmd.AddCommand(connectCmd)
 }
 
-// resolveTarget determines what the user wants to connect to.
+// resolveTarget determines what the user wants to connect to. The second
+// positional argument, if present, is a free-form variant label that forks
+// the sprite identity (see connectCmd.Long).
 func resolveTarget(args []string) (*setup.ResolvedTarget, error) {
 	target := "."
+	variant := ""
 	if len(args) > 0 {
 		target = args[0]
+	}
+	if len(args) > 1 {
+		variant = args[1]
 	}
 
 	// Check if it's a path (. or starts with / or ./)
 	if target == "." || strings.HasPrefix(target, "/") || strings.HasPrefix(target, "./") {
-		return setup.ResolvePath(target)
+		return setup.ResolvePath(target, variant)
 	}
 
 	// Check if it looks like owner/repo
 	if strings.Contains(target, "/") {
-		return setup.ResolveRepo(target)
+		return setup.ResolveRepo(target, variant)
 	}
 
-	// Treat as sprite name
+	// Bare sprite name — variants only make sense with a base context, refuse.
+	if variant != "" {
+		return nil, fmt.Errorf("variant requires a path or owner/repo target, got bare sprite name %q", target)
+	}
 	return &setup.ResolvedTarget{
 		SpriteName: target,
+		BaseName:   target,
 		RemotePath: "/home/sprite",
 	}, nil
 }
@@ -104,52 +127,118 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking sprite: %w", err)
 	}
 
-	if !exists {
-		fmt.Println("Creating sprite...")
-		if err := client.Create(resolved.SpriteName); err != nil {
-			return fmt.Errorf("creating sprite: %w", err)
-		}
-
-		// Wait for sprite to be ready
-		fmt.Println("Waiting for sprite to be ready...")
-		if err := waitForSpriteReady(client, resolved.SpriteName); err != nil {
-			return fmt.Errorf("waiting for sprite: %w", err)
-		}
-
-		// Full setup for new sprites
-		fmt.Println("Setting up authentication...")
-		if err := setup.SetupSpriteAuth(client, resolved.SpriteName, token); err != nil {
-			return fmt.Errorf("setting up auth: %w", err)
-		}
-
-		fmt.Println("Configuring git...")
-		if err := setup.SetupGitConfig(client, resolved.SpriteName); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: git config failed: %v\n", err)
-		}
-
-		// Run setup.conf
-		conf, err := setup.ParseSetupConf(setup.DefaultConfPath())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: parsing setup.conf: %v\n", err)
-		}
-		if conf != nil {
-			fmt.Println("Running setup.conf...")
-			setup.RunSetupConf(client, resolved.SpriteName, conf)
-		}
-
-		// Sync local directory for new sprites
-		if resolved.LocalPath != "" && !noSync {
-			fmt.Println("Uploading initial files...")
-			if err := syncInitialFiles(client, resolved.SpriteName, resolved.LocalPath, resolved.RemotePath); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: initial sync failed: %v\n", err)
+	// Sequential prologue: create + wait + perms must happen in order
+	// before any parallel setup. Wrapped in a single spinner task so the
+	// user sees elapsed time but we don't accidentally parallelize steps
+	// that depend on each other (earlier bug: parallel perms-fix raced
+	// with the ready-check and waited 55s instead of piggybacking).
+	prologue := progress.New(verbose)
+	prologue.Add("Preparing sprite", func() error {
+		if !exists {
+			if err := client.Create(resolved.SpriteName); err != nil {
+				return fmt.Errorf("creating sprite: %w", err)
 			}
 		}
+		if err := waitForSpriteReady(client, resolved.SpriteName); err != nil {
+			return err
+		}
+		return setup.FixSpriteHomePermissions(client, resolved.SpriteName)
+	})
+	if err := prologue.Run(); err != nil {
+		return err
+	}
+
+	// Claude auth path decision (see prior implementation note): credentials
+	// file path is preferred when we have it, env-var fallback otherwise.
+	creds := setup.LocalClaudeCredentials()
+	authTokenForEnv := token
+	if creds != nil {
+		authTokenForEnv = ""
+	}
+
+	// Parallel setup. Five concurrent task chains:
+	//
+	//   1. Auth chain (SetupSpriteAuth → PushClaudeCredentials if creds →
+	//      SetupGhAuth → InstallOpenWrapper). All four touch shell rc files,
+	//      so they must serialize within this chain. Internal sed -i edits
+	//      against .bashrc would race if these ran in parallel.
+	//
+	//   2. Git config (writes ~/.gitconfig only — no rc-file conflict).
+	//
+	//   3. Claude config chain (PushClaudeConfig → EnsureSpriteClaudeSettings).
+	//      Both touch ~/.claude/, but only settings.json is shared between
+	//      them and Ensure must layer on top of the pushed file.
+	//
+	//   4. Repo clone (writes /home/sprite/<repo>/ only — independent).
+	//
+	//   5. New-sprite-only setup.conf + initial file upload, OR for existing
+	//      sprites the lighter "[always] files" copy. Independent.
+	parallel := progress.New(verbose)
+
+	parallel.Add("Setting up auth + gh + clone", func() error {
+		// Auth must complete before clone because the clone needs the SSH
+		// key and StrictHostKeyChecking=no config that auth deploys. These
+		// are chained in one parallel task so other tasks (config push,
+		// git config) run concurrently while this chain serializes.
+		if err := setup.SetupSpriteAuth(client, resolved.SpriteName, authTokenForEnv); err != nil {
+			return fmt.Errorf("sprite auth: %w", err)
+		}
+		if creds != nil {
+			if err := setup.PushClaudeCredentials(client, resolved.SpriteName, creds); err != nil {
+				return fmt.Errorf("claude credentials: %w", err)
+			}
+		}
+		if err := setup.SetupGhAuth(client, resolved.SpriteName); err != nil {
+			return fmt.Errorf("gh auth: %w", err)
+		}
+		if err := setup.InstallOpenWrapper(client, resolved.SpriteName); err != nil {
+			return fmt.Errorf("open wrapper: %w", err)
+		}
+		// Clone depends on SSH key from auth. Runs here instead of as a
+		// separate parallel task to avoid the race where clone fires
+		// before the key is deployed.
+		if resolved.Repo != "" && resolved.LocalPath == "" {
+			if err := cloneRepoOnSprite(client, resolved.SpriteName, resolved.Repo, resolved.RemotePath); err != nil {
+				return fmt.Errorf("clone repo: %w", err)
+			}
+		}
+		return nil
+	})
+
+	parallel.Add("Configuring git", func() error {
+		return setup.SetupGitConfig(client, resolved.SpriteName)
+	})
+
+	parallel.Add("Syncing Claude config", func() error {
+		if err := setup.PushClaudeConfig(client, resolved.SpriteName); err != nil {
+			return fmt.Errorf("push claude config: %w", err)
+		}
+		return setup.EnsureSpriteClaudeSettings(client, resolved.SpriteName)
+	})
+
+	if !exists {
+		parallel.Add("Running setup.conf", func() error {
+			conf, err := setup.ParseSetupConf(setup.DefaultConfPath())
+			if err != nil {
+				return fmt.Errorf("parse setup.conf: %w", err)
+			}
+			if conf != nil {
+				setup.RunSetupConf(client, resolved.SpriteName, conf)
+			}
+			if resolved.LocalPath != "" && !noSync {
+				if err := syncInitialFiles(client, resolved.SpriteName, resolved.LocalPath, resolved.RemotePath); err != nil {
+					return fmt.Errorf("initial sync: %w", err)
+				}
+			}
+			return nil
+		})
 	} else {
-		// Existing sprite: just copy [always] files
-		conf, err := setup.ParseSetupConf(setup.DefaultConfPath())
-		if err == nil && conf != nil {
-			alwaysFiles := setup.GetAlwaysFiles(conf)
-			for _, f := range alwaysFiles {
+		parallel.Add("Pushing [always] files", func() error {
+			conf, err := setup.ParseSetupConf(setup.DefaultConfPath())
+			if err != nil || conf == nil {
+				return nil // best-effort
+			}
+			for _, f := range setup.GetAlwaysFiles(conf) {
 				if _, err := os.Stat(f.Source); err == nil {
 					client.Exec(sprite.ExecOptions{
 						Sprite:  resolved.SpriteName,
@@ -158,12 +247,15 @@ func runConnect(cmd *cobra.Command, args []string) error {
 					})
 				}
 			}
-		}
+			return nil
+		})
 	}
 
-	// Install the OSC 9999 open wrapper for tmux passthrough (idempotent)
-	if err := setup.InstallOpenWrapper(client, resolved.SpriteName); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: open wrapper install failed: %v\n", err)
+	if err := parallel.Run(); err != nil {
+		// Don't fail the whole connect on a single setup-task error —
+		// the user probably still wants the shell. Surface the error to
+		// stderr (the spinner already showed the failed task) and keep going.
+		fmt.Fprintf(os.Stderr, "Warning: setup task failed: %v\n", err)
 	}
 
 	// Setup web service if requested — always reconfigure to ensure correct state
@@ -177,6 +269,13 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	// Register with daemon. The daemon owns the sync lifecycle — it will
 	// auto-start sync when the sprite is running and has local/remote paths.
 	// In web mode the daemon is required; in console mode it's best-effort.
+	//
+	// Variant sprites (sp . scratch-idea) are deliberately NOT synced after
+	// the initial upload: they're throwaway parallel environments, and
+	// running a second mutagen session against the same local dir would
+	// fight the base sprite's sync. `registerWithDaemon` already strips
+	// LocalPath for variants; here we also skip the inline-sync fallback
+	// and the "daemon will manage sync" banner.
 	if err := registerWithDaemon(resolved, client); err != nil {
 		if webMode {
 			return fmt.Errorf("daemon required for --web: %w", err)
@@ -185,7 +284,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 		// Fallback: inline sync for console mode when daemon is unavailable.
 		// The proxy dies with this process, so it only works while sp is running.
-		if !noSync && resolved.LocalPath != "" {
+		if !noSync && resolved.LocalPath != "" && resolved.Variant == "" {
 			fmt.Println("Starting inline file sync (no daemon)...")
 			go func() {
 				if err := startSyncInline(client, resolved); err != nil {
@@ -193,8 +292,19 @@ func runConnect(cmd *cobra.Command, args []string) error {
 				}
 			}()
 		}
-	} else if !noSync && resolved.LocalPath != "" {
+	} else if !noSync && resolved.LocalPath != "" && resolved.Variant == "" {
 		fmt.Println("Daemon will manage file sync.")
+	}
+
+	if resolved.Variant != "" {
+		switch {
+		case !exists && resolved.LocalPath != "":
+			fmt.Printf("Variant %q: initial files uploaded, no ongoing sync. Edit inside the sprite.\n", resolved.Variant)
+		case !exists:
+			fmt.Printf("Variant %q: fresh sprite, no local sync.\n", resolved.Variant)
+		default:
+			fmt.Printf("Variant %q: attached (no local sync).\n", resolved.Variant)
+		}
 	}
 
 	// In web mode, don't open a console — just return after setup.
@@ -208,8 +318,24 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Connect to sprite shell
-	return execInSprite(client, resolved, token)
+	// Spawn the keep-warm sentinel BEFORE the foreground exec — once we
+	// hand off to execInSprite the current process is essentially blocked
+	// on tmux until the user disconnects, and we want the sentinel to
+	// already be running so it covers the disconnect window.
+	if keepWarmDur > 0 {
+		if err := startKeepWarmSentinel(resolved.SpriteName, resolved.Org, keepWarmDur); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: starting keep-warm sentinel: %v\n", err)
+		} else if verbose {
+			fmt.Fprintf(os.Stderr, "Keep-warm sentinel started (max %s, exits early when claude is idle for 60s)\n", keepWarmDur)
+		}
+	}
+
+	// Connect to sprite shell. Pass authTokenForEnv (empty when we pushed
+	// a credentials.json) so execInSprite knows whether to inject the
+	// CLAUDE_CODE_OAUTH_TOKEN env var / tmux setenv. Injecting it
+	// alongside credentials.json would mask the file and defeat
+	// auto-refresh.
+	return execInSprite(client, resolved, authTokenForEnv)
 }
 
 // defaultOpencodePort is the port opencode web listens on inside the sprite.
@@ -353,6 +479,87 @@ func setupWebServiceProxy(client *sprite.Client, spriteName string) error {
 	return nil
 }
 
+// startKeepWarmSentinel spawns a backgrounded sprite-exec process that
+// runs a watcher script on the sprite. The watcher hashes the active
+// tmux pane every 10 seconds; when the hash is stable for 60s the
+// watcher assumes claude (or whatever is in the foreground) has
+// reached a prompt/idle state and exits. Otherwise it runs until the
+// duration deadline.
+//
+// The mechanism that keeps the sprite warm is the sprite-exec connection
+// itself: as long as a sprite-exec process is talking to the sprite,
+// sprite-env counts it as an active client and the underlying Fly
+// machine doesn't auto-stop. When the watcher script exits, the
+// sprite-exec connection closes and (assuming no other clients) the
+// machine eventually cold-stops normally.
+//
+// The local sprite-exec process is detached from sp's process group
+// via Setpgid + redirected stdio so it survives the foreground sp
+// process exiting (e.g. when the user closes their tmux session).
+//
+// Idempotent: any prior keep-warm watcher on the same sprite is killed
+// at the start of the script via pkill against an embedded marker, so
+// reconnects don't accumulate watchers.
+func startKeepWarmSentinel(spriteName, org string, dur time.Duration) error {
+	if dur <= 0 {
+		return nil
+	}
+	deadline := time.Now().Add(dur).Unix()
+
+	// Marker is grep'd by pkill to identify our watchers across sp runs.
+	// Embedded as a comment in the script body so it appears in the
+	// process command line that pkill -f matches against.
+	const marker = "SP_KEEPWARM_MARKER_v1"
+	const idleTicks = 6 // 6 * 10s = 60s of pane stability before declaring idle
+	script := fmt.Sprintf(`
+# %s
+# Kill any existing keep-warm watchers from prior sp runs.
+pkill -f '%s' 2>/dev/null || true
+DEADLINE=%d
+LAST_HASH=""
+IDLE_COUNT=0
+while [ "$(date +%%s)" -lt "$DEADLINE" ]; do
+    HASH=$(tmux capture-pane -t bash -p 2>/dev/null | sha256sum | cut -d' ' -f1)
+    if [ "$HASH" = "$LAST_HASH" ]; then
+        IDLE_COUNT=$((IDLE_COUNT + 1))
+        if [ "$IDLE_COUNT" -ge %d ]; then
+            exit 0
+        fi
+    else
+        IDLE_COUNT=0
+    fi
+    LAST_HASH="$HASH"
+    sleep 10
+done
+`, marker, marker, deadline, idleTicks)
+
+	args := []string{"exec"}
+	if org != "" {
+		args = append(args, "-o", org)
+	}
+	args = append(args, "-s", spriteName, "sh", "-c", script)
+
+	cmd := exec.Command("sprite", args...)
+	// Setpgid puts the child in its own process group so SIGHUP from sp's
+	// controlling terminal at exit doesn't propagate to it. Redirected
+	// stdio severs any inherited ttys.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting keep-warm sentinel: %w", err)
+	}
+	// Release so the runtime doesn't track the child after we leave the
+	// function. The child becomes a zombie when it exits, eventually
+	// reaped by init. We don't care about its exit code.
+	if err := cmd.Process.Release(); err != nil {
+		return fmt.Errorf("releasing keep-warm sentinel: %w", err)
+	}
+	return nil
+}
+
 // waitForSpriteReady polls until the sprite responds to commands.
 func waitForSpriteReady(client *sprite.Client, name string) error {
 	for i := 0; i < 60; i++ {
@@ -363,9 +570,99 @@ func waitForSpriteReady(client *sprite.Client, name string) error {
 		if err == nil {
 			return nil
 		}
-		fmt.Print(".")
+		// Previously printed a `.` per retry, but the spinner now provides
+		// progress indication so the dots would interleave with the live
+		// render. Verbose mode could re-add this if useful, but for now
+		// the spinner duration counter suffices.
 	}
 	return fmt.Errorf("sprite did not become ready within 60 seconds")
+}
+
+// cloneRepoOnSprite runs `git clone` inside the sprite for the given GitHub
+// owner/repo. Uses the SSH URL so the deployed key from SetupSpriteAuth is
+// picked up (SetupGitConfig also rewrites HTTPS GitHub URLs to SSH as a
+// safety net). Handles three pre-states of the target directory:
+//
+//   - doesn't exist: git clone creates it
+//   - exists and is already a git repo: skipped (idempotent)
+//   - exists and is empty: rmdir'd first so git clone has a clean slate —
+//     git *does* allow cloning into an existing empty dir, but removing it
+//     first avoids any subtle differences in git version behavior
+//   - exists and is non-empty and not a repo: error with a clear message
+//
+// All four states are handled in a single shell script so we only pay one
+// round trip to the sprite.
+func cloneRepoOnSprite(client *sprite.Client, spriteName, ownerRepo, remoteDir string) error {
+	sshURL := fmt.Sprintf("git@github.com:%s.git", ownerRepo)
+	parent, _ := splitRemoteDir(remoteDir)
+	q := shellQuote
+	// Consolidated pre-check + clone. Exit codes:
+	//   0   success (cloned or already present)
+	//   2   target exists as non-repo with content (user must resolve)
+	//   3   git clone itself failed
+	script := fmt.Sprintf(`
+set -e
+DIR=%s
+PARENT=%s
+URL=%s
+
+if [ -d "$DIR/.git" ]; then
+  echo "sp: repo already present at $DIR"
+  exit 0
+fi
+
+if [ -d "$DIR" ]; then
+  if [ -z "$(ls -A "$DIR" 2>/dev/null)" ]; then
+    echo "sp: removing empty $DIR so git clone can create it"
+    rmdir "$DIR"
+  else
+    echo "sp: $DIR exists and is not empty and is not a git repo — refusing to clobber" >&2
+    ls -la "$DIR" >&2
+    exit 2
+  fi
+fi
+
+mkdir -p "$PARENT"
+cd "$PARENT"
+echo "sp: cloning $URL into $DIR"
+git clone --recurse-submodules "$URL" "$(basename "$DIR")" || exit 3
+`, q(remoteDir), q(parent), q(sshURL))
+
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", script},
+	})
+	// In verbose mode, surface the script's status output ("sp: cloning…",
+	// "sp: repo already present", etc.) so users can see what happened.
+	// In spinner mode the print would interleave with the live frame, so
+	// the spinner's task name + duration carries the signal instead.
+	if verbose {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			fmt.Fprintln(os.Stderr, trimmed)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("clone script: %w\n%s", err, string(out))
+	}
+	return nil
+}
+
+// splitRemoteDir splits a remote dir into its parent and last segment.
+// "/home/sprite/gameservers" -> ("/home/sprite", "gameservers"). Defaults
+// to ("/home/sprite", "repo") if the path is malformed.
+func splitRemoteDir(p string) (parent, target string) {
+	p = strings.TrimRight(p, "/")
+	idx := strings.LastIndex(p, "/")
+	if idx <= 0 {
+		return "/home/sprite", "repo"
+	}
+	return p[:idx], p[idx+1:]
+}
+
+// shellQuote wraps a string in single quotes for safe interpolation into a
+// sh -c command string, escaping embedded single quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // syncInitialFiles creates a tar of the local directory and uploads it to the sprite.
@@ -469,12 +766,24 @@ func registerWithDaemon(resolved *setup.ResolvedTarget, client *sprite.Client) e
 	}
 	defer dc.Close()
 
+	// Variant sprites with a local path get an initial one-shot upload at
+	// creation (see runConnect) and then run unsynced — they should NOT be
+	// registered with a LocalPath, or the daemon will start an ongoing mutagen
+	// session that conflicts with the base sprite's sync. Storing the base's
+	// LocalPath on a variant would also give the daemon a sibling to watch.
+	localPath := resolved.LocalPath
+	if resolved.Variant != "" {
+		localPath = ""
+	}
+
 	s := &store.Sprite{
 		Name:       resolved.SpriteName,
-		LocalPath:  resolved.LocalPath,
+		LocalPath:  localPath,
 		RemotePath: resolved.RemotePath,
 		Repo:       resolved.Repo,
 		Org:        resolved.Org,
+		Variant:    resolved.Variant,
+		BaseName:   resolved.BaseName,
 		Status:     "running",
 		SyncStatus: "none",
 	}
@@ -538,7 +847,82 @@ func startSyncInline(client *sprite.Client, resolved *setup.ResolvedTarget) erro
 }
 
 // execInSprite connects to the sprite with a tmux session.
+// execInSprite connects to the sprite with a tmux session. On the first
+// connect a new sprite-exec persistent session is created (TTY sessions
+// are kept alive by sprite-env even after the client disconnects). On
+// subsequent connects we detect the existing session and reattach via
+// `sprite attach`, which means tmux, claude, and anything else running
+// inside the session survive network drops and reconnects.
 func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token string) error {
+	// Check for an existing persistent session from a prior connect.
+	// If found, reattach directly — tmux + claude are still running.
+	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" {
+		fmt.Printf("Reattaching to session %s...\n", sessionID)
+		return attachToSpriteSession(resolved.SpriteName, resolved.Org, sessionID)
+	}
+
+	// No existing session — create a new one with the full tmux setup.
+	return createSpriteSession(client, resolved, token)
+}
+
+// findExistingSpriteSession queries sprite sessions list and returns the
+// ID of the first active session, or "" if none. Parsing is simple:
+// look for the first line whose first whitespace-delimited field is
+// numeric (session IDs are integers).
+func findExistingSpriteSession(spriteName, org string) string {
+	args := []string{"sessions", "list"}
+	if org != "" {
+		args = append(args, "-o", org)
+	}
+	args = append(args, "-s", spriteName)
+
+	out, err := exec.Command("sprite", args...).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if _, err := fmt.Sscanf(fields[0], "%d", new(int)); err == nil {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+// attachToSpriteSession reattaches to an existing sprite-env session by
+// its numeric ID via `sprite attach`. The running tmux + claude inside
+// the session are exactly where the user left them.
+func attachToSpriteSession(spriteName, org, sessionID string) error {
+	args := []string{"attach", sessionID}
+	if org != "" {
+		args = append(args, "-o", org)
+	}
+	args = append(args, "-s", spriteName)
+
+	binary, err := exec.LookPath("sprite")
+	if err != nil {
+		return fmt.Errorf("sprite binary not found: %w", err)
+	}
+
+	cmd := exec.Command(binary, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	runErr := cmd.Run()
+	resetTerminal()
+	return runErr
+}
+
+// createSpriteSession creates a brand-new sprite-exec persistent session
+// running tmux. Sprite-env keeps TTY sessions alive even after the
+// client disconnects, so the tmux server (and claude inside it) survive
+// network drops. On the next connect, execInSprite will detect the
+// existing session via findExistingSpriteSession and reattach.
+func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, token string) error {
 	command := "bash"
 	if execCmd != "" {
 		command = execCmd
@@ -550,47 +934,67 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 		tmuxSession = strings.ReplaceAll(command, " ", "-")
 		tmuxSession = strings.ReplaceAll(tmuxSession, ".", "-")
 		tmuxSession = strings.ReplaceAll(tmuxSession, ":", "-")
-		// Use just the first word as session name
 		if parts := strings.Fields(tmuxSession); len(parts) > 0 {
 			tmuxSession = parts[0]
 		}
 	}
 
-	shellCmd := fmt.Sprintf(
-		"mkdir -p '%s' && cd '%s' && exec tmux new-session -A -s '%s' %s",
-		resolved.RemotePath, resolved.RemotePath, tmuxSession, command,
-	)
+	// Ensure the target dir exists
+	if _, err := client.Exec(sprite.ExecOptions{
+		Sprite:  resolved.SpriteName,
+		Command: []string{"mkdir", "-p", resolved.RemotePath},
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: mkdir -p %s failed: %v\n", resolved.RemotePath, err)
+	}
 
-	env := map[string]string{
-		"CLAUDE_CODE_OAUTH_TOKEN": token,
+	// Build the per-tool tmux setenv lines.
+	ghToken := setup.LocalGhToken()
+	claudeSetenv := "tmux setenv -gu CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true\n"
+	if token != "" {
+		claudeSetenv = fmt.Sprintf("tmux setenv -g CLAUDE_CODE_OAUTH_TOKEN %s 2>/dev/null || true\n", shellQuote(token))
+	}
+	ghSetenv := ""
+	if ghToken != "" {
+		ghSetenv = fmt.Sprintf("tmux setenv -g GH_TOKEN %s 2>/dev/null || true\n", shellQuote(ghToken))
+	}
+
+	shellCmd := fmt.Sprintf(`
+tmux start-server 2>/dev/null || true
+tmux set -g allow-passthrough on 2>/dev/null || true
+for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
+  tmux setenv -gu "$v" 2>/dev/null || true
+done
+%s%sexec tmux new-session -A -s %s -c %s %s
+`, claudeSetenv, ghSetenv, shellQuote(tmuxSession), shellQuote(resolved.RemotePath), command)
+
+	env := map[string]string{}
+	if token != "" {
+		env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+	}
+	if ghToken != "" {
+		env["GH_TOKEN"] = ghToken
 	}
 
 	args := client.BuildExecArgs(sprite.ExecOptions{
 		Sprite:  resolved.SpriteName,
 		TTY:     true,
+		Dir:     resolved.RemotePath,
 		Env:     env,
 		Command: []string{"sh", "-c", shellCmd},
 	})
 
-	// Replace current process with sprite exec
 	binary, err := exec.LookPath("sprite")
 	if err != nil {
 		return fmt.Errorf("sprite binary not found: %w", err)
 	}
 
-	// Use syscall.Exec-like behavior via os/exec
 	cmd := exec.Command(binary, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	runErr := cmd.Run()
-
-	// Reset terminal after disconnect. Remote tmux may have enabled SGR mouse
-	// tracking modes (1000/1003/1006) which persist after the connection drops,
-	// causing raw escape sequences to appear on scroll/click.
 	resetTerminal()
-
 	return runErr
 }
 

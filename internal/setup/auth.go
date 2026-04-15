@@ -2,9 +2,14 @@ package setup
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/jphenow/sp/internal/sprite"
@@ -73,8 +78,318 @@ func isValidToken(token string) bool {
 	return strings.HasPrefix(token, "sk-ant-oat01-") && len(token) >= 100
 }
 
-// SetupSpriteAuth provisions SSH keys, Claude token, and shell config on a sprite.
-// This mirrors the Bash script's setup_sprite_auth function.
+// LocalClaudeCredentials returns the raw Claude Code OAuth credentials
+// JSON from the user's local machine, or nil if no credentials are
+// available. On macOS the credentials live in Keychain (service name
+// "Claude Code-credentials"); on Linux they live in a plain file at
+// ~/.claude/.credentials.json. Both paths produce the same JSON shape:
+//
+//	{"claudeAiOauth":{"accessToken":"...","refreshToken":"...",
+//	                   "expiresAt":<int>,"scopes":[...],
+//	                   "subscriptionType":"...","rateLimitTier":"..."}}
+//
+// The refreshToken is the durable part: pushed to a sprite, Claude Code
+// on the sprite can auto-refresh the access token without user
+// interaction, which is strictly better than the `claude setup-token`
+// path (those tokens have tight quota limits and expire within a day).
+//
+// Returns nil on any error — missing keychain entry, missing file,
+// permission denied, etc. The caller should treat nil as "fall back to
+// the legacy CLAUDE_CODE_OAUTH_TOKEN path" rather than "fatal error".
+func LocalClaudeCredentials() []byte {
+	switch runtime.GOOS {
+	case "darwin":
+		return readClaudeCredentialsKeychain()
+	case "linux":
+		return readClaudeCredentialsFile()
+	default:
+		return nil
+	}
+}
+
+// readClaudeCredentialsKeychain pulls the credentials blob out of the
+// macOS Keychain. The Keychain entry is created by Claude Code on login
+// and updated whenever the access token refreshes, so reading it on
+// each connect picks up the freshest credentials automatically.
+//
+// Note: the first time `security` reads the entry for a process it may
+// prompt the user for Keychain access. Subsequent reads from the same
+// binary can be allowlisted ("Always Allow"). If the user denies or
+// cancels the prompt, security exits non-zero and we return nil.
+func readClaudeCredentialsKeychain() []byte {
+	u, err := user.Current()
+	if err != nil {
+		return nil
+	}
+	cmd := exec.Command("security",
+		"find-generic-password",
+		"-s", "Claude Code-credentials",
+		"-a", u.Username,
+		"-w")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	return bytes.TrimSpace(out)
+}
+
+// readClaudeCredentialsFile reads the credentials file that Claude Code
+// writes on Linux. Path is fixed at ~/.claude/.credentials.json.
+func readClaudeCredentialsFile() []byte {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".claude", ".credentials.json"))
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// EnsureSpriteClaudeSettings merges bypass-permissions defaults into the
+// sprite's ~/.claude/settings.json. This is sprite-scoped — the user's
+// local settings.json is never modified. PushClaudeConfig runs first
+// and drops the local settings.json onto the sprite verbatim; this
+// function then augments it with sprite-specific bypass defaults.
+//
+// Two fields are merged under `permissions`:
+//
+//   - defaultMode = "bypassPermissions": makes `claude` default to
+//     bypass mode without needing the --dangerously-skip-permissions
+//     flag. Sprites are disposable environments where per-tool approval
+//     prompts are friction, not safety.
+//
+//   - skipDangerousModePermissionPrompt = true: pre-accepts the
+//     one-time "Bypass Permissions mode" consent dialog so claude
+//     starts straight into the session instead of asking to confirm.
+//
+// Idempotent: re-running just re-writes the same keys. Uses python3
+// for JSON-safe merging — sed/awk would be fragile against arbitrary
+// pre-existing settings.json structures. python3 is on essentially
+// every modern Linux sprite image.
+func EnsureSpriteClaudeSettings(client *sprite.Client, spriteName string) error {
+	home, _ := os.UserHomeDir()
+
+	// The python script is embedded as a here-doc to keep the JSON
+	// manipulation logic readable and to avoid any shell-level escaping
+	// headaches around the nested quotes in dict key access.
+	//
+	// It does three things:
+	//   1. Merges bypass-permissions defaults (defaultMode + skipPrompt).
+	//   2. Rewrites any statusLine.command path that references the user's
+	//      LOCAL home directory to /home/sprite — PushClaudeConfig copies
+	//      settings.json verbatim from local, so statusLine paths like
+	//      "/Users/jon/.claude/statusline-command.sh" wouldn't exist on
+	//      the sprite without this fixup.
+	//   3. Writes the result back with indent for readability.
+	script := fmt.Sprintf(`mkdir -p ~/.claude
+python3 <<'PYEOF'
+import json, os, re
+p = os.path.expanduser("~/.claude/settings.json")
+try:
+    with open(p) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+
+# 1. Bypass permissions
+perm = d.setdefault("permissions", {})
+if not isinstance(perm, dict):
+    perm = {}
+    d["permissions"] = perm
+perm["defaultMode"] = "bypassPermissions"
+perm["skipDangerousModePermissionPrompt"] = True
+
+# 2. Fix statusLine.command path: replace local home with sprite home
+LOCAL_HOME = %q
+sl = d.get("statusLine")
+if isinstance(sl, dict) and "command" in sl:
+    sl["command"] = sl["command"].replace(LOCAL_HOME, "/home/sprite")
+
+with open(p, "w") as f:
+    json.dump(d, f, indent=2)
+PYEOF
+`, home)
+	_, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", script},
+	})
+	return err
+}
+
+// PushClaudeCredentials writes the raw Claude OAuth credentials JSON to
+// ~/.claude/.credentials.json on the sprite with 600 perms. Meant to be
+// called with the output of LocalClaudeCredentials; caller decides
+// whether the bytes are worth pushing.
+//
+// Implementation note: the credentials are base64-encoded into a shell
+// command and decoded on the sprite via `base64 -d`, NOT uploaded via
+// `sprite exec -file`. The reason is that the -file upload path on the
+// sprite runtime creates files (and any auto-created parent directories)
+// owned by `ubuntu:ubuntu`, not the sprite user. With ~/.claude ending
+// up as ubuntu:700, the sprite user can't even traverse it, so claude
+// gets "Permission denied" when trying to read its own credentials and
+// silently falls back to an interactive login. Shell-redirect writes
+// run as the sprite user and produce sprite-owned files, sidestepping
+// the entire ownership tangle.
+//
+// After this runs, the sprite's claude will read credentials from the
+// file (position 6 in the auth precedence hierarchy) and use the
+// embedded refreshToken to auto-refresh the accessToken as needed.
+// CLAUDE_CODE_OAUTH_TOKEN should NOT be set in the same session —
+// it sits at position 5 and would mask the file, preventing refresh
+// when the access token in the env var goes stale.
+func PushClaudeCredentials(client *sprite.Client, spriteName string, creds []byte) error {
+	if len(creds) == 0 {
+		return fmt.Errorf("empty credentials blob")
+	}
+	// Base64 in standard encoding has no shell-special characters, so
+	// it's safe to interpolate into a sh -c command without quoting.
+	encoded := base64.StdEncoding.EncodeToString(creds)
+	script := fmt.Sprintf(`
+mkdir -p ~/.claude
+chmod 700 ~/.claude
+printf '%%s' '%s' | base64 -d > ~/.claude/.credentials.json
+chmod 600 ~/.claude/.credentials.json
+`, encoded)
+	_, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", script},
+	})
+	return err
+}
+
+// LocalGhToken returns the user's active gh OAuth token from their local
+// gh installation, or the empty string if gh is not installed or not
+// authenticated. `gh auth token` prints the active token regardless of
+// whether gh stores it in a file (Linux) or keyring (macOS), which is
+// critical: on macOS the ~/.config/gh/hosts.yml file has no oauth_token
+// field at all — the token lives in the Keychain. Copying hosts.yml
+// alone is useless there.
+func LocalGhToken() string {
+	out, err := exec.Command("gh", "auth", "token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// SetupGhAuth plumbs gh authentication into the sprite. Two parts:
+//
+//  1. Exports GH_TOKEN to .bashrc/.zshrc/.profile in an idempotent
+//     marker block. gh always honors GH_TOKEN ahead of any file-based
+//     or keyring-based lookup, so this bypasses the "token in hosts.yml
+//     is invalid" problem that arises from macOS Keychain storage not
+//     making the token visible in the YAML file we could copy.
+//
+//  2. Pushes ~/.config/gh/config.yml (user preferences — editor,
+//     aliases, prompt style) to the sprite. config.yml is non-sensitive
+//     and small (~1KB). hosts.yml is deliberately NOT pushed because
+//     on macOS it's incomplete (no token) and misleading to gh's
+//     auth lookup on the sprite.
+//
+// Silent no-op if the local machine has no gh token (user never ran
+// `gh auth login`). Non-fatal on upload errors so a transient failure
+// doesn't block the whole connect flow.
+func SetupGhAuth(client *sprite.Client, spriteName string) error {
+	token := LocalGhToken()
+	if token == "" {
+		// No local gh auth to propagate. Not an error.
+		return nil
+	}
+
+	// Write GH_TOKEN to all 3 rc files in a SINGLE exec call, using the
+	// same marker-block pattern as the Claude auth block. Previous version
+	// did 3 execs (one per file) at ~5-10s websocket overhead each.
+	quotedToken := "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
+	ghBlock := fmt.Sprintf(`# sp-gh-auth-begin
+export GH_TOKEN=%s
+# sp-gh-auth-end`, quotedToken)
+
+	ghScript := fmt.Sprintf(`
+for RC in .bashrc .zshrc .profile; do
+    touch ~/$RC
+    sed -i '/# sp-gh-auth-begin/,/# sp-gh-auth-end/d' ~/$RC 2>/dev/null || true
+    cat >> ~/$RC <<'GHEOF'
+%s
+GHEOF
+done
+`, ghBlock)
+	if _, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", ghScript},
+	}); err != nil {
+		return fmt.Errorf("writing gh auth blocks: %w", err)
+	}
+
+	// Push config.yml (preferences) if it exists. Non-critical — gh
+	// works fine without it, just uses defaults.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil // gracefully skip the file push, token export already succeeded
+	}
+	configPath := filepath.Join(home, ".config", "gh", "config.yml")
+	if _, err := os.Stat(configPath); err != nil {
+		return nil
+	}
+	if _, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "mkdir -p ~/.config/gh && chmod 700 ~/.config/gh && chmod 600 ~/.config/gh/config.yml 2>/dev/null || true"},
+		Files:   map[string]string{configPath: "/home/sprite/.config/gh/config.yml"},
+	}); err != nil {
+		return fmt.Errorf("uploading gh config.yml: %w", err)
+	}
+	return nil
+}
+
+// FixSpriteHomePermissions papers over a base-image quirk where /home/sprite
+// ships as ubuntu:ubuntu 0750, and additionally cleans up any ubuntu-owned
+// state under /home/sprite/.claude that earlier sp versions may have left
+// behind via the sprite-exec -file upload path (which creates files as
+// ubuntu, not sprite — see PushClaudeCredentials for the gory details).
+//
+// Normal file ops on /home/sprite work through some runtime override (ACL
+// or similar), but git's stricter path-walk refuses to operate inside a
+// home dir it sees as foreign-owned (symptom: `git init` fails with
+// "Cannot access work tree: Permission denied"). chown'ing to
+// sprite:sprite 0755 via sudo makes git work again.
+//
+// For ~/.claude specifically, claude reads its credentials and settings
+// from there as the sprite user — if any of that state ends up owned by
+// ubuntu (mode 700), claude gets EACCES and silently falls back to an
+// interactive login. We chown -R it on every connect to keep it sane.
+//
+// All chowns are idempotent and best-effort: failures (no sudo, dir
+// doesn't exist) are silently swallowed.
+func FixSpriteHomePermissions(client *sprite.Client, spriteName string) error {
+	script := `
+sudo -n chown sprite:sprite /home/sprite 2>/dev/null || true
+sudo -n chmod 755 /home/sprite 2>/dev/null || true
+if [ -e /home/sprite/.claude ]; then
+  sudo -n chown -R sprite:sprite /home/sprite/.claude 2>/dev/null || true
+fi
+`
+	_, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", script},
+	})
+	return err
+}
+
+// SetupSpriteAuth provisions SSH keys, Claude token, and shell config on a
+// sprite in as few exec calls as possible to minimize websocket overhead.
+//
+// Phase 1: upload SSH keys (needs -file flag, so one exec per file).
+// Phase 2: one mega-script exec that writes all rc files, claude.json, and
+//
+//	SSH config in a single shell invocation. This is the key
+//	optimization: prior versions did 8+ separate execs at ~5-10s each.
+//
+// If token is empty, the CLAUDE_CODE_OAUTH_TOKEN export is skipped — the
+// caller has already pushed a credentials.json via PushClaudeCredentials.
 func SetupSpriteAuth(client *sprite.Client, spriteName, token string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -84,68 +399,81 @@ func SetupSpriteAuth(client *sprite.Client, spriteName, token string) error {
 	sshKeyPath := filepath.Join(home, ".ssh", "id_ed25519")
 	sshPubPath := sshKeyPath + ".pub"
 
-	// Write Claude token to shell RC files
-	tokenExport := fmt.Sprintf(`export CLAUDE_CODE_OAUTH_TOKEN="%s"`, token)
-	for _, rcFile := range []string{".bashrc", ".zshrc"} {
-		cmd := fmt.Sprintf(`grep -q CLAUDE_CODE_OAUTH_TOKEN ~/%s 2>/dev/null && sed -i '/CLAUDE_CODE_OAUTH_TOKEN/d' ~/%s; echo '%s' >> ~/%s`,
-			rcFile, rcFile, tokenExport, rcFile)
-		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite:  spriteName,
-			Command: []string{"sh", "-c", cmd},
-		}); err != nil {
-			return fmt.Errorf("writing token to %s: %w", rcFile, err)
-		}
-	}
-
-	// Write Claude config for onboarding bypass
-	claudeConfig := `{"bypassPermissionsModeAccepted":true,"hasCompletedOnboarding":true}`
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", fmt.Sprintf(`mkdir -p ~/.claude && echo '%s' > ~/.claude/claude.json`, claudeConfig)},
-	}); err != nil {
-		return fmt.Errorf("writing claude config: %w", err)
-	}
-
-	// Upload SSH keys
+	// --- Phase 1: upload SSH keys (need -file flag, so separate execs) ---
+	// Combine private + public key into one exec where possible.
+	files := map[string]string{}
 	if _, err := os.Stat(sshKeyPath); err == nil {
-		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite:  spriteName,
-			Command: []string{"sh", "-c", "mkdir -p ~/.ssh && chmod 700 ~/.ssh"},
-			Files:   map[string]string{sshKeyPath: "/home/sprite/.ssh/id_ed25519"},
-		}); err != nil {
-			return fmt.Errorf("uploading SSH private key: %w", err)
-		}
-		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite:  spriteName,
-			Command: []string{"sh", "-c", "chmod 600 ~/.ssh/id_ed25519"},
-		}); err != nil {
-			return fmt.Errorf("setting SSH key permissions: %w", err)
-		}
+		files[sshKeyPath] = "/home/sprite/.ssh/id_ed25519"
 	}
-
 	if _, err := os.Stat(sshPubPath); err == nil {
+		files[sshPubPath] = "/home/sprite/.ssh/id_ed25519.pub"
+	}
+	if len(files) > 0 {
 		if _, err := client.Exec(sprite.ExecOptions{
 			Sprite:  spriteName,
-			Command: []string{"sh", "-c", "true"},
-			Files:   map[string]string{sshPubPath: "/home/sprite/.ssh/id_ed25519.pub"},
+			Command: []string{"sh", "-c", "mkdir -p ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519 2>/dev/null; chmod 644 ~/.ssh/id_ed25519.pub 2>/dev/null; true"},
+			Files:   files,
 		}); err != nil {
-			return fmt.Errorf("uploading SSH public key: %w", err)
+			return fmt.Errorf("uploading SSH keys: %w", err)
 		}
 	}
 
-	// Write SSH config for GitHub
-	sshConfig := `Host github.com
+	// --- Phase 2: one mega-script for all shell writes ---
+	// Build the auth block content. The block is written to all 3 rc files.
+	exportLine := ""
+	if token != "" {
+		quotedToken := "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
+		exportLine = "export CLAUDE_CODE_OAUTH_TOKEN=" + quotedToken + "\n"
+	}
+	authBlock := fmt.Sprintf(`# sp-claude-auth-begin
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
+unset CLAUDE_CODE_USE_BEDROCK
+unset CLAUDE_CODE_USE_VERTEX
+unset CLAUDE_CODE_USE_FOUNDRY
+%salias claude='command claude --dangerously-skip-permissions'
+# sp-claude-auth-end`, exportLine)
+
+	claudeConfig := `{"bypassPermissionsModeAccepted":true,"hasCompletedOnboarding":true}`
+
+	// The mega-script handles: rc-file auth blocks (3 files), claude.json,
+	// and SSH config — all in one exec. Single-digit seconds instead of
+	// 8 × 5-10s = 40-80s.
+	megaScript := fmt.Sprintf(`
+set -e
+# --- Auth block for .bashrc, .zshrc, .profile ---
+for RC in .bashrc .zshrc .profile; do
+    touch ~/$RC
+    sed -i '/# sp-claude-auth-begin/,/# sp-claude-auth-end/d' ~/$RC 2>/dev/null || true
+    sed -i '/CLAUDE_CODE_OAUTH_TOKEN/d' ~/$RC 2>/dev/null || true
+    cat >> ~/$RC <<'AUTHEOF'
+%s
+AUTHEOF
+done
+
+# --- claude.json onboarding bypass ---
+mkdir -p ~/.claude
+echo '%s' > ~/.claude/claude.json
+
+# --- SSH config for GitHub ---
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+touch ~/.ssh/config
+sed -i '/# sp-managed-github-begin/,/# sp-managed-github-end/d' ~/.ssh/config 2>/dev/null || true
+cat >> ~/.ssh/config <<'SSHEOF'
+# sp-managed-github-begin
+Host github.com
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
-`
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite: spriteName,
-		Command: []string{"sh", "-c", fmt.Sprintf(`cat >> ~/.ssh/config << 'SSHEOF'
-%s
+# sp-managed-github-end
 SSHEOF
-chmod 600 ~/.ssh/config`, sshConfig)},
+chmod 600 ~/.ssh/config
+`, authBlock, claudeConfig)
+
+	if _, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", megaScript},
 	}); err != nil {
-		return fmt.Errorf("writing SSH config: %w", err)
+		return fmt.Errorf("running auth mega-script: %w", err)
 	}
 
 	return nil
@@ -196,7 +524,11 @@ fi
 	return nil
 }
 
-// SetupGitConfig copies the local user's git config (name, email) to the sprite.
+// SetupGitConfig copies the local user's git config (name, email) to the sprite
+// and configures URL rewrites so that GitHub HTTPS URLs are transparently
+// converted to SSH. This prevents auth conflicts when .git/config is synced
+// between a local machine (which may use SSH remotes) and the sprite (which
+// has SSH keys deployed during setup).
 func SetupGitConfig(client *sprite.Client, spriteName string) error {
 	name, _ := gitConfigValue("user.name")
 	email, _ := gitConfigValue("user.email")
@@ -217,6 +549,17 @@ func SetupGitConfig(client *sprite.Client, spriteName string) error {
 		}); err != nil {
 			return fmt.Errorf("setting git user.email: %w", err)
 		}
+	}
+
+	// Rewrite HTTPS GitHub URLs to SSH so that regardless of what URL format
+	// arrives via .git/config sync, the sprite always uses SSH (which has keys
+	// deployed in SetupSpriteAuth). This avoids auth failures when the local
+	// machine uses SSH remotes and prevents credential prompts for HTTPS.
+	if _, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"git", "config", "--global", "url.git@github.com:.insteadOf", "https://github.com/"},
+	}); err != nil {
+		return fmt.Errorf("setting git url.insteadOf for GitHub SSH: %w", err)
 	}
 
 	return nil

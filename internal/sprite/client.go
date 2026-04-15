@@ -74,9 +74,13 @@ func (c *Client) Create(name string) error {
 	return nil
 }
 
-// Destroy destroys a sprite by name.
+// Destroy destroys a sprite by name. Always passes --force to skip the
+// interactive confirmation prompt — callers are expected to do their own
+// confirmation up-front (e.g. sp rm's safety rails, sp prune's dry-run).
+// Without --force, sprite destroy blocks on a tty prompt that CombinedOutput
+// never answers, so the caller hangs indefinitely.
 func (c *Client) Destroy(name string) error {
-	args := []string{"destroy"}
+	args := []string{"destroy", "--force"}
 	if c.org != "" {
 		args = append(args, "-o", c.org)
 	}
@@ -204,6 +208,7 @@ func (c *Client) GetURL(name string) (string, error) {
 }
 
 // Exists checks if a sprite with the given name exists by attempting to get it.
+// Returns true only when the API returns a sprite with a non-empty ID.
 func (c *Client) Exists(name string) (bool, error) {
 	info, err := c.Get(name)
 	if err != nil {
@@ -220,7 +225,9 @@ func (c *Client) Exists(name string) (bool, error) {
 		}
 		return false, nil
 	}
-	return info != nil, nil
+	// Guard against the API returning an empty/null JSON body that
+	// deserialises into a zero-value Info struct.
+	return info != nil && info.ID != "", nil
 }
 
 // Use associates the current directory with a sprite name (creates .sprite file).

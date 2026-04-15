@@ -63,6 +63,9 @@ func runDefault(cmd *cobra.Command, args []string) error {
 		if v, _ := cmd.Flags().GetInt("web-dev-port"); v != 0 {
 			webDevPort = v
 		}
+		if v, _ := cmd.Flags().GetDuration("keep-warm"); v != 0 {
+			keepWarmDur = v
+		}
 
 		// Handle -- separator for exec command
 		connectArgs := args
@@ -85,12 +88,15 @@ func runDefault(cmd *cobra.Command, args []string) error {
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose output")
 
-	// Allow connect-related flags on root too
+	// Allow connect-related flags on root too so `sp owner/repo --flag`
+	// works without the `connect` prefix. Each flag registered here must
+	// also be inherited in runDefault above.
 	rootCmd.Flags().Bool("no-sync", false, "disable file syncing")
 	rootCmd.Flags().String("name", "", "tmux session name")
 	rootCmd.Flags().Bool("web", false, "enable opencode web UI via sprite service")
 	rootCmd.Flags().Bool("web-proxy", false, "enable reverse proxy in front of opencode")
 	rootCmd.Flags().Int("web-dev-port", 0, "development server port for proxy fallthrough")
+	rootCmd.Flags().Duration("keep-warm", 0, "keep sprite warm after disconnect (e.g. 1h)")
 
 	// Prevent cobra from complaining about unknown flags being passed through --
 	rootCmd.TraverseChildren = true
