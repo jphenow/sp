@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"hash/crc32"
@@ -316,18 +317,8 @@ func AddSSHConfig(spriteName string, port int) error {
 	// Include IdentityFile so SSH uses the right key even without an agent
 	identityFile := filepath.Join(home, ".ssh", "id_ed25519")
 
-	entry := fmt.Sprintf(`
-# sp-managed: %s
-Host %s
-  HostName localhost
-  Port %d
-  User sprite
-  IdentityFile %s
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  LogLevel ERROR
-# sp-end: %s
-`, alias, alias, port, identityFile, alias)
+	entry := fmt.Sprintf("# sp-managed: %s\nHost %s\n  HostName localhost\n  Port %d\n  User sprite\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n# sp-end: %s\n",
+		alias, alias, port, identityFile, alias)
 
 	slog.Debug("ssh_config: writing entry", "alias", alias, "port", port, "identity", identityFile)
 
@@ -337,13 +328,33 @@ Host %s
 		_ = err
 	}
 
+	// Ensure proper separation from existing content: read the file to check
+	// if it ends with a newline, and prepend a blank line separator if needed.
+	prefix := "\n"
+	if existing, err := os.ReadFile(configPath); err == nil {
+		if len(existing) == 0 {
+			prefix = ""
+		} else if bytes.HasSuffix(existing, []byte("\n\n")) {
+			prefix = ""
+		} else if bytes.HasSuffix(existing, []byte("\n")) {
+			// ends with single newline — add one blank line
+			prefix = "\n"
+		} else {
+			// no trailing newline at all
+			prefix = "\n\n"
+		}
+	} else {
+		// File doesn't exist yet
+		prefix = ""
+	}
+
 	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("opening SSH config: %w", err)
 	}
 	defer f.Close()
 
-	if _, err := f.WriteString(entry); err != nil {
+	if _, err := f.WriteString(prefix + entry); err != nil {
 		return fmt.Errorf("writing SSH config entry: %w", err)
 	}
 
@@ -430,7 +441,28 @@ func removeSSHConfigEntry(configPath, alias string) error {
 		}
 	}
 
-	return os.WriteFile(configPath, []byte(strings.Join(result, "\n")), 0o600)
+	// Collapse runs of 3+ blank lines down to at most 1, and trim trailing blank lines.
+	var cleaned []string
+	consecutiveBlanks := 0
+	for _, line := range result {
+		if strings.TrimSpace(line) == "" {
+			consecutiveBlanks++
+			if consecutiveBlanks <= 1 {
+				cleaned = append(cleaned, line)
+			}
+		} else {
+			consecutiveBlanks = 0
+			cleaned = append(cleaned, line)
+		}
+	}
+	// Trim trailing blank lines
+	for len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) == "" {
+		cleaned = cleaned[:len(cleaned)-1]
+	}
+	// Ensure file ends with a newline
+	output := strings.Join(cleaned, "\n") + "\n"
+
+	return os.WriteFile(configPath, []byte(output), 0o600)
 }
 
 // MutagenSyncMode translates our sync mode constants into Mutagen CLI flags.

@@ -17,49 +17,37 @@ var defaultIgnores = []string{
 	"._*",
 }
 
-// gitVolatileIgnores are .git internal files that change frequently during
-// normal git operations (staging, committing, fetching, rebasing) and must
-// NOT be synced bidirectionally. Syncing these causes:
-//   - Staged changes to "vanish" (.git/index stomped by the other side)
-//   - Lock file collisions (.git/index.lock, .git/refs/*.lock)
-//   - Stale merge/rebase state crossing between sides
+// gitVolatileIgnores are .git internal files that are transient lock files or
+// in-progress operation state that must NOT be synced bidirectionally. These
+// files exist briefly during git operations and should never cross machines.
+//
+// IMPORTANT: Files like .git/index, .git/refs/*, .git/logs/, and .git/FETCH_HEAD
+// MUST be synced so that commits, pushes, and branch operations on one side are
+// reflected on the other. Only exclude files that are:
+//   - Lock files (*.lock) — transient, cause conflicts if synced
+//   - In-progress multi-step operation state (rebase, cherry-pick, bisect)
 //
 // These patterns are appended AFTER the "!.git" un-ignore rule so that the
-// .git directory itself (objects, config, hooks, refs, HEAD) is still synced.
+// .git directory itself is still synced.
 var gitVolatileIgnores = []string{
-	// Staging area — binary file rewritten on every git add/checkout/reset
-	".git/index",
-	// Lock files created transiently during git operations
+	// Lock files created transiently during git operations. These exist for
+	// milliseconds and should never be synced — they cause spurious conflicts
+	// and can prevent git operations on the other side.
 	".git/index.lock",
 	".git/refs/**/*.lock",
 	".git/packed-refs.lock",
 	".git/config.lock",
 	".git/HEAD.lock",
 	".git/shallow.lock",
-	// Transient state files from fetch/merge/rebase/cherry-pick
-	".git/FETCH_HEAD",
-	".git/ORIG_HEAD",
-	".git/MERGE_HEAD",
-	".git/MERGE_MSG",
-	".git/MERGE_MODE",
-	".git/CHERRY_PICK_HEAD",
-	".git/REVERT_HEAD",
-	".git/BISECT_LOG",
-	".git/SQUASH_MSG",
-	".git/COMMIT_EDITMSG",
+	// In-progress rebase/cherry-pick/revert/bisect state. These directories
+	// and files track multi-step operations that are local to one side.
+	// Syncing them mid-operation can corrupt the rebase/cherry-pick state.
 	".git/rebase-merge",
 	".git/rebase-apply",
 	".git/sequencer",
-	// Reflogs — each side appends entries independently on every commit,
-	// checkout, rebase, fetch, etc. Bidirectional sync causes constant
-	// conflicts because both sides diverge after any local operation.
-	".git/logs",
-	// Remote-tracking refs — each side runs git fetch independently, so
-	// refs/remotes/origin/* always diverge. Only local branch refs and
-	// tags need syncing.
-	".git/refs/remotes",
-	// Auto-stash file used during rebase
-	".git/refs/stash",
+	".git/BISECT_LOG",
+	".git/BISECT_NAMES",
+	".git/BISECT_TERMS",
 	// Editor backup / git gc temp files
 	".git/gc.log",
 	".git/gc.log.lock",
