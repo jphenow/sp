@@ -29,6 +29,17 @@ import (
 //
 // Add to this list if a new Claude feature ships a user-facing config
 // directory that should follow the user between machines.
+// claudeConfigAllowlist enumerates the entries under ~/.claude/ that we
+// upload to the sprite on every connect. Intentionally conservative:
+//   - Preferences and global instructions (settings.json, CLAUDE.md)
+//   - User-authored extensibility (commands, skills, plugins, agents,
+//     keybindings, statusline) — the stuff the user presumably wants
+//     available in every sprite claude session
+//
+// IMPORTANT: session state must NEVER be added here. The sprite builds
+// its own conversation history, project memory, and session state — pushing
+// the local machine's would clobber in-progress work. If you're tempted to
+// add an entry, check it against claudeConfigDenylist first.
 var claudeConfigAllowlist = []string{
 	"CLAUDE.md",
 	"settings.json",
@@ -41,6 +52,47 @@ var claudeConfigAllowlist = []string{
 	"agents",
 	"marketplace",
 	"marketplaces",
+}
+
+// claudeConfigDenylist is a safety net: entries that must NEVER appear in
+// the allowlist because they contain sprite-local session state that would
+// be destroyed by a local→sprite push. PushClaudeConfig panics at init
+// time if any of these are also in the allowlist, so a bad merge or
+// refactor is caught immediately rather than silently nuking a user's
+// conversation history on their next connect.
+var claudeConfigDenylist = []string{
+	"projects",
+	"sessions",
+	"history.jsonl",
+	"backups",
+	"file-history",
+	"todos",
+	"tasks",
+	"plans",
+	"statsig",
+	"telemetry",
+	"usage-data",
+	"stats-cache.json",
+	"cache",
+	"debug",
+	"downloads",
+	"image-cache",
+	"paste-cache",
+	"session-env",
+	"shell-snapshots",
+	"ide",
+}
+
+func init() {
+	deny := make(map[string]bool, len(claudeConfigDenylist))
+	for _, d := range claudeConfigDenylist {
+		deny[d] = true
+	}
+	for _, a := range claudeConfigAllowlist {
+		if deny[a] {
+			panic("claudeConfigAllowlist contains denied entry: " + a)
+		}
+	}
 }
 
 // PushClaudeConfig tars the allow-listed entries under ~/.claude/ and
