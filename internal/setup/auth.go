@@ -203,7 +203,9 @@ if not isinstance(perm, dict):
 perm["defaultMode"] = "bypassPermissions"
 perm["skipDangerousModePermissionPrompt"] = True
 
-# 2. Fix statusLine.command path: replace local home with sprite home
+# 2. Fix paths referencing local home dir — replace with sprite home.
+#    Applies to statusLine.command and any other string values that embed
+#    the local user's home directory.
 LOCAL_HOME = %q
 sl = d.get("statusLine")
 if isinstance(sl, dict) and "command" in sl:
@@ -211,6 +213,27 @@ if isinstance(sl, dict) and "command" in sl:
 
 with open(p, "w") as f:
     json.dump(d, f, indent=2)
+
+# 3. Fix installPath in installed_plugins.json — same local→sprite rewrite.
+#    Claude uses installPath to locate cached plugin code; without the
+#    rewrite, plugins installed locally are "not found" on the sprite even
+#    though the files exist at the sprite-equivalent path.
+ip = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+try:
+    with open(ip) as f:
+        pd = json.load(f)
+    changed = False
+    for name, entries in pd.get("plugins", {}).items():
+        for entry in entries:
+            old = entry.get("installPath", "")
+            if LOCAL_HOME in old:
+                entry["installPath"] = old.replace(LOCAL_HOME, "/home/sprite")
+                changed = True
+    if changed:
+        with open(ip, "w") as f:
+            json.dump(pd, f, indent=2)
+except Exception:
+    pass  # best-effort; missing file is fine
 PYEOF
 `, home)
 	_, err := client.Exec(sprite.ExecOptions{
