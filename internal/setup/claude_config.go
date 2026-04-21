@@ -83,6 +83,19 @@ var claudeConfigDenylist = []string{
 	"ide",
 }
 
+// claudeConfigExclude lists paths WITHIN allowlisted entries that should
+// be skipped during tar building. These are subdirectories that are large
+// and/or unnecessary on the sprite — claude can fetch them itself.
+// Paths are relative to ~/.claude/ and matched as prefixes.
+var claudeConfigExclude = []string{
+	// Full git clones of marketplace repos (~30MB). The sprite only needs
+	// the plugin config JSONs + the small cache/ with installed plugin code.
+	// Claude refetches marketplace repos on first plugin operation.
+	"plugins/marketplaces",
+	"plugins/repos",
+	"plugins/data",
+}
+
 func init() {
 	deny := make(map[string]bool, len(claudeConfigDenylist))
 	for _, d := range claudeConfigDenylist {
@@ -175,6 +188,11 @@ func PushClaudeConfig(client *sprite.Client, spriteName string) error {
 // following symlinks so their real content is included. Paths inside the
 // tar are stored relative to base (which is ~/.claude/) so extraction
 // into ~/.claude/ on the sprite lands files in the right place.
+//
+// Entries whose relative path matches any prefix in claudeConfigExclude
+// are silently skipped — this is how we keep the 30MB marketplace git
+// repos out of the tar while still including the small plugin config
+// files alongside them.
 func addToTarFollowingSymlinks(tw *tar.Writer, base, path string) error {
 	info, err := os.Stat(path) // Stat follows symlinks; Lstat would not
 	if err != nil {
@@ -183,6 +201,13 @@ func addToTarFollowingSymlinks(tw *tar.Writer, base, path string) error {
 	rel, err := filepath.Rel(base, path)
 	if err != nil {
 		return fmt.Errorf("rel %s: %w", path, err)
+	}
+
+	// Check excludes — skip entire subtrees that match.
+	for _, excl := range claudeConfigExclude {
+		if rel == excl || strings.HasPrefix(rel, excl+"/") {
+			return nil
+		}
 	}
 
 	if !info.IsDir() {
@@ -206,9 +231,6 @@ func addToTarFollowingSymlinks(tw *tar.Writer, base, path string) error {
 	for _, entry := range entries {
 		child := filepath.Join(path, entry.Name())
 		if err := addToTarFollowingSymlinks(tw, base, child); err != nil {
-			// Surface the error up so the caller's warning print shows
-			// which entry was problematic. Collected by the PushClaudeConfig
-			// outer loop which logs and continues.
 			return err
 		}
 	}
