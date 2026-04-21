@@ -214,26 +214,24 @@ if isinstance(sl, dict) and "command" in sl:
 with open(p, "w") as f:
     json.dump(d, f, indent=2)
 
-# 3. Fix installPath in installed_plugins.json — same local→sprite rewrite.
-#    Claude uses installPath to locate cached plugin code; without the
-#    rewrite, plugins installed locally are "not found" on the sprite even
-#    though the files exist at the sprite-equivalent path.
-ip = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
-try:
-    with open(ip) as f:
-        pd = json.load(f)
-    changed = False
-    for name, entries in pd.get("plugins", {}).items():
-        for entry in entries:
-            old = entry.get("installPath", "")
-            if LOCAL_HOME in old:
-                entry["installPath"] = old.replace(LOCAL_HOME, "/home/sprite")
-                changed = True
-    if changed:
-        with open(ip, "w") as f:
-            json.dump(pd, f, indent=2)
-except Exception:
-    pass  # best-effort; missing file is fine
+# 3. Rewrite all local home paths in plugin JSON files. Claude uses these
+#    paths to locate cached plugin code and marketplace repos; without
+#    the rewrite, plugins installed locally are "not found" on the sprite.
+plugin_files = [
+    ("~/.claude/plugins/installed_plugins.json", True),
+    ("~/.claude/plugins/known_marketplaces.json", True),
+]
+for pf, deep in plugin_files:
+    fp = os.path.expanduser(pf)
+    try:
+        with open(fp) as f:
+            raw = f.read()
+        if LOCAL_HOME in raw:
+            raw = raw.replace(LOCAL_HOME, "/home/sprite")
+            with open(fp, "w") as f:
+                f.write(raw)
+    except Exception:
+        pass  # best-effort; missing file is fine
 PYEOF
 `, home)
 	_, err := client.Exec(sprite.ExecOptions{
