@@ -866,9 +866,11 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 }
 
 // findExistingSpriteSession queries sprite sessions list and returns the
-// ID of the first active session, or "" if none. Parsing is simple:
-// look for the first line whose first whitespace-delimited field is
-// numeric (session IDs are integers).
+// ID of the first active tmux session, or "" if none. Only matches
+// sessions whose Command column contains "tmux" to avoid accidentally
+// reattaching to stale non-interactive exec sessions (e.g. leftover
+// setup commands like FixSpriteHomePermissions that sprite-env keeps
+// around as "Active" sessions).
 func findExistingSpriteSession(spriteName, org string) string {
 	args := []string{"sessions", "list"}
 	if org != "" {
@@ -882,10 +884,18 @@ func findExistingSpriteSession(spriteName, org string) string {
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 0 {
+		if len(fields) < 2 {
 			continue
 		}
-		if _, err := fmt.Sscanf(fields[0], "%d", new(int)); err == nil {
+		// First field must be a numeric session ID.
+		if _, err := fmt.Sscanf(fields[0], "%d", new(int)); err != nil {
+			continue
+		}
+		// Only match tmux sessions — the Command column (field 1+)
+		// should contain "tmux". This filters out stale setup exec
+		// sessions (chown, git config, etc.) that sprite-env keeps alive.
+		rest := strings.Join(fields[1:], " ")
+		if strings.Contains(rest, "tmux") {
 			return fields[0]
 		}
 	}
