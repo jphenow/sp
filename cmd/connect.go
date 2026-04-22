@@ -858,7 +858,7 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 	// If found, reattach directly — tmux + claude are still running.
 	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" {
 		fmt.Printf("Reattaching to session %s...\n", sessionID)
-		return attachToSpriteSession(resolved.SpriteName, resolved.Org, sessionID)
+		return attachToSpriteSession(client, resolved.SpriteName, resolved.Org, sessionID)
 	}
 
 	// No existing session — create a new one with the full tmux setup.
@@ -893,9 +893,27 @@ func findExistingSpriteSession(spriteName, org string) string {
 }
 
 // attachToSpriteSession reattaches to an existing sprite-env session by
-// its numeric ID via `sprite attach`. The running tmux + claude inside
-// the session are exactly where the user left them.
-func attachToSpriteSession(spriteName, org, sessionID string) error {
+// its numeric ID via `sprite attach`. Before attaching, it refreshes
+// the tmux global environment with the current GH_TOKEN so new panes
+// pick up a fresh token (since we no longer persist tokens in rc files).
+func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID string) error {
+	// Refresh tmux env vars before reattaching. GH_TOKEN is no longer in
+	// rc files (security: we don't leave tokens on the dormant filesystem),
+	// so it must be injected into the tmux server's global env on every
+	// connect. Without this, panes opened after a reconnect would have no
+	// GH_TOKEN and git operations would fail.
+	ghToken := setup.LocalGhToken()
+	if ghToken != "" {
+		refreshScript := fmt.Sprintf(
+			"tmux setenv -g GH_TOKEN %s 2>/dev/null || true",
+			shellQuote(ghToken),
+		)
+		client.Exec(sprite.ExecOptions{
+			Sprite:  spriteName,
+			Command: []string{"sh", "-c", refreshScript},
+		})
+	}
+
 	args := []string{"attach", sessionID}
 	if org != "" {
 		args = append(args, "-o", org)

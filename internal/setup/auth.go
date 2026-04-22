@@ -322,28 +322,23 @@ func SetupGhAuth(client *sprite.Client, spriteName string) error {
 		return nil
 	}
 
-	// Write GH_TOKEN to all 3 rc files in a SINGLE exec call, using the
-	// same marker-block pattern as the Claude auth block. Previous version
-	// did 3 execs (one per file) at ~5-10s websocket overhead each.
-	quotedToken := "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
-	ghBlock := fmt.Sprintf(`# sp-gh-auth-begin
-export GH_TOKEN=%s
-# sp-gh-auth-end`, quotedToken)
-
-	ghScript := fmt.Sprintf(`
+	// Clean up any prior GH_TOKEN exports from rc files left by older sp
+	// versions. We no longer write tokens to disk — they're injected via
+	// sprite exec -env + tmux setenv -g on every connect, so they only
+	// exist in running processes and vanish when the sprite cold-stops.
+	// This avoids leaving a valid GitHub token in plaintext on a dormant
+	// sprite's filesystem.
+	cleanScript := `
 for RC in .bashrc .zshrc .profile; do
-    touch ~/$RC
     sed -i '/# sp-gh-auth-begin/,/# sp-gh-auth-end/d' ~/$RC 2>/dev/null || true
-    cat >> ~/$RC <<'GHEOF'
-%s
-GHEOF
 done
-`, ghBlock)
+`
 	if _, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Command: []string{"sh", "-c", ghScript},
+		Command: []string{"sh", "-c", cleanScript},
 	}); err != nil {
-		return fmt.Errorf("writing gh auth blocks: %w", err)
+		// Non-fatal: cleanup of old state shouldn't block connect.
+		_ = err
 	}
 
 	// Push config.yml (preferences) if it exists. Non-critical — gh
