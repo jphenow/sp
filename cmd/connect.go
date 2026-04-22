@@ -628,8 +628,18 @@ echo "sp: cloning $URL into $DIR"
 git clone --recurse-submodules "$URL" "$(basename "$DIR")" || exit 3
 `, q(remoteDir), q(parent), q(sshURL))
 
+	// GH_TOKEN must be in the exec env so the git credential helper
+	// (installed by SetupGitConfig) can authenticate HTTPS requests.
+	// The URL rewrite converts git@github.com: to https://github.com/,
+	// so the clone goes over HTTPS and needs the token.
+	env := map[string]string{}
+	if ghToken := setup.LocalGhToken(); ghToken != "" {
+		env["GH_TOKEN"] = ghToken
+	}
+
 	out, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
+		Env:     env,
 		Command: []string{"sh", "-c", script},
 	})
 	// In verbose mode, surface the script's status output ("sp: cloning…",
