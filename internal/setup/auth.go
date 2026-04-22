@@ -381,12 +381,18 @@ done
 // All chowns are idempotent and best-effort: failures (no sudo, dir
 // doesn't exist) are silently swallowed.
 func FixSpriteHomePermissions(client *sprite.Client, spriteName string) error {
+	// Only fix the top-level directories, NOT recursive. The -R flag on
+	// chown was causing indefinite hangs when ~/.claude contained broken
+	// inodes, FUSE mounts, or deep plugin trees. Files inside these dirs
+	// are already sprite-owned because PushClaudeConfig uses tar extract
+	// and PushClaudeCredentials uses base64 shell redirect — both run as
+	// the sprite user. The only ownership issue is the dirs themselves
+	// (created by sprite-exec file uploads as ubuntu).
 	script := `
 sudo -n chown sprite:sprite /home/sprite 2>/dev/null || true
 sudo -n chmod 755 /home/sprite 2>/dev/null || true
-if [ -e /home/sprite/.claude ]; then
-  sudo -n chown -R sprite:sprite /home/sprite/.claude 2>/dev/null || true
-fi
+sudo -n chown sprite:sprite /home/sprite/.claude 2>/dev/null || true
+sudo -n chown sprite:sprite /home/sprite/.ssh 2>/dev/null || true
 `
 	_, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
