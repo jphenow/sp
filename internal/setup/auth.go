@@ -545,45 +545,74 @@ fi
 	return nil
 }
 
-// SetupGitConfig copies the local user's git config (name, email) to the sprite
-// and configures URL rewrites so that GitHub HTTPS URLs are transparently
-// converted to SSH. This prevents auth conflicts when .git/config is synced
-// between a local machine (which may use SSH remotes) and the sprite (which
-// has SSH keys deployed during setup).
+// SetupGitConfig copies the local user's git config (name, email) to the
+// sprite and configures git to use HTTPS + GH_TOKEN for GitHub operations
+// instead of SSH. This avoids passphrase prompts when SSH keys are
+// password-protected (increasingly required by company policy).
+//
+// The setup does three things in a single exec call:
+//
+//  1. Sets user.name and user.email from the local git config.
+//
+//  2. Rewrites SSH GitHub URLs to HTTPS: any `git@github.com:<path>` URL
+//     is transparently converted to `https://github.com/<path>`. This
+//     covers repos cloned with SSH remotes that get synced into the sprite
+//     via mutagen. Also removes any prior HTTPS→SSH rewrite from older sp
+//     versions so the two don't conflict.
+//
+//  3. Installs a credential helper that reads GH_TOKEN at runtime (from
+//     the environment, set by SetupGhAuth on every connect). Git calls
+//     this helper every time it needs credentials for github.com, so
+//     token refreshes between connects are picked up automatically. No
+//     SSH key involvement, no passphrase prompt, works non-interactively
+//     for claude's git operations.
 func SetupGitConfig(client *sprite.Client, spriteName string) error {
 	name, _ := gitConfigValue("user.name")
 	email, _ := gitConfigValue("user.email")
 
+	// Build a single script for all git config operations. Was 3 separate
+	// exec calls before; consolidated to 1 for speed (~10s saved).
+	script := "set -e\n"
 	if name != "" {
-		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite:  spriteName,
-			Command: []string{"git", "config", "--global", "user.name", name},
-		}); err != nil {
-			return fmt.Errorf("setting git user.name: %w", err)
-		}
+		script += fmt.Sprintf("git config --global user.name %s\n", shellQuote(name))
 	}
-
 	if email != "" {
-		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite:  spriteName,
-			Command: []string{"git", "config", "--global", "user.email", email},
-		}); err != nil {
-			return fmt.Errorf("setting git user.email: %w", err)
-		}
+		script += fmt.Sprintf("git config --global user.email %s\n", shellQuote(email))
 	}
 
-	// Rewrite HTTPS GitHub URLs to SSH so that regardless of what URL format
-	// arrives via .git/config sync, the sprite always uses SSH (which has keys
-	// deployed in SetupSpriteAuth). This avoids auth failures when the local
-	// machine uses SSH remotes and prevents credential prompts for HTTPS.
+	// Remove any prior HTTPS→SSH rewrite (from older sp versions) that
+	// would conflict with our SSH→HTTPS rewrite.
+	script += `
+git config --global --unset-all 'url.git@github.com:.insteadOf' 2>/dev/null || true
+`
+
+	// SSH→HTTPS rewrite: git@github.com: → https://github.com/
+	script += `
+git config --global 'url.https://github.com/.insteadOf' 'git@github.com:'
+`
+
+	// Credential helper: reads GH_TOKEN from env at runtime. The helper
+	// is a shell function that git invokes when it needs auth for
+	// github.com. Because it reads $GH_TOKEN dynamically, token updates
+	// via SetupGhAuth are picked up without restarting git.
+	script += `
+git config --global credential.helper '!f() { echo "protocol=https"; echo "host=github.com"; echo "username=x-access-token"; echo "password=$GH_TOKEN"; }; f'
+`
+
 	if _, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Command: []string{"git", "config", "--global", "url.git@github.com:.insteadOf", "https://github.com/"},
+		Command: []string{"sh", "-c", script},
 	}); err != nil {
-		return fmt.Errorf("setting git url.insteadOf for GitHub SSH: %w", err)
+		return fmt.Errorf("setting up git config: %w", err)
 	}
-
 	return nil
+}
+
+// shellQuote wraps a string in single quotes for safe shell interpolation.
+// This is a package-level helper duplicated from cmd/ because setup/ can't
+// import cmd/ (would create a cycle). Identical implementation.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // gitConfigValue reads a git config value from the local machine.

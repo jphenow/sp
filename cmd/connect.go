@@ -959,8 +959,24 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 	}
 
 	shellCmd := fmt.Sprintf(`
+# Start ssh-agent if not already running. The agent lives in the tmux
+# server's process tree, so it survives reconnects (persistent session).
+# The user runs 'ssh-add' once per session to unlock passphrase-protected
+# SSH keys; all subsequent SSH operations (scp, ssh to other hosts) use
+# the agent. Git operations don't need the agent at all — they use
+# HTTPS + GH_TOKEN via the credential helper set up by SetupGitConfig.
+if [ -z "$SSH_AUTH_SOCK" ]; then
+  eval "$(ssh-agent -s)" > /dev/null 2>&1
+fi
+
 tmux start-server 2>/dev/null || true
 tmux set -g allow-passthrough on 2>/dev/null || true
+
+# Pass SSH_AUTH_SOCK into tmux so new panes inherit the agent.
+if [ -n "$SSH_AUTH_SOCK" ]; then
+  tmux setenv -g SSH_AUTH_SOCK "$SSH_AUTH_SOCK" 2>/dev/null || true
+fi
+
 for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
   tmux setenv -gu "$v" 2>/dev/null || true
 done
