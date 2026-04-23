@@ -1,0 +1,721 @@
+package sync
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"hash/crc32"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/jphenow/sp/internal/sprite"
+)
+
+// Manager handles Mutagen sync session lifecycle for sprite environments.
+// It manages SSH server setup, proxy processes, and Mutagen sessions.
+type Manager struct {
+	client *sprite.Client
+}
+
+// SessionState describes the current state of a sync session.
+type SessionState struct {
+	Name           string
+	MutagenID      string
+	Status         string // "watching", "syncing", "connecting", "error", "none"
+	AlphaConnected bool
+	BetaConnected  bool
+	Conflicts      int
+	LastError      string
+	SSHPort        int
+	ProxyPID       int
+}
+
+// NewManager creates a new sync manager wrapping the given sprite client.
+func NewManager(client *sprite.Client) *Manager {
+	return &Manager{client: client}
+}
+
+// ComputeSSHPort derives a deterministic SSH port from a sprite name.
+// Port range: 10000-60000 to avoid privileged ports and common service ports.
+func ComputeSSHPort(spriteName string) int {
+	h := crc32.ChecksumIEEE([]byte(spriteName))
+	return int(h%50000) + 10000
+}
+
+// SessionName returns the Mutagen session name for a sprite.
+func SessionName(spriteName string) string {
+	return "sprite-" + spriteName
+}
+
+// SSHHostAlias returns the SSH config host alias for Mutagen to use.
+func SSHHostAlias(spriteName string) string {
+	return "sprite-mutagen-" + spriteName
+}
+
+// WakeSprite ensures a sprite is running by executing a trivial command.
+// This wakes warm/cold sprites before we try to set up SSH and proxies.
+// Retries a few times because waking can take several seconds.
+func (m *Manager) WakeSprite(spriteName string) error {
+	slog.Info("wake: ensuring sprite is running", "sprite", spriteName)
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		out, err := m.client.Exec(sprite.ExecOptions{
+			Sprite:  spriteName,
+			Command: []string{"echo", "ready"},
+		})
+		if err == nil {
+			slog.Info("wake: sprite is running", "sprite", spriteName, "output", strings.TrimSpace(string(out)))
+			return nil
+		}
+		lastErr = err
+		slog.Debug("wake: attempt failed, retrying", "sprite", spriteName, "attempt", attempt+1, "error", err)
+		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+	}
+	return fmt.Errorf("waking sprite %q: %w", spriteName, lastErr)
+}
+
+// FetchAuthLog retrieves the sshd authentication log from the sprite.
+// Called after SSH test failures to get the server-side rejection reason.
+func (m *Manager) FetchAuthLog(spriteName string) (string, error) {
+	out, err := m.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "sudo cat /var/log/auth.log 2>/dev/null | tail -30 || echo 'no auth log'"},
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// SetupSSHServer installs and configures openssh-server on the sprite,
+// adds the local user's public key to authorized_keys, and starts sshd.
+// Uses explicit /home/sprite paths since sprite exec may run as a different user
+// or ~ may not resolve as expected.
+func (m *Manager) SetupSSHServer(spriteName string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("getting home directory: %w", err)
+	}
+
+	pubKeyPath := filepath.Join(home, ".ssh", "id_ed25519.pub")
+	pubKey, err := os.ReadFile(pubKeyPath)
+	if err != nil {
+		return fmt.Errorf("reading SSH public key %s: %w", pubKeyPath, err)
+	}
+	pubKeyStr := strings.TrimSpace(string(pubKey))
+	slog.Info("ssh_setup: using public key", "sprite", spriteName,
+		"path", pubKeyPath, "key_prefix", pubKeyStr[:min(40, len(pubKeyStr))]+"...")
+
+	// Upload the public key file directly to the sprite, then install sshd
+	// and configure authorized_keys. Using file upload avoids shell quoting issues.
+	// Use /home/sprite explicitly since ~ may not resolve correctly in sprite exec.
+	if _, err := m.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "mkdir -p /home/sprite/.ssh && chmod 700 /home/sprite/.ssh"},
+		Files:   map[string]string{pubKeyPath: "/home/sprite/.ssh/sp_pubkey.pub"},
+	}); err != nil {
+		return fmt.Errorf("uploading public key to sprite: %w", err)
+	}
+
+	// Install openssh-server if needed, configure auth, add key
+	setupCmd := `
+		set -e
+
+		# Install sshd if missing
+		if ! command -v sshd >/dev/null 2>&1; then
+			sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server 2>/dev/null || true
+		fi
+
+		# Fix ownership and permissions on home dir and .ssh (sshd is strict about these).
+		# Sprites may have /home/sprite owned by ubuntu — sshd rejects authorized_keys
+		# unless the home dir is owned by the authenticating user.
+		sudo chown sprite:sprite /home/sprite
+		chmod 755 /home/sprite
+		chmod 700 /home/sprite/.ssh
+
+		# Write authorized_keys fresh from the uploaded key (avoid append duplicates)
+		cp /home/sprite/.ssh/sp_pubkey.pub /home/sprite/.ssh/authorized_keys
+		chmod 600 /home/sprite/.ssh/authorized_keys
+		chown -R sprite:sprite /home/sprite/.ssh
+
+		# Configure sshd
+		sudo mkdir -p /run/sshd
+		sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+		sudo sed -i 's/PubkeyAuthentication no/PubkeyAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+
+		# Clear any auth log so we get fresh entries
+		sudo truncate -s 0 /var/log/auth.log 2>/dev/null || true
+
+		# Restart sshd to pick up config changes
+		sudo systemctl restart ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || sudo /usr/sbin/sshd 2>/dev/null
+
+		# Verify and dump diagnostics
+		sleep 1
+		echo "HOME_PERMS: $(ls -ld /home/sprite)"
+		echo "SSH_DIR_PERMS: $(ls -ld /home/sprite/.ssh)"
+		echo "AUTH_KEYS_PERMS: $(ls -la /home/sprite/.ssh/authorized_keys)"
+		echo "WHOAMI: $(whoami)"
+		echo "KEY_FINGERPRINT: $(ssh-keygen -lf /home/sprite/.ssh/authorized_keys 2>/dev/null || echo unknown)"
+		echo "SSHD_CONFIG_AUTHKEYS: $(grep -i AuthorizedKeysFile /etc/ssh/sshd_config 2>/dev/null || echo default)"
+		echo "SSHD_CONFIG_PUBKEY: $(grep -i PubkeyAuthentication /etc/ssh/sshd_config 2>/dev/null || echo default)"
+		if ss -tlnp 2>/dev/null | grep -q ':22 '; then
+			echo "SSHD_OK"
+		elif netstat -tlnp 2>/dev/null | grep -q ':22 '; then
+			echo "SSHD_OK"
+		else
+			echo "SSHD_FAIL: port 22 not listening"
+			sudo systemctl status ssh 2>/dev/null || sudo service ssh status 2>/dev/null || true
+			ps aux | grep sshd 2>/dev/null || true
+		fi
+	`
+	out, err := m.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", setupCmd},
+	})
+	if err != nil {
+		return fmt.Errorf("configuring SSH server: %w", err)
+	}
+	outStr := strings.TrimSpace(string(out))
+	slog.Info("ssh_setup: configuration result", "sprite", spriteName, "output", outStr)
+
+	if !strings.Contains(outStr, "SSHD_OK") {
+		return fmt.Errorf("sshd verification failed: %s", outStr)
+	}
+
+	return nil
+}
+
+// StartProxy starts a sprite proxy forwarding a local port to SSH port 22 on the sprite.
+// Returns the proxy command (caller must manage the process) and the local port.
+// If the proxy exits immediately (e.g., sprite is warm/cold and can't be reached),
+// returns the proxy's stderr output in the error for diagnostics.
+func (m *Manager) StartProxy(spriteName string) (*exec.Cmd, int, error) {
+	port := ComputeSSHPort(spriteName)
+	portMapping := fmt.Sprintf("%d:22", port)
+
+	// Kill any stale proxy on this port before starting
+	killStaleProxies(spriteName, port)
+
+	slog.Info("proxy: starting", "sprite", spriteName, "port", port, "mapping", portMapping)
+
+	cmd, err := m.client.StartProxy(sprite.ProxyOptions{
+		Sprite: spriteName,
+		Ports:  []string{portMapping},
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("starting proxy: %w", err)
+	}
+
+	// Wait for proxy to be listening, checking that it's still alive
+	if err := waitForPortOrDeath(cmd, port, 30*time.Second); err != nil {
+		stderr := sprite.ProxyStderr(cmd)
+		if stderr != "" {
+			slog.Error("proxy: failed", "sprite", spriteName, "port", port, "stderr", stderr)
+			return nil, 0, fmt.Errorf("proxy failed (port %d): %s", port, strings.TrimSpace(stderr))
+		}
+		cmd.Process.Kill()
+		return nil, 0, fmt.Errorf("waiting for proxy port %d: %w", port, err)
+	}
+
+	slog.Info("proxy: listening", "sprite", spriteName, "port", port, "pid", cmd.Process.Pid)
+	return cmd, port, nil
+}
+
+// killStaleProxies finds and kills any process listening on the deterministic
+// SSH proxy port, then waits for the port to actually be free.
+func killStaleProxies(spriteName string, port int) {
+	// Use lsof to find the PID of whatever is listening on our port.
+	// -t returns just the PID(s), -i selects by address, -sTCP:LISTEN filters.
+	out, err := exec.Command("lsof", "-t", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Output()
+	if err != nil {
+		return // Port is free
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		slog.Info("proxy: killing stale process on port", "sprite", spriteName, "port", port, "pid", pid)
+		proc, _ := os.FindProcess(pid)
+		if proc != nil {
+			proc.Signal(syscall.SIGTERM)
+		}
+	}
+
+	// Wait for the port to actually be free (up to 5s)
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if exec.Command("lsof", "-t", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Run() != nil {
+			slog.Info("proxy: port is free", "sprite", spriteName, "port", port)
+			return
+		}
+	}
+
+	// Last resort: SIGKILL anything still on the port
+	slog.Warn("proxy: port still occupied after SIGTERM, force-killing", "sprite", spriteName, "port", port)
+	out, err = exec.Command("lsof", "-t", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Output()
+	if err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			pid, err := strconv.Atoi(strings.TrimSpace(line))
+			if err == nil && pid > 0 {
+				proc, _ := os.FindProcess(pid)
+				if proc != nil {
+					proc.Kill()
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// waitForPortOrDeath polls until a local TCP port is accepting connections,
+// or detects the proxy process has exited (whichever comes first).
+// Does NOT call cmd.Wait() — the caller (monitorProxy) owns that.
+func waitForPortOrDeath(cmd *exec.Cmd, port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		// Check if process is still alive using signal 0
+		if cmd.Process != nil {
+			if err := syscall.Kill(cmd.Process.Pid, 0); err != nil {
+				// Process is gone — give it a moment for stderr buffer to fill
+				time.Sleep(100 * time.Millisecond)
+				stderr := sprite.ProxyStderr(cmd)
+				if stderr != "" {
+					return fmt.Errorf("proxy died before port ready\nstderr: %s", strings.TrimSpace(stderr))
+				}
+				return fmt.Errorf("proxy died before port ready (pid %d)", cmd.Process.Pid)
+			}
+		}
+
+		// Check if port is listening
+		if err := exec.Command("lsof", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN").Run(); err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("port %d not listening after %v", port, timeout)
+}
+
+// AddSSHConfig adds a temporary SSH config entry for Mutagen to use.
+func AddSSHConfig(spriteName string, port int) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("getting home directory: %w", err)
+	}
+
+	configPath := filepath.Join(home, ".ssh", "config")
+	alias := SSHHostAlias(spriteName)
+
+	// Include IdentityFile so SSH uses the right key even without an agent
+	identityFile := filepath.Join(home, ".ssh", "id_ed25519")
+
+	entry := fmt.Sprintf("# sp-managed: %s\nHost %s\n  HostName localhost\n  Port %d\n  User sprite\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n# sp-end: %s\n",
+		alias, alias, port, identityFile, alias)
+
+	slog.Debug("ssh_config: writing entry", "alias", alias, "port", port, "identity", identityFile)
+
+	// Remove old entry if present, then append new one
+	if err := removeSSHConfigEntry(configPath, alias); err != nil {
+		// Non-fatal: file might not exist yet
+		_ = err
+	}
+
+	// Ensure proper separation from existing content: read the file to check
+	// if it ends with a newline, and prepend a blank line separator if needed.
+	prefix := "\n"
+	if existing, err := os.ReadFile(configPath); err == nil {
+		if len(existing) == 0 {
+			prefix = ""
+		} else if bytes.HasSuffix(existing, []byte("\n\n")) {
+			prefix = ""
+		} else if bytes.HasSuffix(existing, []byte("\n")) {
+			// ends with single newline — add one blank line
+			prefix = "\n"
+		} else {
+			// no trailing newline at all
+			prefix = "\n\n"
+		}
+	} else {
+		// File doesn't exist yet
+		prefix = ""
+	}
+
+	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening SSH config: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(prefix + entry); err != nil {
+		return fmt.Errorf("writing SSH config entry: %w", err)
+	}
+
+	return nil
+}
+
+// RemoveSSHConfig removes the temporary SSH config entry for a sprite.
+func RemoveSSHConfig(spriteName string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("getting home directory: %w", err)
+	}
+	configPath := filepath.Join(home, ".ssh", "config")
+	alias := SSHHostAlias(spriteName)
+	return removeSSHConfigEntry(configPath, alias)
+}
+
+// CleanupStaleSSHConfigs removes SSH config entries for sprites that no longer
+// have active Mutagen sessions. Called during daemon startup or periodic cleanup.
+func CleanupStaleSSHConfigs() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("getting home directory: %w", err)
+	}
+	configPath := filepath.Join(home, ".ssh", "config")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find all sp-managed aliases
+	var managedAliases []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# sp-managed: ") {
+			alias := strings.TrimPrefix(line, "# sp-managed: ")
+			managedAliases = append(managedAliases, alias)
+		}
+	}
+
+	// Check each alias — if the corresponding Mutagen session doesn't exist,
+	// the SSH config entry is stale and should be removed
+	var removed []string
+	for _, alias := range managedAliases {
+		// Alias format is "sprite-mutagen-<name>", sprite name is after that prefix
+		spriteName := strings.TrimPrefix(alias, "sprite-mutagen-")
+		if !MutagenSessionExists(spriteName) {
+			if err := removeSSHConfigEntry(configPath, alias); err == nil {
+				removed = append(removed, alias)
+				slog.Info("ssh_cleanup: removed stale config entry", "alias", alias)
+			}
+		}
+	}
+
+	return removed, nil
+}
+
+// removeSSHConfigEntry removes a managed SSH config block identified by the alias marker.
+func removeSSHConfigEntry(configPath, alias string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+
+	startMarker := "# sp-managed: " + alias
+	endMarker := "# sp-end: " + alias
+
+	lines := strings.Split(string(data), "\n")
+	var result []string
+	inBlock := false
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == startMarker {
+			inBlock = true
+			continue
+		}
+		if strings.TrimSpace(line) == endMarker {
+			inBlock = false
+			continue
+		}
+		if !inBlock {
+			result = append(result, line)
+		}
+	}
+
+	// Collapse runs of 3+ blank lines down to at most 1, and trim trailing blank lines.
+	var cleaned []string
+	consecutiveBlanks := 0
+	for _, line := range result {
+		if strings.TrimSpace(line) == "" {
+			consecutiveBlanks++
+			if consecutiveBlanks <= 1 {
+				cleaned = append(cleaned, line)
+			}
+		} else {
+			consecutiveBlanks = 0
+			cleaned = append(cleaned, line)
+		}
+	}
+	// Trim trailing blank lines
+	for len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) == "" {
+		cleaned = cleaned[:len(cleaned)-1]
+	}
+	// Ensure file ends with a newline
+	output := strings.Join(cleaned, "\n") + "\n"
+
+	return os.WriteFile(configPath, []byte(output), 0o600)
+}
+
+// MutagenSyncMode translates our sync mode constants into Mutagen CLI flags.
+// For directional modes it also returns whether to swap alpha/beta ordering.
+// Alpha is the first positional arg (normally local), beta is the second (normally remote).
+func MutagenSyncMode(mode string) (mutagenMode string, swapAlphaBeta bool) {
+	switch mode {
+	case "one-way-replica-to-remote":
+		return "one-way-replica", false // local (alpha) -> remote (beta)
+	case "one-way-replica-to-local":
+		return "one-way-replica", true // remote (alpha) -> local (beta)
+	case "one-way-safe-to-remote":
+		return "one-way-safe", false // local (alpha) -> remote (beta)
+	case "one-way-safe-to-local":
+		return "one-way-safe", true // remote (alpha) -> local (beta)
+	default:
+		return "two-way-safe", false
+	}
+}
+
+// StartMutagenSession creates a new Mutagen sync session between localDir and the sprite.
+// The syncMode parameter controls the Mutagen sync mode; pass "" for the default two-way-safe.
+func (m *Manager) StartMutagenSession(spriteName, localDir, remoteDir, syncMode string) (string, error) {
+	sessionName := SessionName(spriteName)
+	alias := SSHHostAlias(spriteName)
+
+	// Build ignore arguments from .gitignore
+	ignorePatterns := CollectIgnorePatterns(localDir)
+	var ignoreArgs []string
+	for _, p := range ignorePatterns {
+		ignoreArgs = append(ignoreArgs, "--ignore", p)
+	}
+
+	// Resolve Mutagen mode and alpha/beta ordering
+	mutagenMode, swapAlphaBeta := MutagenSyncMode(syncMode)
+	alpha := localDir
+	beta := fmt.Sprintf("%s:%s", alias, remoteDir)
+	if swapAlphaBeta {
+		alpha, beta = beta, alpha
+	}
+
+	// Build mutagen sync create command
+	args := []string{"sync", "create",
+		"--name", sessionName,
+		"--sync-mode", mutagenMode,
+	}
+	args = append(args, ignoreArgs...)
+	args = append(args, alpha, beta)
+
+	cmd := exec.Command("mutagen", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("creating mutagen session: %w\n%s", err, string(out))
+	}
+
+	// Get the session identifier
+	id, err := getMutagenSessionID(sessionName)
+	if err != nil {
+		return sessionName, nil // Return name even if we can't get ID
+	}
+
+	return id, nil
+}
+
+// FlushMutagenSession flushes pending changes for a Mutagen sync session with
+// a 15-second timeout. This ensures both sides agree before tearing down the session.
+func FlushMutagenSession(spriteName string) error {
+	sessionName := SessionName(spriteName)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "mutagen", "sync", "flush", sessionName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("flushing mutagen session %q: %w\n%s", sessionName, err, string(out))
+	}
+	return nil
+}
+
+// ResetMutagenSession clears the internal snapshot for a Mutagen sync session,
+// forcing a full rescan of both alpha and beta on the next sync cycle. Use this
+// when Mutagen reports "watching" but files appear out of date — the reset
+// discards cached state so Mutagen re-evaluates every file.
+func ResetMutagenSession(spriteName string) error {
+	sessionName := SessionName(spriteName)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "mutagen", "sync", "reset", sessionName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("resetting mutagen session %q: %w\n%s", sessionName, err, string(out))
+	}
+	return nil
+}
+
+// TerminateMutagenSession stops and removes a Mutagen sync session.
+func TerminateMutagenSession(spriteName string) error {
+	sessionName := SessionName(spriteName)
+	cmd := exec.Command("mutagen", "sync", "terminate", sessionName)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("terminating mutagen session %q: %w\n%s", sessionName, err, string(out))
+	}
+	return nil
+}
+
+// GetMutagenStatus queries the current status of a Mutagen sync session.
+func GetMutagenStatus(spriteName string) (*SessionState, error) {
+	sessionName := SessionName(spriteName)
+
+	out, err := exec.Command("mutagen", "sync", "list", sessionName).Output()
+	if err != nil {
+		return nil, fmt.Errorf("listing mutagen session %q: %w", sessionName, err)
+	}
+
+	return parseMutagenStatus(sessionName, string(out)), nil
+}
+
+// parseMutagenStatus extracts session state from mutagen sync list output.
+func parseMutagenStatus(name, output string) *SessionState {
+	state := &SessionState{
+		Name:   name,
+		Status: "none",
+	}
+
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "Identifier:") {
+			state.MutagenID = strings.TrimSpace(strings.TrimPrefix(line, "Identifier:"))
+		}
+
+		if strings.HasPrefix(line, "Status:") {
+			statusText := strings.TrimSpace(strings.TrimPrefix(line, "Status:"))
+			state.Status = normalizeMutagenStatus(statusText)
+		}
+
+		if strings.HasPrefix(line, "Connected:") {
+			connected := strings.TrimSpace(strings.TrimPrefix(line, "Connected:"))
+			// This appears under Alpha and Beta sections
+			if !state.AlphaConnected {
+				state.AlphaConnected = connected == "Yes"
+			} else {
+				state.BetaConnected = connected == "Yes"
+			}
+		}
+
+		if strings.Contains(line, "conflict") || strings.Contains(line, "Conflict") {
+			// Try to extract conflict count
+			parts := strings.Fields(line)
+			for _, p := range parts {
+				if n, err := strconv.Atoi(p); err == nil && n > 0 {
+					state.Conflicts = n
+					break
+				}
+			}
+		}
+
+		if strings.HasPrefix(line, "Last error:") {
+			state.LastError = strings.TrimSpace(strings.TrimPrefix(line, "Last error:"))
+		}
+	}
+
+	return state
+}
+
+// normalizeMutagenStatus converts Mutagen's verbose status to our short form.
+func normalizeMutagenStatus(status string) string {
+	status = strings.ToLower(status)
+	switch {
+	case strings.Contains(status, "watching"):
+		return "watching"
+	case strings.Contains(status, "scanning"):
+		return "syncing"
+	case strings.Contains(status, "staging"):
+		return "syncing"
+	case strings.Contains(status, "transitioning"):
+		return "syncing"
+	case strings.Contains(status, "saving"):
+		return "syncing"
+	case strings.Contains(status, "connecting"):
+		return "connecting"
+	case strings.Contains(status, "halted"):
+		return "error"
+	default:
+		return "unknown"
+	}
+}
+
+// getMutagenSessionID gets the session identifier from mutagen sync list.
+func getMutagenSessionID(sessionName string) (string, error) {
+	out, err := exec.Command("mutagen", "sync", "list", sessionName).Output()
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Identifier:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Identifier:")), nil
+		}
+	}
+	return "", fmt.Errorf("identifier not found in output")
+}
+
+// MutagenSessionExists checks if a named Mutagen session exists.
+func MutagenSessionExists(spriteName string) bool {
+	sessionName := SessionName(spriteName)
+	err := exec.Command("mutagen", "sync", "list", sessionName).Run()
+	return err == nil
+}
+
+// TestSSHConnection verifies SSH connectivity through the proxy.
+// If done is non-nil and closed, the test aborts early (e.g., proxy died).
+func TestSSHConnection(spriteName string, port int, done <-chan struct{}) error {
+	alias := SSHHostAlias(spriteName)
+
+	// Clear any stale known_hosts entry
+	exec.Command("ssh-keygen", "-R", fmt.Sprintf("[localhost]:%d", port)).Run()
+
+	for attempt := 0; attempt < 10; attempt++ {
+		// Check if we've been told to stop
+		if done != nil {
+			select {
+			case <-done:
+				return fmt.Errorf("SSH test aborted: proxy died for %s (port %d)", alias, port)
+			default:
+			}
+		}
+
+		cmd := exec.Command("ssh", "-o", "ConnectTimeout=5",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			alias, "echo", "ok")
+		out, err := cmd.CombinedOutput()
+		if err == nil && strings.Contains(string(out), "ok") {
+			slog.Info("ssh_test: connection succeeded", "sprite", spriteName, "attempt", attempt+1)
+			return nil
+		}
+		// Log the SSH error output for diagnostics
+		slog.Debug("ssh_test: attempt failed",
+			"sprite", spriteName, "attempt", attempt+1,
+			"error", err, "output", string(out))
+
+		// Sleep with early abort on proxy death
+		sleepDur := time.Duration(attempt+1) * time.Second
+		if done != nil {
+			select {
+			case <-done:
+				return fmt.Errorf("SSH test aborted: proxy died for %s (port %d)", alias, port)
+			case <-time.After(sleepDur):
+			}
+		} else {
+			time.Sleep(sleepDur)
+		}
+	}
+
+	return fmt.Errorf("SSH connection to %s (port %d) failed after 10 attempts", alias, port)
+}

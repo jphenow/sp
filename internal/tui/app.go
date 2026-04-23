@@ -1,0 +1,1059 @@
+package tui
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/jphenow/sp/internal/daemon"
+	"github.com/jphenow/sp/internal/store"
+)
+
+// binaryCheckInterval is how often the TUI checks if the sp binary has changed.
+const binaryCheckInterval = 10 * time.Second
+
+// pollInterval is how often the TUI re-fetches the sprite list from the daemon
+// to pick up newly added/imported sprites and status changes.
+const pollInterval = 3 * time.Second
+
+// view represents which screen the TUI is showing.
+type view int
+
+const (
+	viewDashboard view = iota
+	viewDetail
+	viewTagInput
+)
+
+// FilterOptions holds the TUI's initial filter configuration.
+type FilterOptions struct {
+	Tags       []string
+	PathPrefix string
+	NameFilter string
+}
+
+// Model is the top-level Bubbletea model for the sp TUI.
+type Model struct {
+	client  *daemon.Client
+	sprites []*store.Sprite
+	tags    map[string][]string // sprite name -> tags
+
+	// View state
+	currentView view
+	width       int
+	height      int
+
+	// Dashboard state
+	cursor      int
+	filterInput textinput.Model
+	filtering   bool
+	filterOpts  FilterOptions
+
+	// Detail state
+	selectedSprite *store.Sprite
+	selectedTags   []string
+
+	// Tag input state
+	tagInput    textinput.Model
+	tagging     bool   // when true, the tag text input is active
+	tagTarget   string // sprite name being tagged
+	tagRemoving bool   // true if the 'T' (remove) variant was pressed
+
+	// Sync menu state
+	syncMenu       bool          // when true, the sync action submenu is visible
+	syncMenuTarget *store.Sprite // sprite the sync menu applies to
+
+	// Delete confirmation state
+	confirmDelete bool   // when true, waiting for y/n to confirm delete
+	deleteName    string // name of sprite pending deletion
+
+	// Binary change detection
+	startBinaryHash string // hash at TUI startup
+	binaryChanged   bool   // true if we detected a new binary
+
+	// Error display
+	err     error
+	message string
+}
+
+// spriteListMsg is sent when the sprite list is refreshed.
+type spriteListMsg struct {
+	sprites []*store.Sprite
+	tags    map[string][]string
+}
+
+// stateUpdateMsg is sent when the daemon broadcasts a state change.
+type stateUpdateMsg struct {
+	update daemon.StateUpdate
+}
+
+// errMsg wraps an error for the TUI.
+type errMsg struct {
+	err error
+}
+
+// msgMsg carries a status message to display briefly.
+type msgMsg string
+
+// tickMsg is sent periodically to trigger a sprite list refresh.
+type tickMsg time.Time
+
+// binaryCheckMsg is sent periodically to check if the sp binary has changed.
+type binaryCheckMsg time.Time
+
+// binaryChangedMsg indicates the on-disk binary differs from what's running.
+type binaryChangedMsg struct{}
+
+// consoleFinishedMsg is sent when an interactive console session ends and
+// control returns to the TUI.
+type consoleFinishedMsg struct {
+	err error
+}
+
+// syncToggledMsg is sent after a sync start/stop operation completes.
+type syncToggledMsg struct {
+	name   string
+	action string // "started" or "stopped"
+	err    error
+}
+
+// syncResyncMsg is sent after a resync-with-mode operation is dispatched.
+type syncResyncMsg struct {
+	name string
+	mode string // human-readable description of the mode
+	err  error
+}
+
+// deleteResultMsg is sent after a sprite delete operation completes.
+type deleteResultMsg struct {
+	name string
+	err  error
+}
+
+// setupResultMsg is sent after a setup.conf push operation completes.
+type setupResultMsg struct {
+	name string // sprite name, or "all" for bulk
+	msg  string // success message from daemon
+	err  error
+}
+
+// NewModel creates a new TUI model connected to the daemon.
+func NewModel(client *daemon.Client, opts FilterOptions) Model {
+	ti := textinput.New()
+	ti.Placeholder = "filter by name, tag, or path..."
+	ti.CharLimit = 100
+	ti.Width = 40
+
+	// Pre-populate filter if provided
+	if opts.NameFilter != "" {
+		ti.SetValue(opts.NameFilter)
+	}
+
+	hash, _ := daemon.BinaryHash()
+
+	tagTi := textinput.New()
+	tagTi.Placeholder = "tag name..."
+	tagTi.CharLimit = 50
+	tagTi.Width = 30
+
+	return Model{
+		client:          client,
+		filterInput:     ti,
+		tagInput:        tagTi,
+		filterOpts:      opts,
+		tags:            make(map[string][]string),
+		startBinaryHash: hash,
+	}
+}
+
+// Init returns the initial command to fetch sprites and start the periodic poll ticker.
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(
+		m.fetchSprites,
+		tickCmd(),
+		binaryCheckCmd(),
+	)
+}
+
+// binaryCheckCmd returns a tea.Cmd that sends a binaryCheckMsg after the check interval.
+func binaryCheckCmd() tea.Cmd {
+	return tea.Tick(binaryCheckInterval, func(t time.Time) tea.Msg {
+		return binaryCheckMsg(t)
+	})
+}
+
+// tickCmd returns a tea.Cmd that sends a tickMsg after pollInterval.
+func tickCmd() tea.Cmd {
+	return tea.Tick(pollInterval, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+// Update handles messages and user input.
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+
+	case spriteListMsg:
+		m.sprites = msg.sprites
+		m.tags = msg.tags
+		if m.cursor >= len(m.sprites) {
+			m.cursor = max(0, len(m.sprites)-1)
+		}
+		return m, nil
+
+	case tickMsg:
+		// Periodic poll: re-fetch the sprite list and schedule the next tick.
+		// This ensures new imports and status changes always appear.
+		return m, tea.Batch(m.fetchSprites, tickCmd())
+
+	case binaryCheckMsg:
+		return m, tea.Batch(m.checkBinaryChanged, binaryCheckCmd())
+
+	case binaryChangedMsg:
+		m.binaryChanged = true
+		// Auto re-exec: the TUI replaces itself with the new binary
+		return m, m.reExec
+
+	case stateUpdateMsg:
+		// Refresh sprite list on any state change
+		return m, m.fetchSprites
+
+	case consoleFinishedMsg:
+		// Console session ended — refresh sprites to pick up any changes.
+		if msg.err != nil {
+			m.err = msg.err
+		}
+		return m, m.fetchSprites
+
+	case syncToggledMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Sync %s for %s", msg.action, msg.name)
+		}
+		return m, m.fetchSprites
+
+	case syncResyncMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Resync (%s) started for %s", msg.mode, msg.name)
+		}
+		return m, m.fetchSprites
+
+	case deleteResultMsg:
+		m.confirmDelete = false
+		m.deleteName = ""
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Deleted sprite %s", msg.name)
+			// If we were viewing the deleted sprite's detail, go back
+			if m.currentView == viewDetail && m.selectedSprite != nil && m.selectedSprite.Name == msg.name {
+				m.currentView = viewDashboard
+				m.selectedSprite = nil
+			}
+		}
+		return m, m.fetchSprites
+
+	case setupResultMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.message = fmt.Sprintf("Setup: %s — %s", msg.name, msg.msg)
+		}
+		return m, nil
+
+	case reconnectedMsg:
+		// Daemon connection was broken and we reconnected. Swap the client
+		// and immediately re-fetch sprites.
+		if m.client != nil {
+			m.client.Close()
+		}
+		m.client = msg.client
+		m.err = nil
+		m.message = "reconnected to daemon"
+		return m, m.fetchSprites
+
+	case errMsg:
+		m.err = msg.err
+		return m, nil
+
+	case msgMsg:
+		m.message = string(msg)
+		return m, nil
+	}
+
+	// Update filter input if filtering
+	if m.filtering {
+		var cmd tea.Cmd
+		m.filterInput, cmd = m.filterInput.Update(msg)
+		return m, cmd
+	}
+
+	// Update tag input if tagging
+	if m.tagging {
+		var cmd tea.Cmd
+		m.tagInput, cmd = m.tagInput.Update(msg)
+		return m, cmd
+	}
+
+	return m, nil
+}
+
+// handleKey processes keyboard input based on current view.
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Sync menu intercepts all keys
+	if m.syncMenu {
+		return m.handleSyncMenuKey(msg)
+	}
+
+	// Delete confirmation intercepts all keys
+	if m.confirmDelete {
+		return m.handleDeleteConfirm(msg)
+	}
+
+	// Tag input intercepts all keys
+	if m.tagging {
+		return m.handleTagKey(msg)
+	}
+
+	// Global keys
+	switch msg.String() {
+	case "ctrl+c", "q":
+		if m.filtering {
+			m.filtering = false
+			m.filterInput.Blur()
+			return m, nil
+		}
+		if m.currentView == viewDetail {
+			m.currentView = viewDashboard
+			return m, nil
+		}
+		return m, tea.Quit
+	}
+
+	if m.filtering {
+		return m.handleFilterKey(msg)
+	}
+
+	switch m.currentView {
+	case viewDashboard:
+		return m.handleDashboardKey(msg)
+	case viewDetail:
+		return m.handleDetailKey(msg)
+	}
+
+	return m, nil
+}
+
+// handleDashboardKey processes keys in the main list view.
+func (m Model) handleDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < len(m.sprites)-1 {
+			m.cursor++
+		}
+	case "enter":
+		if len(m.sprites) > 0 && m.cursor < len(m.sprites) {
+			m.selectedSprite = m.sprites[m.cursor]
+			m.selectedTags = m.tags[m.selectedSprite.Name]
+			m.currentView = viewDetail
+		}
+	case "f":
+		m.filtering = true
+		m.filterInput.Focus()
+		return m, textinput.Blink
+	case "r":
+		return m, m.fetchSprites
+	case "t":
+		// Add a tag to the selected sprite
+		if s := m.selectedDashboardSprite(); s != nil {
+			m.tagging = true
+			m.tagTarget = s.Name
+			m.tagRemoving = false
+			m.tagInput.SetValue("")
+			m.tagInput.Focus()
+			return m, textinput.Blink
+		}
+	case "T":
+		// Remove a tag from the selected sprite
+		if s := m.selectedDashboardSprite(); s != nil {
+			m.tagging = true
+			m.tagTarget = s.Name
+			m.tagRemoving = true
+			m.tagInput.SetValue("")
+			m.tagInput.Focus()
+			return m, textinput.Blink
+		}
+	case "o":
+		// Open sprite URL in browser
+		if s := m.selectedDashboardSprite(); s != nil {
+			return m, m.openInBrowser(s)
+		}
+	case "c":
+		// Connect to sprite via interactive console
+		if s := m.selectedDashboardSprite(); s != nil {
+			return m, m.connectConsole(s)
+		}
+	case "s":
+		// Open sync action menu
+		if s := m.selectedDashboardSprite(); s != nil {
+			m.syncMenu = true
+			m.syncMenuTarget = s
+		}
+	case "d":
+		// Delete sprite (enter confirmation mode)
+		if s := m.selectedDashboardSprite(); s != nil {
+			m.confirmDelete = true
+			m.deleteName = s.Name
+		}
+	case "u":
+		// Run setup.conf on the selected sprite
+		if s := m.selectedDashboardSprite(); s != nil {
+			return m, m.runSetup(s)
+		}
+	case "U":
+		// Run setup.conf on all running sprites
+		return m, m.runSetupAll()
+	}
+	return m, nil
+}
+
+// handleDetailKey processes keys in the sprite detail view.
+func (m Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "backspace":
+		m.currentView = viewDashboard
+	case "r":
+		return m, m.fetchSprites
+	case "o":
+		// Open sprite URL in browser
+		if m.selectedSprite != nil {
+			return m, m.openInBrowser(m.selectedSprite)
+		}
+	case "c":
+		// Connect to sprite via interactive console
+		if m.selectedSprite != nil {
+			return m, m.connectConsole(m.selectedSprite)
+		}
+	case "s":
+		// Open sync action menu
+		if m.selectedSprite != nil {
+			m.syncMenu = true
+			m.syncMenuTarget = m.selectedSprite
+		}
+	case "d":
+		// Delete sprite (enter confirmation mode)
+		if m.selectedSprite != nil {
+			m.confirmDelete = true
+			m.deleteName = m.selectedSprite.Name
+		}
+	case "u":
+		// Run setup.conf on this sprite
+		if m.selectedSprite != nil {
+			return m, m.runSetup(m.selectedSprite)
+		}
+	case "U":
+		// Run setup.conf on all running sprites
+		return m, m.runSetupAll()
+	}
+	return m, nil
+}
+
+// handleFilterKey processes keys when the filter input is active.
+func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		m.filtering = false
+		m.filterInput.Blur()
+		m.filterOpts.NameFilter = m.filterInput.Value()
+		return m, m.fetchSprites
+	case "esc":
+		m.filtering = false
+		m.filterInput.Blur()
+		m.filterInput.SetValue("")
+		m.filterOpts.NameFilter = ""
+		return m, m.fetchSprites
+	}
+
+	var cmd tea.Cmd
+	m.filterInput, cmd = m.filterInput.Update(msg)
+	return m, cmd
+}
+
+// View renders the current state of the TUI.
+func (m Model) View() string {
+	switch m.currentView {
+	case viewDetail:
+		return m.viewDetail()
+	default:
+		return m.viewDashboard()
+	}
+}
+
+// viewDashboard renders the main sprite list view.
+func (m Model) viewDashboard() string {
+	var b strings.Builder
+
+	// Header
+	running, warm, cold := 0, 0, 0
+	for _, s := range m.sprites {
+		switch s.Status {
+		case "running":
+			running++
+		case "warm":
+			warm++
+		case "cold":
+			cold++
+		}
+	}
+
+	header := fmt.Sprintf("sp — %d sprites (%d running, %d warm, %d cold)",
+		len(m.sprites), running, warm, cold)
+	if len(m.filterOpts.Tags) > 0 {
+		header += fmt.Sprintf("  [filter: %s]", strings.Join(m.filterOpts.Tags, ", "))
+	}
+	if m.filterOpts.PathPrefix != "" {
+		header += fmt.Sprintf("  [prefix: %s]", m.filterOpts.PathPrefix)
+	}
+	b.WriteString(HeaderStyle.Render(header))
+	b.WriteString("\n")
+
+	// Filter input
+	if m.filtering {
+		b.WriteString(m.filterInput.View())
+		b.WriteString("\n\n")
+	}
+
+	// Tag input
+	if m.tagging {
+		action := "Add tag to"
+		if m.tagRemoving {
+			action = "Remove tag from"
+		}
+		b.WriteString(fmt.Sprintf("%s %s: ", action, m.tagTarget))
+		b.WriteString(m.tagInput.View())
+		b.WriteString("\n\n")
+	}
+
+	// Table header
+	headerRow := fmt.Sprintf("  %-35s %-10s %-12s %-40s %s",
+		"NAME", "STATUS", "SYNC", "LOCAL PATH", "TAGS")
+	b.WriteString(NormalRowStyle.Render(headerRow))
+	b.WriteString("\n")
+
+	// Sprite rows
+	if len(m.sprites) == 0 {
+		b.WriteString(NormalRowStyle.Render("\n  No sprites found. Use 'sp import' to add existing sprites."))
+	}
+
+	for i, s := range m.sprites {
+		cursor := "  "
+		if i == m.cursor {
+			cursor = "> "
+		}
+
+		localPath := s.LocalPath
+		if len(localPath) > 38 {
+			localPath = "…" + localPath[len(localPath)-37:]
+		}
+
+		tagList := ""
+		if tags, ok := m.tags[s.Name]; ok && len(tags) > 0 {
+			tagList = TagStyle.Render(strings.Join(tags, ", "))
+		}
+
+		name := s.Name
+		if len(name) > 33 {
+			name = name[:32] + "…"
+		}
+
+		row := fmt.Sprintf("%s%-35s %-10s %-12s %-40s %s",
+			cursor, name,
+			StatusStyle(s.Status),
+			SyncStatusStyle(s.SyncStatus),
+			localPath, tagList)
+
+		if i == m.cursor {
+			b.WriteString(SelectedRowStyle.Render(row))
+		} else {
+			b.WriteString(NormalRowStyle.Render(row))
+		}
+		b.WriteString("\n")
+	}
+
+	// Error/message display
+	if m.err != nil {
+		b.WriteString("\n")
+		b.WriteString(ErrorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
+	}
+	if m.message != "" {
+		b.WriteString("\n")
+		b.WriteString(m.message)
+	}
+
+	// Sync menu
+	if m.syncMenu && m.syncMenuTarget != nil {
+		b.WriteString("\n")
+		b.WriteString(m.renderSyncMenu())
+	}
+
+	// Delete confirmation banner
+	if m.confirmDelete {
+		b.WriteString("\n")
+		b.WriteString(ErrorStyle.Render(fmt.Sprintf("Delete sprite %q? [y] confirm  [n/esc] cancel", m.deleteName)))
+	}
+
+	// Help bar
+	b.WriteString("\n")
+	help := "[↑↓/jk] navigate  [enter] details  [o] open  [c] console  [s] sync  [u/U] setup/all  [d] delete  [f] filter  [t/T] tag/untag  [r] refresh  [q] quit"
+	b.WriteString(HelpStyle.Render(help))
+
+	return b.String()
+}
+
+// viewDetail renders the detail view for a single sprite.
+func (m Model) viewDetail() string {
+	s := m.selectedSprite
+	if s == nil {
+		return "No sprite selected"
+	}
+
+	var b strings.Builder
+
+	// Title
+	title := fmt.Sprintf("%s    [%s] [%s]",
+		s.Name, StatusStyle(s.Status), SyncStatusStyle(s.SyncStatus))
+	b.WriteString(HeaderStyle.Render(title))
+	b.WriteString("\n\n")
+
+	// Details
+	details := []struct {
+		label string
+		value string
+	}{
+		{"Sprite ID", s.SpriteID},
+		{"URL", s.URL},
+		{"Local", s.LocalPath},
+		{"Remote", s.RemotePath},
+		{"Repo", s.Repo},
+		{"Org", s.Org},
+		{"Status", StatusStyle(s.Status)},
+		{"Sync Status", SyncStatusStyle(s.SyncStatus)},
+		{"Created", s.CreatedAt.Format("2006-01-02 15:04:05")},
+		{"Last Seen", s.LastSeen.Format("2006-01-02 15:04:05")},
+	}
+
+	for _, d := range details {
+		if d.value == "" || d.value == "0001-01-01 00:00:00" {
+			d.value = "-"
+		}
+		line := DetailLabelStyle.Render(d.label+":") + "  " + DetailValueStyle.Render(d.value)
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+
+	// Sync error
+	if s.SyncError != "" {
+		b.WriteString("\n")
+		b.WriteString(DetailLabelStyle.Render("Sync Error:") + "  ")
+		b.WriteString(ErrorStyle.Render(s.SyncError))
+		b.WriteString("\n")
+	}
+
+	// Tags
+	if len(m.selectedTags) > 0 {
+		b.WriteString("\n")
+		b.WriteString(DetailLabelStyle.Render("Tags:") + "  ")
+		b.WriteString(TagStyle.Render(strings.Join(m.selectedTags, ", ")))
+		b.WriteString("\n")
+	}
+
+	// Sync menu
+	if m.syncMenu && m.syncMenuTarget != nil {
+		b.WriteString("\n")
+		b.WriteString(m.renderSyncMenu())
+	}
+
+	// Delete confirmation banner
+	if m.confirmDelete {
+		b.WriteString("\n")
+		b.WriteString(ErrorStyle.Render(fmt.Sprintf("Delete sprite %q? [y] confirm  [n/esc] cancel", m.deleteName)))
+	}
+
+	// Help
+	b.WriteString("\n")
+	help := "[esc] back  [o] open  [c] console  [s] sync  [u/U] setup/all  [d] delete  [r] refresh  [q] quit"
+	b.WriteString(HelpStyle.Render(help))
+
+	return b.String()
+}
+
+// fetchSprites is a tea.Cmd that queries the daemon for the current sprite list.
+// reconnectedMsg carries a new daemon client after a successful reconnect.
+type reconnectedMsg struct {
+	client *daemon.Client
+}
+
+func (m Model) fetchSprites() tea.Msg {
+	opts := store.ListOptions{
+		Tags:       m.filterOpts.Tags,
+		PathPrefix: m.filterOpts.PathPrefix,
+		NameFilter: m.filterOpts.NameFilter,
+	}
+
+	sprites, err := m.client.ListSprites(opts)
+	if err != nil {
+		// Connection may be broken (daemon restarted). Try to reconnect.
+		newClient, reconErr := daemon.Connect()
+		if reconErr != nil {
+			return errMsg{err: fmt.Errorf("daemon unavailable: %v (reconnect: %v)", err, reconErr)}
+		}
+		// Send reconnect message so Update can swap the client
+		return reconnectedMsg{client: newClient}
+	}
+
+	// Fetch tags for each sprite
+	tags := make(map[string][]string)
+	for _, s := range sprites {
+		t, err := m.client.GetTags(s.Name)
+		if err == nil {
+			tags[s.Name] = t
+		}
+	}
+
+	return spriteListMsg{sprites: sprites, tags: tags}
+}
+
+// checkBinaryChanged is a tea.Cmd that compares the current binary hash to
+// the one at startup. Sends binaryChangedMsg if they differ.
+func (m Model) checkBinaryChanged() tea.Msg {
+	if m.startBinaryHash == "" {
+		return nil
+	}
+	current, err := daemon.BinaryHash()
+	if err != nil {
+		return nil
+	}
+	if current != m.startBinaryHash {
+		return binaryChangedMsg{}
+	}
+	return nil
+}
+
+// reExec replaces the current TUI process with the new binary. It first tells
+// the daemon to restart (so both pick up the new code), then execs itself.
+func (m Model) reExec() tea.Msg {
+	// Tell the daemon to restart too
+	if m.client != nil {
+		m.client.Restart()
+	}
+
+	// Re-exec ourselves with the same args
+	exePath, err := os.Executable()
+	if err != nil {
+		return errMsg{err: fmt.Errorf("re-exec: %w", err)}
+	}
+
+	// Restore terminal state before exec. syscall.Exec replaces the process
+	// so Bubbletea never gets to clean up. Without this, the new process
+	// starts inside an orphaned alt screen buffer.
+	fmt.Fprint(os.Stdout, "\033[?1049l\033[?1000l\033[?1003l\033[?1006l\033[?25h\033[0m")
+
+	execErr := syscall.Exec(exePath, os.Args, os.Environ())
+	// If we get here, exec failed
+	return errMsg{err: fmt.Errorf("re-exec failed: %w", execErr)}
+}
+
+// handleTagKey processes keys when the tag text input is active.
+func (m Model) handleTagKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		tag := strings.TrimSpace(m.tagInput.Value())
+		if tag == "" {
+			m.tagging = false
+			m.tagInput.Blur()
+			return m, nil
+		}
+		m.tagging = false
+		m.tagInput.Blur()
+		name := m.tagTarget
+		removing := m.tagRemoving
+		return m, func() tea.Msg {
+			if removing {
+				if err := m.client.UntagSprite(name, tag); err != nil {
+					return errMsg{err: err}
+				}
+				return msgMsg(fmt.Sprintf("Removed tag %q from %s", tag, name))
+			}
+			if err := m.client.TagSprite(name, tag); err != nil {
+				return errMsg{err: err}
+			}
+			return msgMsg(fmt.Sprintf("Added tag %q to %s", tag, name))
+		}
+	case "esc":
+		m.tagging = false
+		m.tagInput.Blur()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.tagInput, cmd = m.tagInput.Update(msg)
+	return m, cmd
+}
+
+// selectedDashboardSprite returns the sprite at the current cursor position, or nil.
+func (m Model) selectedDashboardSprite() *store.Sprite {
+	if len(m.sprites) > 0 && m.cursor < len(m.sprites) {
+		return m.sprites[m.cursor]
+	}
+	return nil
+}
+
+// openInBrowser opens the sprite's public URL in the default browser.
+func (m Model) openInBrowser(s *store.Sprite) tea.Cmd {
+	return func() tea.Msg {
+		url := s.URL
+		if url == "" {
+			return errMsg{err: fmt.Errorf("no URL for sprite %s", s.Name)}
+		}
+		if err := exec.Command("open", url).Start(); err != nil {
+			return errMsg{err: fmt.Errorf("opening browser: %w", err)}
+		}
+		return msgMsg(fmt.Sprintf("Opened %s", url))
+	}
+}
+
+// connectConsole suspends the TUI and opens an interactive console session to
+// the sprite using `sprite exec`. When the session ends, the TUI resumes.
+func (m Model) connectConsole(s *store.Sprite) tea.Cmd {
+	name := s.Name
+	org := s.Org
+	remotePath := s.RemotePath
+	if remotePath == "" {
+		remotePath = "/home/sprite"
+	}
+
+	shellCmd := fmt.Sprintf(
+		"mkdir -p '%s' && cd '%s' && exec tmux new-session -A -s console bash",
+		remotePath, remotePath,
+	)
+
+	args := []string{"exec"}
+	if org != "" {
+		args = append(args, "-o", org)
+	}
+	args = append(args, "-s", name, "-tty", "sh", "-c", shellCmd)
+
+	c := exec.Command("sprite", args...)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		// Reset terminal mouse tracking modes that tmux may have left enabled
+		fmt.Fprintf(os.Stderr, "\033[?1000l\033[?1003l\033[?1006l")
+		return consoleFinishedMsg{err: err}
+	})
+}
+
+// toggleSync starts or stops sync for a sprite depending on its current sync status.
+func (m Model) toggleSync(s *store.Sprite) tea.Cmd {
+	return func() tea.Msg {
+		name := s.Name
+		switch s.SyncStatus {
+		case "watching", "syncing", "connecting", "recovering", "conflicts":
+			// Sync is active — stop it
+			if err := m.client.StopSync(name); err != nil {
+				return syncToggledMsg{name: name, action: "stopped", err: err}
+			}
+			return syncToggledMsg{name: name, action: "stopped"}
+		default:
+			// Sync is not active — start it
+			if s.LocalPath == "" {
+				return syncToggledMsg{name: name, action: "started",
+					err: fmt.Errorf("no local path configured for %s", name)}
+			}
+			req := daemon.StartSyncRequest{
+				SpriteName: name,
+				LocalPath:  s.LocalPath,
+				RemotePath: s.RemotePath,
+				Org:        s.Org,
+			}
+			if err := m.client.StartSync(req); err != nil {
+				return syncToggledMsg{name: name, action: "started", err: err}
+			}
+			return syncToggledMsg{name: name, action: "started"}
+		}
+	}
+}
+
+// renderSyncMenu renders the sync action submenu for the current target sprite.
+func (m Model) renderSyncMenu() string {
+	s := m.syncMenuTarget
+	var b strings.Builder
+
+	b.WriteString(HeaderStyle.Render(fmt.Sprintf("Sync: %s", s.Name)))
+	b.WriteString("\n")
+
+	if isSyncActive(s) {
+		b.WriteString("  [1] Stop sync\n")
+	} else {
+		b.WriteString("  [1] Start sync (two-way)\n")
+	}
+	b.WriteString("  [2] Force push  local -> sprite  (overwrites sprite)\n")
+	b.WriteString("  [3] Force pull  sprite -> local  (overwrites local)\n")
+	b.WriteString("  [4] Safe push   local -> sprite  (skip conflicts)\n")
+	b.WriteString("  [5] Safe pull   sprite -> local  (skip conflicts)\n")
+	b.WriteString(HelpStyle.Render("  [esc] cancel"))
+
+	return b.String()
+}
+
+// isSyncActive returns true if the sprite's sync status indicates an active session.
+func isSyncActive(s *store.Sprite) bool {
+	switch s.SyncStatus {
+	case "watching", "syncing", "connecting", "recovering", "conflicts":
+		return true
+	default:
+		return false
+	}
+}
+
+// handleSyncMenuKey processes keys when the sync action submenu is visible.
+// The menu shows numbered options for the available sync actions.
+func (m Model) handleSyncMenuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	s := m.syncMenuTarget
+	if s == nil {
+		m.syncMenu = false
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "esc", "q":
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, nil
+	case "1":
+		// Start or stop sync (toggle)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.toggleSync(s)
+	case "2":
+		// Force push: local -> sprite (one-way-replica)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWayReplicaToRemote, "force local -> sprite")
+	case "3":
+		// Force pull: sprite -> local (one-way-replica)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWayReplicaToLocal, "force sprite -> local")
+	case "4":
+		// Safe push: local -> sprite (one-way-safe)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWaySafeToRemote, "safe local -> sprite")
+	case "5":
+		// Safe pull: sprite -> local (one-way-safe)
+		m.syncMenu = false
+		m.syncMenuTarget = nil
+		return m, m.resyncWithMode(s, daemon.SyncModeOneWaySafeToLocal, "safe sprite -> local")
+	}
+	return m, nil
+}
+
+// resyncWithMode dispatches a one-shot resync in the given mode, then restores two-way-safe.
+func (m Model) resyncWithMode(s *store.Sprite, mode daemon.SyncMode, desc string) tea.Cmd {
+	name := s.Name
+	return func() tea.Msg {
+		if err := m.client.ResyncWithMode(name, mode); err != nil {
+			return syncResyncMsg{name: name, mode: desc, err: err}
+		}
+		return syncResyncMsg{name: name, mode: desc}
+	}
+}
+
+// runSetup pushes setup.conf (files and commands) to a single sprite via the daemon.
+func (m Model) runSetup(s *store.Sprite) tea.Cmd {
+	return func() tea.Msg {
+		msg, err := m.client.RunSetup(s.Name)
+		if err != nil {
+			return setupResultMsg{name: s.Name, err: err}
+		}
+		return setupResultMsg{name: s.Name, msg: msg}
+	}
+}
+
+// runSetupAll pushes setup.conf to every tracked running sprite via the daemon.
+func (m Model) runSetupAll() tea.Cmd {
+	return func() tea.Msg {
+		sprites, err := m.client.ListSprites(store.ListOptions{})
+		if err != nil {
+			return setupResultMsg{name: "all", err: fmt.Errorf("listing sprites: %w", err)}
+		}
+
+		var count int
+		var lastErr error
+		for _, s := range sprites {
+			if s.Status != "running" {
+				continue
+			}
+			count++
+			if _, err := m.client.RunSetup(s.Name); err != nil {
+				lastErr = err
+			}
+		}
+
+		if count == 0 {
+			return setupResultMsg{name: "all", msg: "no tracked running sprites found"}
+		}
+		if lastErr != nil {
+			return setupResultMsg{name: "all", err: fmt.Errorf("setup ran on %d sprite(s), last error: %w", count, lastErr)}
+		}
+		return setupResultMsg{name: "all", msg: fmt.Sprintf("setup pushed to %d sprite(s)", count)}
+	}
+}
+
+// handleDeleteConfirm processes keys during delete confirmation mode.
+func (m Model) handleDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		name := m.deleteName
+		return m, m.deleteSprite(name)
+	case "n", "N", "esc":
+		m.confirmDelete = false
+		m.deleteName = ""
+	}
+	return m, nil
+}
+
+// deleteSprite removes a sprite from both the daemon database and the remote
+// Sprites API. Stops sync first if running.
+func (m Model) deleteSprite(name string) tea.Cmd {
+	return func() tea.Msg {
+		// Stop sync first (ignore errors — may not be running)
+		m.client.StopSync(name)
+
+		// Delete from daemon database
+		if err := m.client.DeleteSprite(name); err != nil {
+			return deleteResultMsg{name: name, err: fmt.Errorf("deleting from database: %w", err)}
+		}
+
+		return deleteResultMsg{name: name}
+	}
+}

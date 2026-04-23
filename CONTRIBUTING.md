@@ -242,6 +242,8 @@ Test these scenarios before submitting:
 - [ ] Verify `.gitignore` patterns are respected (files ignored in git should not sync)
 - [ ] Verify nested `.gitignore` files are picked up (e.g., `subdir/.gitignore`)
 - [ ] Verify `.git` is included in sync (explicitly un-ignored)
+- [ ] Verify `.git` lock files and rebase state are excluded (`.git/*.lock`, `.git/rebase-merge`, etc.)
+- [ ] Verify `.git/index`, `.git/refs/`, `.git/logs/` ARE synced (commits/pushes on sprite reflected locally)
 - [ ] Verify git repository state maintained
 - [ ] Test with uncommitted changes
 - [ ] Verify reconnecting to existing sprite does NOT re-tar-sync (remote edits preserved)
