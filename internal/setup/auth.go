@@ -28,6 +28,25 @@ func NewTokenProvider() *TokenProvider {
 	}
 }
 
+// LocalToken returns the Claude Code OAuth token from env or the
+// ~/.claude-token file without ever prompting. Used on reattach paths
+// where blocking on stdin would hang the user inside an existing
+// session. Returns ("", nil) when no valid token is available.
+func (tp *TokenProvider) LocalToken() (string, error) {
+	if token := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); token != "" {
+		return token, nil
+	}
+	data, err := os.ReadFile(tp.tokenPath)
+	if err != nil {
+		return "", nil
+	}
+	token := strings.TrimSpace(string(data))
+	if !isValidToken(token) {
+		return "", nil
+	}
+	return token, nil
+}
+
 // GetToken returns the Claude Code OAuth token from env or file.
 // If no token is available, it prompts the user interactively.
 func (tp *TokenProvider) GetToken() (string, error) {
@@ -401,8 +420,9 @@ sudo -n chown sprite:sprite /home/sprite/.ssh 2>/dev/null || true
 	return err
 }
 
-// SetupSpriteAuth provisions SSH keys, Claude token, and shell config on a
-// sprite in as few exec calls as possible to minimize websocket overhead.
+// SetupSpriteAuth provisions SSH keys, claude.json onboarding bypass, and
+// shell config on a sprite in as few exec calls as possible to minimize
+// websocket overhead.
 //
 // Phase 1: upload SSH keys (needs -file flag, so one exec per file).
 // Phase 2: one mega-script exec that writes all rc files, claude.json, and
@@ -410,9 +430,12 @@ sudo -n chown sprite:sprite /home/sprite/.ssh 2>/dev/null || true
 //	SSH config in a single shell invocation. This is the key
 //	optimization: prior versions did 8+ separate execs at ~5-10s each.
 //
-// If token is empty, the CLAUDE_CODE_OAUTH_TOKEN export is skipped — the
-// caller has already pushed a credentials.json via PushClaudeCredentials.
-func SetupSpriteAuth(client *sprite.Client, spriteName, token string) error {
+// CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT written into rc files —
+// it's injected per-connect via sprite exec -env + tmux setenv -g so the
+// token only lives in running processes and vanishes when the sprite
+// cold-stops. This mirrors the GH_TOKEN handling and avoids leaving a
+// valid token in plaintext on a dormant sprite's filesystem.
+func SetupSpriteAuth(client *sprite.Client, spriteName string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("getting home directory: %w", err)
@@ -441,20 +464,17 @@ func SetupSpriteAuth(client *sprite.Client, spriteName, token string) error {
 	}
 
 	// --- Phase 2: one mega-script for all shell writes ---
-	// Build the auth block content. The block is written to all 3 rc files.
-	exportLine := ""
-	if token != "" {
-		quotedToken := "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
-		exportLine = "export CLAUDE_CODE_OAUTH_TOKEN=" + quotedToken + "\n"
-	}
-	authBlock := fmt.Sprintf(`# sp-claude-auth-begin
+	// Build the auth block. CLAUDE_CODE_OAUTH_TOKEN is NOT written here —
+	// see the function-level comment. The block carries only non-secret
+	// shell hygiene (unsets of competing auth env vars + the bypass alias).
+	authBlock := `# sp-claude-auth-begin
 unset ANTHROPIC_API_KEY
 unset ANTHROPIC_AUTH_TOKEN
 unset CLAUDE_CODE_USE_BEDROCK
 unset CLAUDE_CODE_USE_VERTEX
 unset CLAUDE_CODE_USE_FOUNDRY
-%salias claude='command claude --dangerously-skip-permissions'
-# sp-claude-auth-end`, exportLine)
+alias claude='command claude --dangerously-skip-permissions'
+# sp-claude-auth-end`
 
 	claudeConfig := `{"bypassPermissionsModeAccepted":true,"hasCompletedOnboarding":true}`
 
