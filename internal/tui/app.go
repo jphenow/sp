@@ -861,7 +861,7 @@ func (m Model) connectConsole(s *store.Sprite) tea.Cmd {
 	if org != "" {
 		args = append(args, "-o", org)
 	}
-	args = append(args, "-s", name, "-tty", "sh", "-c", shellCmd)
+	args = append(args, "-s", name, "--tty", "--", "sh", "-c", shellCmd)
 
 	c := exec.Command("sprite", args...)
 	return tea.ExecProcess(c, func(err error) tea.Msg {

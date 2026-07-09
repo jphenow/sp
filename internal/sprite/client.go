@@ -133,10 +133,10 @@ func (c *Client) BuildExecArgs(opts ExecOptions) []string {
 		args = append(args, "-s", opts.Sprite)
 	}
 	if opts.TTY {
-		args = append(args, "-tty")
+		args = append(args, "--tty")
 	}
 	if opts.Dir != "" {
-		args = append(args, "-dir", opts.Dir)
+		args = append(args, "--dir", opts.Dir)
 	}
 	if opts.Detach {
 		args = append(args, "-detach")
@@ -146,10 +146,15 @@ func (c *Client) BuildExecArgs(opts ExecOptions) []string {
 		for k, v := range opts.Env {
 			envParts = append(envParts, k+"="+v)
 		}
-		args = append(args, "-env", strings.Join(envParts, ","))
+		args = append(args, "--env", strings.Join(envParts, ","))
 	}
+	// Multi-char flags must use the double-dash long form: the sprite CLI's
+	// flag parser treats a single-dash multi-char token as grouped
+	// shorthands (e.g. `-file` -> `-f -i -l -e`), which fails on the second
+	// occurrence with "unknown shorthand flag: 'f'". Only -o/-s are real
+	// single-char shorthands.
 	for local, remote := range opts.Files {
-		args = append(args, "-file", local+":"+remote)
+		args = append(args, "--file", local+":"+remote)
 	}
 	// The sprite CLI requires a `--` separator before the command so that
 	// command flags (e.g. `sh -c`) aren't parsed as sprite's own flags.

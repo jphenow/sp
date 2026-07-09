@@ -549,7 +549,7 @@ done
 	if org != "" {
 		args = append(args, "-o", org)
 	}
-	args = append(args, "-s", spriteName, "sh", "-c", script)
+	args = append(args, "-s", spriteName, "--", "sh", "-c", script)
 
 	cmd := exec.Command("sprite", args...)
 	// Setpgid puts the child in its own process group so SIGHUP from sp's
