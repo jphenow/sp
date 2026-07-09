@@ -151,7 +151,14 @@ func (c *Client) BuildExecArgs(opts ExecOptions) []string {
 	for local, remote := range opts.Files {
 		args = append(args, "-file", local+":"+remote)
 	}
-	args = append(args, opts.Command...)
+	// The sprite CLI requires a `--` separator before the command so that
+	// command flags (e.g. `sh -c`) aren't parsed as sprite's own flags.
+	// Without it, `sprite exec -s <name> sh -c '...'` fails with
+	// "unknown shorthand flag: 'c'" and exit status 2.
+	if len(opts.Command) > 0 {
+		args = append(args, "--")
+		args = append(args, opts.Command...)
+	}
 	return args
 }
 
