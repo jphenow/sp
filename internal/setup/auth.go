@@ -444,20 +444,31 @@ func SetupSpriteAuth(client *sprite.Client, spriteName string) error {
 	sshKeyPath := filepath.Join(home, ".ssh", "id_ed25519")
 	sshPubPath := sshKeyPath + ".pub"
 
-	// --- Phase 1: upload SSH keys (need -file flag, so separate execs) ---
-	// Combine private + public key into one exec where possible.
-	files := map[string]string{}
-	if _, err := os.Stat(sshKeyPath); err == nil {
-		files[sshKeyPath] = "/home/sprite/.ssh/id_ed25519"
+	// --- Phase 1: install SSH keys ---
+	// Read the key bytes locally and write them onto the sprite via a
+	// base64 shell redirect rather than `sprite exec --file`. The --file
+	// upload path creates files (and any auto-created parent dirs) owned by
+	// ubuntu:ubuntu, not the sprite user, and has been observed to fail
+	// outright with "input/output error" when opening the destination. A
+	// shell redirect runs as the sprite user, produces sprite-owned files
+	// with correct perms, and sidesteps the CLI upload path entirely — the
+	// same reasoning (and the same base64 -d trick) as PushClaudeCredentials.
+	var keyParts []string
+	if data, err := os.ReadFile(sshKeyPath); err == nil {
+		keyParts = append(keyParts, fmt.Sprintf(
+			"printf '%%s' '%s' | base64 -d > ~/.ssh/id_ed25519\nchmod 600 ~/.ssh/id_ed25519",
+			base64.StdEncoding.EncodeToString(data)))
 	}
-	if _, err := os.Stat(sshPubPath); err == nil {
-		files[sshPubPath] = "/home/sprite/.ssh/id_ed25519.pub"
+	if data, err := os.ReadFile(sshPubPath); err == nil {
+		keyParts = append(keyParts, fmt.Sprintf(
+			"printf '%%s' '%s' | base64 -d > ~/.ssh/id_ed25519.pub\nchmod 644 ~/.ssh/id_ed25519.pub",
+			base64.StdEncoding.EncodeToString(data)))
 	}
-	if len(files) > 0 {
+	if len(keyParts) > 0 {
+		script := "set -e\nmkdir -p ~/.ssh && chmod 700 ~/.ssh\n" + strings.Join(keyParts, "\n") + "\n"
 		if _, err := client.Exec(sprite.ExecOptions{
 			Sprite:  spriteName,
-			Command: []string{"sh", "-c", "mkdir -p ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519 2>/dev/null; chmod 644 ~/.ssh/id_ed25519.pub 2>/dev/null; true"},
-			Files:   files,
+			Command: []string{"sh", "-c", script},
 		}); err != nil {
 			return fmt.Errorf("uploading SSH keys: %w", err)
 		}

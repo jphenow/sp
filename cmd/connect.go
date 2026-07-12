@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/jphenow/sp/internal/daemon"
 	"github.com/jphenow/sp/internal/progress"
@@ -1054,7 +1055,19 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 		tokenRefresh = "tmux setenv -gu CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true\n" + tokenRefresh
 	}
 
-	shellCmd := fmt.Sprintf(`
+	// Work around the sprite CLI's --tty not propagating the initial window
+	// size to the remote PTY: it comes up 0x0, which makes tmux and
+	// full-screen TUIs (claude) render one column off. Seed the PTY size
+	// from the local terminal before tmux starts so it lays out correctly.
+	// Caveat: this fixes only the *initial* size — the CLI also doesn't
+	// forward live SIGWINCH, so resizing the local window mid-session won't
+	// reflow until tmux is detached and reattached.
+	sttyPrefix := ""
+	if rows, cols, ok := localTerminalSize(); ok {
+		sttyPrefix = fmt.Sprintf("stty rows %d cols %d 2>/dev/null || true\n", rows, cols)
+	}
+
+	shellCmd := fmt.Sprintf(`%s
 # Start ssh-agent if not already running. The agent lives in the tmux
 # server's process tree, so it survives reconnects (persistent session).
 # The user runs 'ssh-add' once per session to unlock passphrase-protected
@@ -1077,7 +1090,7 @@ for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_C
   tmux setenv -gu "$v" 2>/dev/null || true
 done
 %sexec tmux new-session -A -s %s -c %s %s
-`, tokenRefresh, shellQuote(tmuxSession), shellQuote(resolved.RemotePath), command)
+`, sttyPrefix, tokenRefresh, shellQuote(tmuxSession), shellQuote(resolved.RemotePath), command)
 
 	env := map[string]string{}
 	if token != "" {
@@ -1108,6 +1121,20 @@ done
 	runErr := cmd.Run()
 	resetTerminal()
 	return runErr
+}
+
+// localTerminalSize returns the local controlling terminal's size (rows,
+// cols) by probing stdout/stdin/stderr in turn. ok is false when none is a
+// TTY (e.g. output is piped), in which case callers should skip the stty
+// seed and let the remote default stand.
+func localTerminalSize() (rows, cols int, ok bool) {
+	for _, f := range []*os.File{os.Stdout, os.Stdin, os.Stderr} {
+		ws, err := unix.IoctlGetWinsize(int(f.Fd()), unix.TIOCGWINSZ)
+		if err == nil && ws.Row > 0 && ws.Col > 0 {
+			return int(ws.Row), int(ws.Col), true
+		}
+	}
+	return 0, 0, false
 }
 
 // resetTerminal disables mouse tracking modes that may have been left enabled
