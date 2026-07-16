@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/jphenow/sp/internal/daemon"
 	"github.com/jphenow/sp/internal/progress"
@@ -148,12 +149,24 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Claude auth path decision (see prior implementation note): credentials
-	// file path is preferred when we have it, env-var fallback otherwise.
-	creds := setup.LocalClaudeCredentials()
+	// Claude auth path decision: prefer the env-token path (~/.claude-token
+	// or CLAUDE_CODE_OAUTH_TOKEN) whenever a token is available. The
+	// Keychain credentials.json path is the fallback for users who don't
+	// have a setup-token but do have Claude Code creds in the local
+	// Keychain. Reasons to prefer the token file:
+	//
+	//   - It's explicit user intent: if you ran `claude setup-token` and
+	//     dropped the result in ~/.claude-token, that's the token you
+	//     want propagated, not whatever Keychain happens to hold.
+	//   - setup-tokens are long-lived and don't auto-refresh, so the
+	//     "env goes stale across reconnects" failure mode doesn't apply
+	//     in practice.
+	//
+	// Only fall back to pushing credentials.json when there's no token.
+	var creds []byte
 	authTokenForEnv := token
-	if creds != nil {
-		authTokenForEnv = ""
+	if token == "" {
+		creds = setup.LocalClaudeCredentials()
 	}
 
 	// Parallel setup. Five concurrent task chains:
@@ -180,7 +193,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// key and StrictHostKeyChecking=no config that auth deploys. These
 		// are chained in one parallel task so other tasks (config push,
 		// git config) run concurrently while this chain serializes.
-		if err := setup.SetupSpriteAuth(client, resolved.SpriteName, authTokenForEnv); err != nil {
+		if err := setup.SetupSpriteAuth(client, resolved.SpriteName); err != nil {
 			return fmt.Errorf("sprite auth: %w", err)
 		}
 		if creds != nil {
@@ -537,7 +550,7 @@ done
 	if org != "" {
 		args = append(args, "-o", org)
 	}
-	args = append(args, "-s", spriteName, "sh", "-c", script)
+	args = append(args, "-s", spriteName, "--", "sh", "-c", script)
 
 	cmd := exec.Command("sprite", args...)
 	// Setpgid puts the child in its own process group so SIGHUP from sp's
@@ -912,25 +925,61 @@ func findExistingSpriteSession(spriteName, org string) string {
 	return ""
 }
 
+// buildTmuxEnvRefreshScript builds a shell snippet that updates the
+// given vars in BOTH the tmux global environment AND every existing
+// session's environment. Updating only `-g` (global) is insufficient
+// after a session exists: on session creation tmux snapshots the
+// global env into the session env, and new panes/windows in that
+// session inherit from the session env — not from global. So a
+// post-create `setenv -g` never reaches new panes in the live session.
+//
+// To reach new panes in the existing tmux session, we iterate
+// `tmux list-sessions` and call `setenv -t <session>` for each one.
+// We also still set `-g` so any session created later picks up the
+// fresh value at its snapshot moment.
+//
+// Returns "" when vars is empty so callers can short-circuit.
+func buildTmuxEnvRefreshScript(vars map[string]string) string {
+	if len(vars) == 0 {
+		return ""
+	}
+	var sets []string
+	for k, v := range vars {
+		sets = append(sets, fmt.Sprintf("tmux setenv -g %s %s 2>/dev/null || true", k, shellQuote(v)))
+		sets = append(sets, fmt.Sprintf(
+			`for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do tmux setenv -t "$s" %s %s 2>/dev/null || true; done`,
+			k, shellQuote(v),
+		))
+	}
+	return strings.Join(sets, "\n")
+}
+
 // attachToSpriteSession reattaches to an existing sprite-env session by
 // its numeric ID via `sprite attach`. Before attaching, it refreshes
-// the tmux global environment with the current GH_TOKEN so new panes
-// pick up a fresh token (since we no longer persist tokens in rc files).
+// the tmux global environment with the current GH_TOKEN and
+// CLAUDE_CODE_OAUTH_TOKEN so new panes pick up fresh tokens (since we
+// no longer persist tokens in rc files).
 func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID string) error {
-	// Refresh tmux env vars before reattaching. GH_TOKEN is no longer in
+	// Refresh tmux env vars before reattaching. Tokens are no longer in
 	// rc files (security: we don't leave tokens on the dormant filesystem),
-	// so it must be injected into the tmux server's global env on every
+	// so they must be injected into the tmux server's global env on every
 	// connect. Without this, panes opened after a reconnect would have no
-	// GH_TOKEN and git operations would fail.
-	ghToken := setup.LocalGhToken()
-	if ghToken != "" {
-		refreshScript := fmt.Sprintf(
-			"tmux setenv -g GH_TOKEN %s 2>/dev/null || true",
-			shellQuote(ghToken),
-		)
+	// token and the relevant tools (git, claude) would fail.
+	//
+	// Note: existing panes inside the session keep their old env — only
+	// new panes/windows inherit the refreshed value. That's a tmux
+	// limitation, not something we can work around here.
+	vars := map[string]string{}
+	if ghToken := setup.LocalGhToken(); ghToken != "" {
+		vars["GH_TOKEN"] = ghToken
+	}
+	if claudeToken, err := setup.NewTokenProvider().LocalToken(); err == nil && claudeToken != "" {
+		vars["CLAUDE_CODE_OAUTH_TOKEN"] = claudeToken
+	}
+	if script := buildTmuxEnvRefreshScript(vars); script != "" {
 		client.Exec(sprite.ExecOptions{
 			Sprite:  spriteName,
-			Command: []string{"sh", "-c", refreshScript},
+			Command: []string{"sh", "-c", script},
 		})
 	}
 
@@ -985,18 +1034,40 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 		fmt.Fprintf(os.Stderr, "Warning: mkdir -p %s failed: %v\n", resolved.RemotePath, err)
 	}
 
-	// Build the per-tool tmux setenv lines.
+	// Build the per-tool tmux setenv lines. Uses the shared helper so
+	// both -g (for newly-created sessions) and -t <session> (for any
+	// session that already exists — usually only on a reconnect race)
+	// are updated. When there's no token to set, fall through to the
+	// explicit -gu unset to clear stale values.
 	ghToken := setup.LocalGhToken()
-	claudeSetenv := "tmux setenv -gu CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true\n"
+	refreshVars := map[string]string{}
 	if token != "" {
-		claudeSetenv = fmt.Sprintf("tmux setenv -g CLAUDE_CODE_OAUTH_TOKEN %s 2>/dev/null || true\n", shellQuote(token))
+		refreshVars["CLAUDE_CODE_OAUTH_TOKEN"] = token
 	}
-	ghSetenv := ""
 	if ghToken != "" {
-		ghSetenv = fmt.Sprintf("tmux setenv -g GH_TOKEN %s 2>/dev/null || true\n", shellQuote(ghToken))
+		refreshVars["GH_TOKEN"] = ghToken
+	}
+	tokenRefresh := buildTmuxEnvRefreshScript(refreshVars)
+	if tokenRefresh != "" {
+		tokenRefresh += "\n"
+	}
+	if token == "" {
+		tokenRefresh = "tmux setenv -gu CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true\n" + tokenRefresh
 	}
 
-	shellCmd := fmt.Sprintf(`
+	// Work around the sprite CLI's --tty not propagating the initial window
+	// size to the remote PTY: it comes up 0x0, which makes tmux and
+	// full-screen TUIs (claude) render one column off. Seed the PTY size
+	// from the local terminal before tmux starts so it lays out correctly.
+	// Caveat: this fixes only the *initial* size — the CLI also doesn't
+	// forward live SIGWINCH, so resizing the local window mid-session won't
+	// reflow until tmux is detached and reattached.
+	sttyPrefix := ""
+	if rows, cols, ok := localTerminalSize(); ok {
+		sttyPrefix = fmt.Sprintf("stty rows %d cols %d 2>/dev/null || true\n", rows, cols)
+	}
+
+	shellCmd := fmt.Sprintf(`%s
 # Start ssh-agent if not already running. The agent lives in the tmux
 # server's process tree, so it survives reconnects (persistent session).
 # The user runs 'ssh-add' once per session to unlock passphrase-protected
@@ -1018,8 +1089,8 @@ fi
 for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
   tmux setenv -gu "$v" 2>/dev/null || true
 done
-%s%sexec tmux new-session -A -s %s -c %s %s
-`, claudeSetenv, ghSetenv, shellQuote(tmuxSession), shellQuote(resolved.RemotePath), command)
+%sexec tmux new-session -A -s %s -c %s %s
+`, sttyPrefix, tokenRefresh, shellQuote(tmuxSession), shellQuote(resolved.RemotePath), command)
 
 	env := map[string]string{}
 	if token != "" {
@@ -1050,6 +1121,20 @@ done
 	runErr := cmd.Run()
 	resetTerminal()
 	return runErr
+}
+
+// localTerminalSize returns the local controlling terminal's size (rows,
+// cols) by probing stdout/stdin/stderr in turn. ok is false when none is a
+// TTY (e.g. output is piped), in which case callers should skip the stty
+// seed and let the remote default stand.
+func localTerminalSize() (rows, cols int, ok bool) {
+	for _, f := range []*os.File{os.Stdout, os.Stdin, os.Stderr} {
+		ws, err := unix.IoctlGetWinsize(int(f.Fd()), unix.TIOCGWINSZ)
+		if err == nil && ws.Row > 0 && ws.Col > 0 {
+			return int(ws.Row), int(ws.Col), true
+		}
+	}
+	return 0, 0, false
 }
 
 // resetTerminal disables mouse tracking modes that may have been left enabled
