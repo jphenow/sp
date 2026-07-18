@@ -8,6 +8,7 @@ set -euo pipefail
 #   sp . [--no-sync] [--name NAME] [-- COMMAND...]
 #   sp info owner/repo|.
 #   sp sessions owner/repo|.
+#   sp share owner/repo|.
 #   sp conf {init|edit|show}
 #
 # Sprite naming:
@@ -22,6 +23,7 @@ set -euo pipefail
 # Subcommands:
 #   info       Show sprite info (name, existence, target dir, command, session) without connecting
 #   sessions   List active tmux sessions in a sprite
+#   share      Serve the sprite's tmux session as a phone-joinable web terminal (sshx)
 #   conf       Manage setup config (~/.config/sprite/setup.conf)
 
 # Configuration
@@ -65,6 +67,7 @@ Usage:
   sp info owner/repo|. [--name NAME]
   sp status owner/repo|.
   sp sessions owner/repo|.
+  sp share owner/repo|. [-- COMMAND] [--name NAME]
   sp resync .
   sp conf {init|edit|show}
 
@@ -73,6 +76,8 @@ Subcommands:
              without connecting
   status     Show sync health, conflicts, proxy state, and active users
   sessions   List active tmux sessions in a sprite
+  share      Expose the sprite's tmux session as a public web terminal (sshx) so
+             you can join it from a phone browser — same session as your laptop
   resync     Tear down and restart Mutagen sync (re-reads .gitignore rules)
   conf       Manage setup config (~/.config/sprite/setup.conf)
 
@@ -87,6 +92,14 @@ Options:
 Commands:
   Everything after -- is the command to run in the sprite (default: bash).
   Use this for commands with flags: sp . -- claude -f foo bar baz
+
+Web terminal (join a running session from your phone):
+  sp share . -- claude  serves the sprite's `claude` tmux session as a public
+  web link (via sshx, outbound relay only — no inbound ports). Open the link in
+  your phone's browser to drive the SAME session your laptop is in. Use the same
+  `-- COMMAND` / `--name` you used to launch, so the session names match. Ctrl-C
+  stops sharing; the tmux session keeps running. Needs Claude's existing auth
+  only — no login changes. Installs sshx into the sprite on first use.
 
 Sprite naming (in priority order):
   1. .sprite file   Read from local .sprite JSON file if present
@@ -113,6 +126,7 @@ Examples:
   sp . --name debug -- bash             # Named tmux session
   sp info .                             # Show sprite info without connecting
   sp sessions owner/repo                # List tmux sessions in a sprite
+  sp share . -- claude                  # Share the claude session to your phone
   sp status .                              # Check sync health and conflicts
   sp resync .                             # Reset sync (re-reads .gitignore)
   sp conf init                          # Create setup config
@@ -1401,6 +1415,54 @@ handle_sessions() {
     sprite exec -s "$RESOLVED_SPRITE_NAME" tmux list-sessions 2>/dev/null || echo "No active tmux sessions"
 }
 
+# Ensure the sshx binary is available inside the sprite (installs it if missing).
+# sshx serves a public, phone-friendly web terminal over an outbound relay
+# (no inbound ports), which we point at an existing tmux session.
+ensure_sshx_in_sprite() {
+    local sprite_name="$1"
+    if sprite exec -s "$sprite_name" sh -c 'command -v sshx >/dev/null 2>&1'; then
+        return 0
+    fi
+    info "Installing sshx in sprite..."
+    sprite exec -s "$sprite_name" sh -c 'curl -sSf https://sshx.io/get | sh' \
+        || warn "sshx install failed — install it in the sprite and retry"
+}
+
+# Handle 'sp share' subcommand — expose the sprite's tmux session as a public
+# web terminal via sshx so it can be joined from a phone browser. This joins the
+# SAME tmux session sp uses (derived name), so laptop and phone share one session.
+# Requires no auth changes — Claude's existing token keeps working.
+handle_share() {
+    local target="$1"
+    resolve_sprite_info "$target"
+
+    if ! sprite_exists "$RESOLVED_SPRITE_NAME"; then
+        error "Sprite '$RESOLVED_SPRITE_NAME' does not exist. Run 'sp $target' first."
+    fi
+
+    local sprite_name session_name wrapper
+    sprite_name="$RESOLVED_SPRITE_NAME"
+    session_name=$(derive_session_name)
+    # $HOME on the sprite is /home/sprite (matches RESOLVED_TARGET_DIR paths).
+    wrapper="/home/sprite/.sprite-share-${session_name}.sh"
+
+    ensure_sshx_in_sprite "$sprite_name"
+
+    # sshx's --shell execs a single program path, so write a tiny wrapper that
+    # attaches (or creates) the tmux session and point sshx at it.
+    sprite exec -s "$sprite_name" -env "SP_SHARE_SESSION=${session_name}" sh -c '
+        W="$HOME/.sprite-share-${SP_SHARE_SESSION}.sh"
+        printf "#!/bin/sh\nexec tmux new-session -A -s \"%s\"\n" "$SP_SHARE_SESSION" > "$W"
+        chmod +x "$W"
+    ' || error "Could not write share wrapper in sprite"
+
+    msg "Sharing tmux session '$session_name' via sshx"
+    echo "Open the printed link on your phone. Press Ctrl-C here to stop sharing" >&2
+    echo "(the tmux session keeps running afterward)." >&2
+
+    sprite exec -s "$sprite_name" -tty sshx --name "$session_name" --shell "$wrapper" || true
+}
+
 # Handle 'sp status' subcommand — show sync health, conflicts, and session state.
 handle_status() {
     local target="$1"
@@ -2476,7 +2538,7 @@ main() {
             handle_conf "$@"
             exit 0
             ;;
-        info|sessions|resync|status)
+        info|sessions|resync|status|share)
             subcommand="$1"
             shift
             if [[ $# -eq 0 ]]; then
@@ -2558,6 +2620,9 @@ main() {
             ;;
         status)
             handle_status "$target"
+            ;;
+        share)
+            handle_share "$target"
             ;;
         "")
             # No subcommand — launch mode
