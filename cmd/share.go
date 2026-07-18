@@ -145,12 +145,13 @@ func createShareService(client *sprite.Client, spriteName, session string) error
 		Command: []string{"sprite-env", "services", "delete", shareServiceName},
 	})
 
-	// ttyd -W -p <port> -i 0.0.0.0 tmux new-session -A -s <session>
+	// ttyd -W -p <port> tmux new-session -A -s <session>
 	//   -W            allow client input (writable terminal)
-	//   -p/-i         listen on the routed port, all interfaces (sprite proxy
-	//                 connects from outside localhost)
+	//   -p            listen on the routed port. ttyd binds all interfaces by
+	//                 default, so the sprite proxy can reach it (no -i: that flag
+	//                 takes an interface NAME like eth0, not an address).
 	//   tmux ...      attaches or creates the session — this is the "join".
-	svcArgs := fmt.Sprintf("-W,-p,%d,-i,0.0.0.0,tmux,new-session,-A,-s,%s", shareTtydPort, session)
+	svcArgs := fmt.Sprintf("-W,-p,%d,tmux,new-session,-A,-s,%s", shareTtydPort, session)
 	createCmd := fmt.Sprintf(
 		"sprite-env services create %s --cmd %s --args %s --http-port %d --duration 10s",
 		shareServiceName, ttydBin, svcArgs, shareTtydPort,
