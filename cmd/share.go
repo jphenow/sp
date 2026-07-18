@@ -11,8 +11,7 @@ import (
 )
 
 const (
-	// shareServiceName is the sprite-env service that runs the web terminal
-	// (ttyd or sshx, depending on whether the sprite's HTTP port is free).
+	// shareServiceName is the sprite-env service that runs the web terminal.
 	shareServiceName = "sp-term"
 	// shareTtydPort is the port ttyd listens on inside the sprite; the sprite
 	// proxy routes the sprite's public URL to it via --http-port.
@@ -30,22 +29,22 @@ var (
 	shareStop        bool
 )
 
-// shareCmd exposes an already-running sprite tmux session as a web terminal you
-// can join from a phone. When the sprite's single HTTP port is free it serves a
-// ttyd terminal over the sprite's own Fly.io URL; when the sprite already runs
-// an HTTP app on that port it falls back to sshx (an outbound relay that needs
-// no port). Either way it attaches the SAME tmux session sp uses, so laptop and
-// phone share one session.
+// shareCmd exposes an already-running sprite tmux session as a web terminal
+// reachable over the sprite's own Fly.io URL. It registers a ttyd process as a
+// sprite-env service (like the opencode --web flow), so the HTTP networking,
+// TLS, routing, auth, and auto-wake all come from Fly — no external relay. ttyd
+// attaches the SAME tmux session sp uses, so laptop and phone share one session.
 var shareCmd = &cobra.Command{
 	Use:   "share [target] [variant]",
-	Short: "Share a running sprite session as a web terminal you can join from your phone",
-	Long: `share runs a web terminal in the sprite as a sprite-env service and prints a
-URL to open in a phone browser. It joins the SAME tmux session your laptop is
-attached to.
+	Short: "Share a running sprite session as a web terminal over the sprite's Fly URL (ttyd)",
+	Long: `share runs a ttyd web terminal inside the sprite as a sprite-env service and
+routes the sprite's own Fly.io URL to it. Open that URL in a phone browser to
+join the SAME tmux session your laptop is attached to.
 
-Transport is chosen automatically:
-  - HTTP port free: ttyd over the sprite's own Fly.io URL (stable, Fly routing).
-  - HTTP port taken by your app: sshx relay (no port needed, external link).
+Traffic goes through the sprite's Fly URL, so it's authenticated by Fly — no
+external relay, no public unauthenticated link. A sprite has only one HTTP port,
+so if another service (e.g. your own web app) already owns it, share can't run
+until that port is free.
 
 Target and variant resolve exactly like 'sp connect':
   sp share .                     # current dir's sprite
@@ -65,8 +64,8 @@ func init() {
 }
 
 // runShare resolves the target sprite, then either tears down the share service
-// (--stop) or starts a web terminal — ttyd over the Fly URL if the HTTP port is
-// free, otherwise sshx over its relay — attached to the running tmux session.
+// (--stop) or installs ttyd, registers it on the sprite's HTTP port, and prints
+// the sprite's Fly URL to open on a phone.
 func runShare(cmd *cobra.Command, args []string) error {
 	resolved, err := resolveTarget(args)
 	if err != nil {
@@ -87,6 +86,17 @@ func runShare(cmd *cobra.Command, args []string) error {
 		return stopShare(client, resolved.SpriteName)
 	}
 
+	// A sprite exposes exactly one HTTP port. If another service already owns it,
+	// ttyd can't get a Fly URL — refuse rather than expose a public relay. Print
+	// the reason directly: the root command silences returned errors.
+	if taken, owner := spriteHasHTTPService(client, resolved.SpriteName); taken {
+		fmt.Printf("Can't share sprite %q: its single HTTP port is already used by service %q,\n", resolved.SpriteName, owner)
+		fmt.Println("so sp share can't route a terminal through the (Fly-authenticated) sprite URL.")
+		fmt.Printf("Free the port first, e.g.:\n  sprite exec -s %s -- sprite-env services delete %s\n", resolved.SpriteName, owner)
+		fmt.Println("or share a sprite that doesn't run its own web app.")
+		return nil
+	}
+
 	// Pick the tmux session to attach: explicit --name, else the session already
 	// running in the sprite (join existing), else the connect default ("bash").
 	session := shareSessionName
@@ -97,28 +107,10 @@ func runShare(cmd *cobra.Command, args []string) error {
 		session = "bash"
 	}
 
-	stopHint := "sp share --stop"
-	if len(args) > 0 {
-		stopHint = "sp share " + strings.Join(args, " ") + " --stop"
-	}
-
-	// A sprite exposes exactly one HTTP port. If another service already owns it,
-	// ttyd can't get a Fly URL — use the sshx relay, which needs no port.
-	httpTaken, owner := spriteHasHTTPService(client, resolved.SpriteName)
-	if httpTaken {
-		fmt.Printf("Sprite's HTTP port is used by service %q; sharing over the sshx relay instead of the Fly URL.\n", owner)
-		return shareViaSshx(client, resolved.SpriteName, session, stopHint)
-	}
-	return shareViaTtyd(client, resolved.SpriteName, session, stopHint)
-}
-
-// shareViaTtyd installs ttyd and registers it as the sp-term service on the
-// sprite's HTTP port, reachable at the sprite's Fly URL.
-func shareViaTtyd(client *sprite.Client, spriteName, session, stopHint string) error {
-	if err := ensureTtyd(client, spriteName); err != nil {
+	if err := ensureTtyd(client, resolved.SpriteName); err != nil {
 		return err
 	}
-	deleteShareService(client, spriteName)
+	deleteShareService(client, resolved.SpriteName)
 
 	// ttyd -W -p <port> tmux new-session -A -s <session>
 	//   -W    writable terminal
@@ -131,91 +123,29 @@ func shareViaTtyd(client *sprite.Client, spriteName, session, stopHint string) e
 		shareServiceName, ttydBin, svcArgs, shareTtydPort,
 	)
 	if out, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
+		Sprite:  resolved.SpriteName,
 		Command: []string{"sh", "-c", createCmd},
 	}); err != nil {
 		return fmt.Errorf("creating ttyd service: %w\n%s", err, string(out))
 	}
 
 	url := ""
-	if info, err := client.Get(spriteName); err == nil && info != nil {
+	if info, err := client.Get(resolved.SpriteName); err == nil && info != nil {
 		url = info.URL
 	}
-	fmt.Printf("\nSharing tmux session %q on sprite %q (ttyd over the sprite's Fly URL).\n", session, spriteName)
+
+	stopHint := "sp share --stop"
+	if len(args) > 0 {
+		stopHint = "sp share " + strings.Join(args, " ") + " --stop"
+	}
+
+	fmt.Printf("\nSharing tmux session %q on sprite %q (ttyd over the sprite's Fly URL).\n", session, resolved.SpriteName)
 	if url != "" {
 		fmt.Printf("\n  \U0001F4F1 Open on your phone:  %s\n\n", url)
 	} else {
 		fmt.Println("\n  Service created, but could not read the sprite URL — run 'sprite url'.")
 	}
-	fmt.Printf("  Stop sharing: %s\n", stopHint)
-	return nil
-}
-
-// sshx paths inside the sprite: a tmux-attach wrapper (sshx --shell execs a
-// single program path), a run wrapper that launches sshx and redirects its URL
-// to a file, and that URL file. sshx prints only the URL under --quiet and Rust
-// line-buffers stdout, so the URL lands in the file immediately — the sprite-env
-// service log stream doesn't reliably surface it, hence the file.
-const (
-	sshxURLFile     = "/home/sprite/.sp-share-url"
-	sshxRunWrapper  = "/home/sprite/.sp-share-run.sh"
-	sshxTmuxWrapper = "/home/sprite/.sp-share-tmux.sh"
-)
-
-// shareViaSshx installs sshx and registers it as the sp-term service (no HTTP
-// port needed), writing its share URL to a file which we then read back.
-func shareViaSshx(client *sprite.Client, spriteName, session, stopHint string) error {
-	sshxPath, err := ensureSshx(client, spriteName)
-	if err != nil {
-		return err
-	}
-
-	// Write both wrappers and clear any stale URL. Session names are sanitized
-	// (alnum/dash) upstream, so they're safe to interpolate.
-	writeCmd := fmt.Sprintf(
-		"printf '#!/bin/sh\\nexec tmux new-session -A -s %s\\n' > %s && chmod +x %s && "+
-			"printf '#!/bin/sh\\nexec %s --quiet --name %s --shell %s > %s 2>&1\\n' > %s && chmod +x %s && "+
-			"rm -f %s",
-		session, sshxTmuxWrapper, sshxTmuxWrapper,
-		sshxPath, session, sshxTmuxWrapper, sshxURLFile, sshxRunWrapper, sshxRunWrapper,
-		sshxURLFile,
-	)
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", writeCmd},
-	}); err != nil {
-		return fmt.Errorf("writing sshx wrappers: %w", err)
-	}
-
-	deleteShareService(client, spriteName)
-
-	createCmd := fmt.Sprintf(
-		"sprite-env services create %s --cmd %s --no-stream",
-		shareServiceName, sshxRunWrapper,
-	)
-	if out, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", createCmd},
-	}); err != nil {
-		return fmt.Errorf("creating sshx service: %w\n%s", err, string(out))
-	}
-
-	// Poll the URL file until sshx has connected and written its link.
-	readCmd := fmt.Sprintf(
-		"for i in $(seq 1 30); do if grep -q 'https://' %s 2>/dev/null; then break; fi; sleep 0.5; done; cat %s 2>/dev/null",
-		sshxURLFile, sshxURLFile,
-	)
-	out, _ := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", readCmd},
-	})
-
-	fmt.Printf("\nSharing tmux session %q on sprite %q (sshx relay).\n", session, spriteName)
-	if url := extractURL(string(out)); url != "" {
-		fmt.Printf("\n  \U0001F4F1 Open on your phone:  %s\n\n", url)
-	} else {
-		fmt.Printf("\n  Service started, but no URL appeared yet. Check with:\n    sprite exec -s %s -- cat %s\n", spriteName, sshxURLFile)
-	}
+	fmt.Println("  Authenticated by Fly; auto-wakes on access.")
 	fmt.Printf("  Stop sharing: %s\n", stopHint)
 	return nil
 }
@@ -244,8 +174,8 @@ func deleteShareService(client *sprite.Client, spriteName string) {
 
 // spriteHasHTTPService reports whether any service other than sp-term already
 // owns an HTTP port on the sprite (only one service may). Returns the owning
-// service name for messaging. On any parse error it reports false so we default
-// to the ttyd/Fly path.
+// service name for messaging. On any parse error it reports false so we still
+// attempt the ttyd path.
 func spriteHasHTTPService(client *sprite.Client, spriteName string) (bool, string) {
 	out, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
@@ -272,16 +202,6 @@ func spriteHasHTTPService(client *sprite.Client, spriteName string) (bool, strin
 	return false, ""
 }
 
-// extractURL returns the first whitespace-delimited http(s) token in s, or "".
-func extractURL(s string) string {
-	for _, f := range strings.Fields(s) {
-		if strings.HasPrefix(f, "http://") || strings.HasPrefix(f, "https://") {
-			return strings.TrimRight(f, ".,)")
-		}
-	}
-	return ""
-}
-
 // ensureTtyd makes sure the ttyd binary exists at ttydBin inside the sprite,
 // preferring a system copy and falling back to the static release download.
 func ensureTtyd(client *sprite.Client, spriteName string) error {
@@ -302,40 +222,6 @@ chmod +x %[1]s
 		return fmt.Errorf("installing ttyd in sprite: %w", err)
 	}
 	return nil
-}
-
-// ensureSshx makes sure the sshx binary is present in the sprite and returns an
-// absolute path to it, installing via the official one-liner on first use.
-func ensureSshx(client *sprite.Client, spriteName string) (string, error) {
-	if p := locateSshx(client, spriteName); p != "" {
-		return p, nil
-	}
-	fmt.Println("Installing sshx in sprite (first use)...")
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", "curl -sSf https://sshx.io/get | sh"},
-	}); err != nil {
-		return "", fmt.Errorf("installing sshx: %w", err)
-	}
-	if p := locateSshx(client, spriteName); p != "" {
-		return p, nil
-	}
-	return "", fmt.Errorf("sshx installed but not found — install it into the sprite manually and retry")
-}
-
-// locateSshx probes PATH and common install dirs for sshx, returning an absolute
-// path or "". sprite exec doesn't source login profiles, so we can't rely on
-// PATH alone — check the well-known install locations too.
-func locateSshx(client *sprite.Client, spriteName string) string {
-	probe := `command -v sshx 2>/dev/null || for p in "$HOME/.local/bin/sshx" /usr/local/bin/sshx /usr/bin/sshx; do [ -x "$p" ] && echo "$p" && break; done`
-	out, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", probe},
-	})
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
 }
 
 // detectSpriteTmuxSession returns the name of the first running tmux session in
