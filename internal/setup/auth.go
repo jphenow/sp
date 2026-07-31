@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -282,6 +283,52 @@ PYEOF
 // CLAUDE_CODE_OAUTH_TOKEN should NOT be set in the same session —
 // it sits at position 5 and would mask the file, preventing refresh
 // when the access token in the env var goes stale.
+// claudeCredsExpiry extracts the claudeAiOauth.expiresAt field (epoch millis)
+// from a credentials.json blob, or 0 if absent/unparseable. Used to decide
+// whether one credential copy is fresher than another.
+func claudeCredsExpiry(creds []byte) int64 {
+	var d struct {
+		ClaudeAiOauth struct {
+			ExpiresAt int64 `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(creds, &d); err != nil {
+		return 0
+	}
+	return d.ClaudeAiOauth.ExpiresAt
+}
+
+// spriteClaudeCredsExpiry reads the sprite's ~/.claude/.credentials.json and
+// returns its expiresAt (epoch millis), or 0 if the file is missing/unreadable.
+func spriteClaudeCredsExpiry(client *sprite.Client, spriteName string) int64 {
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", "cat ~/.claude/.credentials.json 2>/dev/null"},
+	})
+	if err != nil {
+		return 0
+	}
+	return claudeCredsExpiry(out)
+}
+
+// PushClaudeCredentialsIfNewer pushes the local credentials only when the sprite
+// has none or the local copy is strictly fresher (later expiresAt). This avoids
+// clobbering a credential the sprite's own Claude already refreshed with a
+// staler copy from this machine — the overwrite is a key driver of repeated
+// /login prompts, because OAuth refresh tokens rotate and a stale copy loses the
+// race. Returns whether a push happened.
+func PushClaudeCredentialsIfNewer(client *sprite.Client, spriteName string, creds []byte) (bool, error) {
+	localExp := claudeCredsExpiry(creds)
+	spriteExp := spriteClaudeCredsExpiry(client, spriteName)
+	// Push if the sprite has no usable credential, or ours is newer. When we
+	// can't read a local expiry (localExp == 0) but the sprite already has one,
+	// don't clobber it.
+	if spriteExp != 0 && localExp <= spriteExp {
+		return false, nil
+	}
+	return true, PushClaudeCredentials(client, spriteName, creds)
+}
+
 func PushClaudeCredentials(client *sprite.Client, spriteName string, creds []byte) error {
 	if len(creds) == 0 {
 		return fmt.Errorf("empty credentials blob")
