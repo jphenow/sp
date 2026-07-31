@@ -23,13 +23,15 @@ import (
 )
 
 var (
-	noSync      bool
-	sessionName string
-	webMode     bool
-	webProxy    bool
-	webDevPort  int
-	execCmd     string
-	keepWarmDur time.Duration
+	noSync        bool
+	sessionName   string
+	webMode       bool
+	webProxy      bool
+	webDevPort    int
+	execCmd       string
+	keepWarmDur   time.Duration
+	remoteControl bool
+	rcAlias       bool
 )
 
 // connectCmd handles `sp .` and `sp owner/repo` — the core connect flow.
@@ -62,6 +64,8 @@ func init() {
 	connectCmd.Flags().IntVar(&webDevPort, "web-dev-port", 0, "development server port for proxy fallthrough (requires --web-proxy)")
 	connectCmd.Flags().StringVar(&execCmd, "exec", "", "command to run instead of bash")
 	connectCmd.Flags().DurationVar(&keepWarmDur, "keep-warm", 0, "hold the sprite Active (Tasks API) for up to this duration after disconnect, exiting early if claude is idle for 60s (e.g. 1h, 30m). Default off. See also 'sp keepalive'.")
+	connectCmd.Flags().BoolVar(&remoteControl, "remote-control", false, "launch Claude with Remote Control so the session can be joined from your phone/browser (claude.ai/code)")
+	connectCmd.Flags().BoolVar(&rcAlias, "rc", false, "alias for --remote-control")
 
 	// Register connect as both a subcommand and the default action
 	rootCmd.AddCommand(connectCmd)
@@ -166,6 +170,23 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	authTokenForEnv := token
 	if token == "" {
 		creds = setup.LocalClaudeCredentials()
+	}
+
+	// Remote Control: default the command to Claude with the join feature on, so
+	// the session can be driven from claude.ai/code or the Claude app. RC needs a
+	// full-scope claude.ai login; the Go connect prefers pushing credentials.json
+	// (which satisfies RC), but if none is available it falls back to the
+	// inference-only setup-token, which RC rejects — warn in that case.
+	if rcAlias {
+		remoteControl = true
+	}
+	if remoteControl {
+		if execCmd == "" {
+			execCmd = "claude --remote-control"
+		}
+		if creds == nil {
+			fmt.Fprintln(os.Stderr, "Warning: Remote Control needs a full claude.ai login. No local ~/.claude credentials were found to push, so the sprite will use the inference-only setup-token, which RC rejects. Run 'claude' then /login on the sprite, or log in with Claude Code locally so credentials.json can be pushed.")
+		}
 	}
 
 	// Parallel setup. Five concurrent task chains:
@@ -1001,6 +1022,12 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 	if token == "" {
 		tokenRefresh = "tmux setenv -gu CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true\n" + tokenRefresh
 	}
+	// Remote Control: give the session a readable name prefix so the sprite is
+	// easy to find in the claude.ai/code session list (defaults to hostname).
+	rcSetenv := ""
+	if remoteControl {
+		rcSetenv = fmt.Sprintf("tmux setenv -g CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX %s 2>/dev/null || true\n", shellQuote(resolved.SpriteName))
+	}
 
 	// Work around the sprite CLI's --tty not propagating the initial window
 	// size to the remote PTY: it comes up 0x0, which makes tmux and
@@ -1036,8 +1063,8 @@ fi
 for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
   tmux setenv -gu "$v" 2>/dev/null || true
 done
-%sexec tmux new-session -A -s %s -c %s %s
-`, sttyPrefix, tokenRefresh, shellQuote(tmuxSession), shellQuote(resolved.RemotePath), command)
+%s%sexec tmux new-session -A -s %s -c %s %s
+`, sttyPrefix, tokenRefresh, rcSetenv, shellQuote(tmuxSession), shellQuote(resolved.RemotePath), command)
 
 	env := map[string]string{}
 	if token != "" {
