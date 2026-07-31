@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -24,13 +23,13 @@ import (
 )
 
 var (
-	noSync       bool
-	sessionName  string
-	webMode      bool
-	webProxy     bool
-	webDevPort   int
-	execCmd      string
-	keepWarmDur  time.Duration
+	noSync      bool
+	sessionName string
+	webMode     bool
+	webProxy    bool
+	webDevPort  int
+	execCmd     string
+	keepWarmDur time.Duration
 )
 
 // connectCmd handles `sp .` and `sp owner/repo` — the core connect flow.
@@ -62,7 +61,7 @@ func init() {
 	connectCmd.Flags().BoolVar(&webProxy, "web-proxy", false, "enable reverse proxy in front of opencode (routes /opencode to opencode, /* to dev server)")
 	connectCmd.Flags().IntVar(&webDevPort, "web-dev-port", 0, "development server port for proxy fallthrough (requires --web-proxy)")
 	connectCmd.Flags().StringVar(&execCmd, "exec", "", "command to run instead of bash")
-	connectCmd.Flags().DurationVar(&keepWarmDur, "keep-warm", 0, "spawn a background sentinel that holds the sprite warm for up to this duration after disconnect, exiting early if claude is idle for 60s (e.g. 1h, 30m). Default off.")
+	connectCmd.Flags().DurationVar(&keepWarmDur, "keep-warm", 0, "hold the sprite Active (Tasks API) for up to this duration after disconnect, exiting early if claude is idle for 60s (e.g. 1h, 30m). Default off. See also 'sp keepalive'.")
 
 	// Register connect as both a subcommand and the default action
 	rootCmd.AddCommand(connectCmd)
@@ -495,85 +494,17 @@ func setupWebServiceProxy(client *sprite.Client, spriteName string) error {
 	return nil
 }
 
-// startKeepWarmSentinel spawns a backgrounded sprite-exec process that
-// runs a watcher script on the sprite. The watcher hashes the active
-// tmux pane every 10 seconds; when the hash is stable for 60s the
-// watcher assumes claude (or whatever is in the foreground) has
-// reached a prompt/idle state and exits. Otherwise it runs until the
-// duration deadline.
-//
-// The mechanism that keeps the sprite warm is the sprite-exec connection
-// itself: as long as a sprite-exec process is talking to the sprite,
-// sprite-env counts it as an active client and the underlying Fly
-// machine doesn't auto-stop. When the watcher script exits, the
-// sprite-exec connection closes and (assuming no other clients) the
-// machine eventually cold-stops normally.
-//
-// The local sprite-exec process is detached from sp's process group
-// via Setpgid + redirected stdio so it survives the foreground sp
-// process exiting (e.g. when the user closes their tmux session).
-//
-// Idempotent: any prior keep-warm watcher on the same sprite is killed
-// at the start of the script via pkill against an embedded marker, so
-// reconnects don't accumulate watchers.
+// startKeepWarmSentinel holds the sprite Active (via the Tasks API heartbeat in
+// launchKeepAlive) for up to dur, exiting early once the tmux session has been
+// idle for ~60s. This replaces the older pane-hash-holds-a-connection hack: the
+// Tasks API keeps the sprite in the Active state directly, so the session's
+// connection doesn't drop and processes don't cold-die while you're working.
+// Idle-exit still stops the hold (and billing) when Claude reaches a prompt.
 func startKeepWarmSentinel(spriteName, org string, dur time.Duration) error {
 	if dur <= 0 {
 		return nil
 	}
-	deadline := time.Now().Add(dur).Unix()
-
-	// Marker is grep'd by pkill to identify our watchers across sp runs.
-	// Embedded as a comment in the script body so it appears in the
-	// process command line that pkill -f matches against.
-	const marker = "SP_KEEPWARM_MARKER_v1"
-	const idleTicks = 6 // 6 * 10s = 60s of pane stability before declaring idle
-	script := fmt.Sprintf(`
-# %s
-# Kill any existing keep-warm watchers from prior sp runs.
-pkill -f '%s' 2>/dev/null || true
-DEADLINE=%d
-LAST_HASH=""
-IDLE_COUNT=0
-while [ "$(date +%%s)" -lt "$DEADLINE" ]; do
-    HASH=$(tmux capture-pane -t bash -p 2>/dev/null | sha256sum | cut -d' ' -f1)
-    if [ "$HASH" = "$LAST_HASH" ]; then
-        IDLE_COUNT=$((IDLE_COUNT + 1))
-        if [ "$IDLE_COUNT" -ge %d ]; then
-            exit 0
-        fi
-    else
-        IDLE_COUNT=0
-    fi
-    LAST_HASH="$HASH"
-    sleep 10
-done
-`, marker, marker, deadline, idleTicks)
-
-	args := []string{"exec"}
-	if org != "" {
-		args = append(args, "-o", org)
-	}
-	args = append(args, "-s", spriteName, "--", "sh", "-c", script)
-
-	cmd := exec.Command("sprite", args...)
-	// Setpgid puts the child in its own process group so SIGHUP from sp's
-	// controlling terminal at exit doesn't propagate to it. Redirected
-	// stdio severs any inherited ttys.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting keep-warm sentinel: %w", err)
-	}
-	// Release so the runtime doesn't track the child after we leave the
-	// function. The child becomes a zombie when it exits, eventually
-	// reaped by init. We don't care about its exit code.
-	if err := cmd.Process.Release(); err != nil {
-		return fmt.Errorf("releasing keep-warm sentinel: %w", err)
-	}
-	return nil
+	return launchKeepAlive(spriteName, org, dur, deriveTmuxSessionName())
 }
 
 // waitForSpriteReady polls until the sprite responds to commands.
@@ -1007,6 +938,28 @@ func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID str
 	return runErr
 }
 
+// deriveTmuxSessionName computes the tmux session name a connect will use:
+// the explicit --name if set, otherwise the first word of the command (bash by
+// default), with characters that are awkward in tmux names replaced by dashes.
+// Shared by createSpriteSession (which creates it) and the keep-warm heartbeat
+// (which watches it for idle-exit), so they always agree on the name.
+func deriveTmuxSessionName() string {
+	if sessionName != "" {
+		return sessionName
+	}
+	name := "bash"
+	if execCmd != "" {
+		name = execCmd
+	}
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.ReplaceAll(name, ".", "-")
+	name = strings.ReplaceAll(name, ":", "-")
+	if parts := strings.Fields(name); len(parts) > 0 {
+		name = parts[0]
+	}
+	return name
+}
+
 // createSpriteSession creates a brand-new sprite-exec persistent session
 // running tmux. Sprite-env keeps TTY sessions alive even after the
 // client disconnects, so the tmux server (and claude inside it) survive
@@ -1018,16 +971,7 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 		command = execCmd
 	}
 
-	// Determine tmux session name
-	tmuxSession := sessionName
-	if tmuxSession == "" {
-		tmuxSession = strings.ReplaceAll(command, " ", "-")
-		tmuxSession = strings.ReplaceAll(tmuxSession, ".", "-")
-		tmuxSession = strings.ReplaceAll(tmuxSession, ":", "-")
-		if parts := strings.Fields(tmuxSession); len(parts) > 0 {
-			tmuxSession = parts[0]
-		}
-	}
+	tmuxSession := deriveTmuxSessionName()
 
 	// Ensure the target dir exists
 	if _, err := client.Exec(sprite.ExecOptions{
