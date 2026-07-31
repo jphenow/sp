@@ -34,6 +34,11 @@ var (
 	rcAlias       bool
 )
 
+// rcHoldCap is the default safety cap for the session-tied hold that --rc starts:
+// the sprite is held Active while the tmux session lives, but never past this cap,
+// so an abandoned session can't bill indefinitely. --keep-warm overrides it.
+const rcHoldCap = 8 * time.Hour
+
 // connectCmd handles `sp .` and `sp owner/repo` — the core connect flow.
 var connectCmd = &cobra.Command{
 	Use:   "connect [target] [variant]",
@@ -364,6 +369,22 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		} else if verbose {
 			fmt.Fprintf(os.Stderr, "Keep-warm sentinel started (max %s, exits early when claude is idle for 60s)\n", keepWarmDur)
 		}
+	} else if remoteControl {
+		// Remote Control means you'll pick the session up from another device,
+		// so idle-exit (which assumes idle == done) is wrong here: an idle prompt
+		// usually means you're on your phone, not finished. Instead hold the
+		// sprite Active while the tmux session lives (so it stays reachable
+		// without a manual wake), releasing on session end or a generous cap so
+		// you never have to pick a duration. --keep-warm overrides this.
+		cap := rcHoldCap
+		if keepWarmDur > 0 {
+			cap = keepWarmDur
+		}
+		if err := launchKeepAlive(resolved.SpriteName, resolved.Org, cap, "", deriveTmuxSessionName()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: starting Remote Control hold: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Holding sprite Active while this session lives (cap %s); stop with 'sp keepalive %s --stop'.\n", cap, resolved.SpriteName)
+		}
 	}
 
 	// Connect to sprite shell. Pass authTokenForEnv (empty when we pushed
@@ -525,7 +546,7 @@ func startKeepWarmSentinel(spriteName, org string, dur time.Duration) error {
 	if dur <= 0 {
 		return nil
 	}
-	return launchKeepAlive(spriteName, org, dur, deriveTmuxSessionName())
+	return launchKeepAlive(spriteName, org, dur, deriveTmuxSessionName(), "")
 }
 
 // waitForSpriteReady polls until the sprite responds to commands.

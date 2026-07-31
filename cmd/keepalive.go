@@ -83,7 +83,7 @@ func runKeepalive(cmd *cobra.Command, args []string) error {
 
 	// idleSession "" → no idle-exit: an explicit keepalive holds for the full
 	// window regardless of terminal activity (that's the point of the command).
-	if err := launchKeepAlive(resolved.SpriteName, resolved.Org, keepAliveFor, ""); err != nil {
+	if err := launchKeepAlive(resolved.SpriteName, resolved.Org, keepAliveFor, "", ""); err != nil {
 		return fmt.Errorf("starting keepalive: %w", err)
 	}
 	fmt.Printf("Holding sprite %q Active for %s (self-releases after).\n", resolved.SpriteName, keepAliveFor)
@@ -93,11 +93,16 @@ func runKeepalive(cmd *cobra.Command, args []string) error {
 
 // heartbeatScript builds the on-sprite shell loop that holds the sprite Active
 // via the Tasks API. It refreshes the task every 15s (task expires in 2m, giving
-// several missed-beat margin). deadlineEpoch of 0 means run until idle/killed.
-// When idleSession is non-empty, the loop watches that tmux session's pane and
-// exits once it's been unchanged for ~60s, so keep-warm stops billing when
-// Claude reaches an idle prompt.
-func heartbeatScript(deadlineEpoch int64, idleSession string) string {
+// several missed-beat margin). It exits (releasing the hold) on the first of:
+//   - deadlineEpoch reached (0 = no deadline / cap);
+//   - idleSession non-empty AND its tmux pane unchanged for ~60s (keep-warm:
+//     stop billing once Claude reaches an idle prompt);
+//   - watchSession non-empty AND that tmux session no longer exists (session-
+//     tied: hold while the session lives, release the moment it's killed).
+// idleSession and watchSession are mutually exclusive in practice — idle-exit
+// suits a foreground disconnect, session-tie suits "keep it reachable until I
+// end the session" (e.g. --rc, where an idle prompt means you're on your phone).
+func heartbeatScript(deadlineEpoch int64, idleSession, watchSession string) string {
 	// One tick = 15s. Idle after 4 unchanged ticks (~60s). PUT refreshes an
 	// existing task; on the first tick (or after expiry) PUT 404s and POST
 	// creates it. A pid file (not a pkill marker) replaces any prior loop, so
@@ -108,11 +113,22 @@ echo $$ > "$PIDFILE"
 TASK='%[2]s'
 DEADLINE=%[3]d
 IDLE_SESSION='%[4]s'
+WATCH_SESSION='%[5]s'
 LAST=''
 IDLE=0
+SEEN=0
 while :; do
   NOW=$(date +%%s)
   if [ "$DEADLINE" -ne 0 ] && [ "$NOW" -ge "$DEADLINE" ]; then break; fi
+  # Session-tie: hold until the watched session exists and then disappears.
+  # SEEN avoids exiting during the startup window before the session is created.
+  if [ -n "$WATCH_SESSION" ]; then
+    if tmux has-session -t "$WATCH_SESSION" 2>/dev/null; then
+      SEEN=1
+    elif [ "$SEEN" -eq 1 ]; then
+      break
+    fi
+  fi
   if [ -n "$IDLE_SESSION" ]; then
     H=$(tmux capture-pane -t "$IDLE_SESSION" -p 2>/dev/null | sha256sum | cut -d' ' -f1)
     if [ "$H" = "$LAST" ]; then
@@ -129,19 +145,20 @@ while :; do
 done
 sprite-env curl -X DELETE "/v1/tasks/$TASK" >/dev/null 2>&1
 rm -f "$PIDFILE"
-`, keepAlivePidFile, keepAliveTaskName, deadlineEpoch, idleSession)
+`, keepAlivePidFile, keepAliveTaskName, deadlineEpoch, idleSession, watchSession)
 }
 
 // launchKeepAlive starts the heartbeat as a detached sprite-exec process so it
 // outlives the local sp process (same detach pattern as the keep-warm sentinel:
-// Setpgid + released so a terminal SIGHUP doesn't reach it). dur of 0 means run
-// until idle/killed; idleSession enables idle-exit (see heartbeatScript).
-func launchKeepAlive(spriteName, org string, dur time.Duration, idleSession string) error {
+// Setpgid + released so a terminal SIGHUP doesn't reach it). dur of 0 means no
+// deadline; idleSession enables idle-exit and watchSession enables session-tied
+// release (see heartbeatScript).
+func launchKeepAlive(spriteName, org string, dur time.Duration, idleSession, watchSession string) error {
 	var deadline int64
 	if dur > 0 {
 		deadline = time.Now().Add(dur).Unix()
 	}
-	script := heartbeatScript(deadline, idleSession)
+	script := heartbeatScript(deadline, idleSession, watchSession)
 
 	args := []string{"exec"}
 	if org != "" {

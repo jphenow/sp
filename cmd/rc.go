@@ -117,7 +117,7 @@ func runRC(cmd *cobra.Command, args []string) error {
 	}
 
 	// Hold the sprite Active so Remote Control stays connected and reachable.
-	if err := launchKeepAlive(resolved.SpriteName, resolved.Org, rcFor, ""); err != nil {
+	if err := launchKeepAlive(resolved.SpriteName, resolved.Org, rcFor, "", ""); err != nil {
 		fmt.Printf("Warning: Remote Control service started but keepalive failed: %v\n", err)
 	}
 
