@@ -197,7 +197,10 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("sprite auth: %w", err)
 		}
 		if creds != nil {
-			if err := setup.PushClaudeCredentials(client, resolved.SpriteName, creds); err != nil {
+			// Only push if the sprite has no credential or ours is fresher —
+			// overwriting a sprite-refreshed credential with a staler copy is a
+			// key cause of repeated /login prompts (rotating refresh tokens).
+			if _, err := setup.PushClaudeCredentialsIfNewer(client, resolved.SpriteName, creds); err != nil {
 				return fmt.Errorf("claude credentials: %w", err)
 			}
 		}
