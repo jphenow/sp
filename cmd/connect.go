@@ -32,12 +32,14 @@ var (
 	keepWarmDur   time.Duration
 	remoteControl bool
 	rcAlias       bool
+	noHold        bool
 )
 
-// rcHoldCap is the default safety cap for the session-tied hold that --rc starts:
-// the sprite is held Active while the tmux session lives, but never past this cap,
-// so an abandoned session can't bill indefinitely. --keep-warm overrides it.
-const rcHoldCap = 8 * time.Hour
+// holdCap bounds the default session-tied hold: the sprite is held Active while
+// its tmux session lives, but never past this cap, so a session left open
+// overnight can't bill indefinitely. --keep-warm replaces the hold with the
+// older idle-exit behavior; --no-hold disables it entirely.
+const holdCap = 8 * time.Hour
 
 // connectCmd handles `sp .` and `sp owner/repo` — the core connect flow.
 var connectCmd = &cobra.Command{
@@ -71,6 +73,7 @@ func init() {
 	connectCmd.Flags().DurationVar(&keepWarmDur, "keep-warm", 0, "hold the sprite Active (Tasks API) for up to this duration after disconnect, exiting early if claude is idle for 60s (e.g. 1h, 30m). Default off. See also 'sp keepalive'.")
 	connectCmd.Flags().BoolVar(&remoteControl, "remote-control", false, "launch Claude with Remote Control so the session can be joined from your phone/browser (claude.ai/code)")
 	connectCmd.Flags().BoolVar(&rcAlias, "rc", false, "alias for --remote-control")
+	connectCmd.Flags().BoolVar(&noHold, "no-hold", false, "don't hold the sprite Active for the life of the session (it may idle-pause while you're away)")
 
 	// Register connect as both a subcommand and the default action
 	rootCmd.AddCommand(connectCmd)
@@ -369,21 +372,21 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		} else if verbose {
 			fmt.Fprintf(os.Stderr, "Keep-warm sentinel started (max %s, exits early when claude is idle for 60s)\n", keepWarmDur)
 		}
-	} else if remoteControl {
-		// Remote Control means you'll pick the session up from another device,
-		// so idle-exit (which assumes idle == done) is wrong here: an idle prompt
-		// usually means you're on your phone, not finished. Instead hold the
-		// sprite Active while the tmux session lives (so it stays reachable
-		// without a manual wake), releasing on session end or a generous cap so
-		// you never have to pick a duration. --keep-warm overrides this.
-		cap := rcHoldCap
-		if keepWarmDur > 0 {
-			cap = keepWarmDur
-		}
-		if err := launchKeepAlive(resolved.SpriteName, resolved.Org, cap, "", deriveTmuxSessionName()); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: starting Remote Control hold: %v\n", err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Holding sprite Active while this session lives (cap %s); stop with 'sp keepalive %s --stop'.\n", cap, resolved.SpriteName)
+	} else if !noHold {
+		// Default: hold the sprite Active while its tmux session lives. This is
+		// deliberately not tied to --rc, because you don't decide up front
+		// whether you'll switch to the phone — you may run /remote-control from
+		// inside an already-running session, and that only works if the sprite
+		// hasn't paused in the meantime. It also keeps a plain terminal session
+		// from dropping its connection on an idle pause.
+		//
+		// Idle-exit is wrong here (it assumes idle == done, but an idle prompt
+		// usually means you stepped away), so the hold releases on session end
+		// instead — or at holdCap, so an abandoned session can't bill forever.
+		if err := launchKeepAlive(resolved.SpriteName, resolved.Org, holdCap, "", deriveTmuxSessionName()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: starting session hold: %v\n", err)
+		} else if verbose {
+			fmt.Fprintf(os.Stderr, "Holding sprite Active until this session ends (cap %s)\n", holdCap)
 		}
 	}
 

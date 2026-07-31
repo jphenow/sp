@@ -72,6 +72,9 @@ func runDefault(cmd *cobra.Command, args []string) error {
 		if v, _ := cmd.Flags().GetBool("rc"); v {
 			rcAlias = true
 		}
+		if v, _ := cmd.Flags().GetBool("no-hold"); v {
+			noHold = true
+		}
 
 		// Handle -- separator for exec command
 		connectArgs := args
@@ -105,6 +108,7 @@ func init() {
 	rootCmd.Flags().Duration("keep-warm", 0, "keep sprite warm after disconnect (e.g. 1h)")
 	rootCmd.Flags().Bool("remote-control", false, "launch Claude with Remote Control (join from phone/browser)")
 	rootCmd.Flags().Bool("rc", false, "alias for --remote-control")
+	rootCmd.Flags().Bool("no-hold", false, "don't hold the sprite Active for the life of the session")
 
 	// Prevent cobra from complaining about unknown flags being passed through --
 	rootCmd.TraverseChildren = true
