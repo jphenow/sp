@@ -1128,14 +1128,44 @@ func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID str
 		return fmt.Errorf("sprite binary not found: %w", err)
 	}
 
-	cmd := exec.Command(binary, args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	runErr := cmd.Run()
+	runErr := runAttachWithRetry(binary, args)
 	resetTerminal()
 	return runErr
+}
+
+// attachFailFastWindow bounds how quickly an attach must fail to be considered
+// "never got going". Past this, the user had a real session and an exit is
+// theirs, not a connection error to paper over.
+const attachFailFastWindow = 10 * time.Second
+
+// runAttachWithRetry runs `sprite attach`, retrying once if it dies almost
+// immediately.
+//
+// Setup can take minutes against a degraded API, and losing all of it to a
+// connection error on the very last step is the worst possible outcome —
+// observed: six and a half minutes of successful setup, then "failed to
+// connect: read tcp ...: i/o timeout" and exit 1. The dial is the flaky part
+// (see the trace: essentially all of a call's time is spent connecting), and a
+// dial that fails fast is exactly the case a retry fixes.
+//
+// Only fast failures are retried. Once the attach has been up long enough to
+// hand the terminal over, a non-zero exit means the user's session ended and
+// re-running it would be wrong.
+func runAttachWithRetry(binary string, args []string) error {
+	for attempt := 1; ; attempt++ {
+		cmd := exec.Command(binary, args...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		start := time.Now()
+		err := cmd.Run()
+		if err == nil || attempt > 1 || time.Since(start) > attachFailFastWindow {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "\nAttach failed after %s (%v) — retrying once.\n",
+			time.Since(start).Round(time.Millisecond), err)
+	}
 }
 
 // deriveTmuxSessionName computes the tmux session name a connect will use:
