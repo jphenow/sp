@@ -311,6 +311,67 @@ func spriteClaudeCredsExpiry(client *sprite.Client, spriteName string) int64 {
 	return claudeCredsExpiry(out)
 }
 
+// SpriteClaudeAuthOK asks claude ON THE SPRITE whether its credentials.json
+// actually works, returning (loggedIn, authMethod).
+//
+// This exists because the presence of a credentials.json says nothing about
+// whether it's usable. Claude's OAuth refresh tokens ROTATE: once this machine
+// or another sprite refreshes the shared credential, every other copy's refresh
+// token is dead. A file with a future expiresAt can therefore be completely
+// unusable, and treating "file exists" as "authenticated" is how you end up
+// suppressing the fallback token and landing on "Not logged in · Please run
+// /login" with no way back.
+//
+// `claude auth status` emits JSON and costs no inference. The probe explicitly
+// unsets CLAUDE_CODE_OAUTH_TOKEN so it measures the FILE — with the env var
+// visible, claude would report on the token instead and the answer would be
+// meaningless for this decision.
+func SpriteClaudeAuthOK(client *sprite.Client, spriteName string) (bool, string) {
+	script := `
+CLAUDE=$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")
+[ -x "$CLAUDE" ] || exit 127
+env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$CLAUDE" auth status 2>/dev/null
+`
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", script},
+	})
+	if err != nil {
+		return false, ""
+	}
+	// `claude auth status` prints a JSON object; anything before it (shell
+	// noise, MOTD) is skipped by seeking to the first brace.
+	i := bytes.IndexByte(out, '{')
+	if i < 0 {
+		return false, ""
+	}
+	var status struct {
+		LoggedIn   bool   `json:"loggedIn"`
+		AuthMethod string `json:"authMethod"`
+	}
+	if err := json.Unmarshal(out[i:], &status); err != nil {
+		return false, ""
+	}
+	return status.LoggedIn, status.AuthMethod
+}
+
+// claudeAiAuthMethod is what `claude auth status` reports for a full-scope
+// claude.ai login — the only method Remote Control accepts. A setup-token
+// reports "oauth_token" instead, and does so even when the token is complete
+// garbage (verified: a junk CLAUDE_CODE_OAUTH_TOKEN yields loggedIn=true,
+// authMethod="oauth_token"), which is why the method must be checked and not
+// just the loggedIn flag.
+const claudeAiAuthMethod = "claude.ai"
+
+// SpriteClaudeFullyAuthed reports whether the sprite's credentials FILE gives a
+// working full-scope claude.ai login — the condition under which it's safe, and
+// necessary, to withhold CLAUDE_CODE_OAUTH_TOKEN. Returns the observed method
+// for use in diagnostics.
+func SpriteClaudeFullyAuthed(client *sprite.Client, spriteName string) (bool, string) {
+	loggedIn, method := SpriteClaudeAuthOK(client, spriteName)
+	return loggedIn && method == claudeAiAuthMethod, method
+}
+
 // PushClaudeCredentialsIfNewer pushes the local credentials only when the sprite
 // has none or the local copy is strictly fresher (later expiresAt). This avoids
 // clobbering a credential the sprite's own Claude already refreshed with a
@@ -417,12 +478,20 @@ done
 	if _, err := os.Stat(configPath); err != nil {
 		return nil
 	}
+	// Non-fatal, as the doc comment above promises: this file is pure
+	// preferences (editor, aliases) and gh works fine without it. Returning
+	// the error used to abort the whole auth chain this runs in — taking the
+	// open wrapper and the repo clone down with it — because an upload of a
+	// ~1KB config file hit the sprite API's timeout.
+	if err := UploadFiles(client, spriteName, map[string]string{configPath: "/home/sprite/.config/gh/config.yml"}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: gh config.yml not pushed (gh still works, minus your preferences): %v\n", err)
+		return nil
+	}
 	if _, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Command: []string{"sh", "-c", "mkdir -p ~/.config/gh && chmod 700 ~/.config/gh && chmod 600 ~/.config/gh/config.yml 2>/dev/null || true"},
-		Files:   map[string]string{configPath: "/home/sprite/.config/gh/config.yml"},
+		Command: []string{"sh", "-c", "chmod 700 ~/.config/gh 2>/dev/null; chmod 600 ~/.config/gh/config.yml 2>/dev/null || true"},
 	}); err != nil {
-		return fmt.Errorf("uploading gh config.yml: %w", err)
+		_ = err // cosmetic perms only
 	}
 	return nil
 }

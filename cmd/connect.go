@@ -123,78 +123,91 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Connecting to sprite: %s\n", resolved.SpriteName)
 
-	// Get Claude token
+	// Claude auth inputs. BOTH are gathered every time, because they serve
+	// different goals and neither alone covers both:
+	//
+	//   - credentials.json (full-scope claude.ai login) is what Remote
+	//     Control requires; a setup-token is inference-only and RC rejects it.
+	//   - ~/.claude-token (setup-token) is long-lived and never rotates, so
+	//     it's the reliable fallback that keeps plain inference working when
+	//     the shared credential has been invalidated by refresh-token
+	//     rotation elsewhere.
+	//
+	// Which one the sprite actually ends up using is decided AFTER the push,
+	// by asking claude on the sprite whether the credential works — see the
+	// auth chain below. LocalToken is the non-prompting read; only fall back
+	// to the interactive prompt when there's no other credential at all.
+	creds := setup.LocalClaudeCredentials()
 	tp := setup.NewTokenProvider()
-	token, err := tp.GetToken()
-	if err != nil {
-		return fmt.Errorf("getting token: %w", err)
+	token, _ := tp.LocalToken()
+	if creds == nil && token == "" {
+		var err error
+		token, err = tp.GetToken()
+		if err != nil {
+			return fmt.Errorf("getting token: %w", err)
+		}
 	}
 
 	// Create sprite client
 	client := sprite.NewClient(resolved.Org)
 
-	// Check if sprite exists, create if needed
-	exists, err := client.Exists(resolved.SpriteName)
+	// Check if sprite exists, create if needed. ExistsInfo hands back the Info
+	// the existence check already fetched, so the lifecycle status
+	// (running/warm/cold) costs nothing extra — and it's the single most
+	// useful number for explaining a slow connect, since a cold sprite makes
+	// the first exec pay a ~30s wake that every later call avoids.
+	connectStart := time.Now()
+	info, exists, err := client.ExistsInfo(resolved.SpriteName)
 	if err != nil {
 		return fmt.Errorf("checking sprite: %w", err)
 	}
+	startStatus := "new"
+	if exists && info != nil && info.Status != "" {
+		startStatus = info.Status
+	}
 
-	// Sequential prologue: create + wait + perms must happen in order
-	// before any parallel setup. Wrapped in a single spinner task so the
-	// user sees elapsed time but we don't accidentally parallelize steps
-	// that depend on each other (earlier bug: parallel perms-fix raced
-	// with the ready-check and waited 55s instead of piggybacking).
+	// Sequential prologue: create + wait + perms must happen in order before
+	// any parallel setup (earlier bug: a parallel perms-fix raced with the
+	// ready-check and waited 55s instead of piggybacking). These used to be
+	// hidden inside ONE task named "Preparing sprite", which meant a slow
+	// prologue was unattributable — you couldn't tell a slow create from a
+	// slow wake from a slow chown. RunSequential keeps the ordering and gives
+	// each step its own timed line.
 	prologue := progress.New(verbose)
-	prologue.Add("Preparing sprite", func() error {
-		if !exists {
+	if !exists {
+		prologue.Add("Creating sprite", func() error {
 			if err := client.Create(resolved.SpriteName); err != nil {
 				return fmt.Errorf("creating sprite: %w", err)
 			}
-		}
-		if err := waitForSpriteReady(client, resolved.SpriteName); err != nil {
-			return err
-		}
+			return nil
+		})
+	}
+	var readyTask *progress.Task
+	readyTask = prologue.Add("Waiting for sprite", func() error {
+		return waitForSpriteReady(client, resolved.SpriteName, readyTask)
+	})
+	prologue.Add("Fixing home permissions", func() error {
 		return setup.FixSpriteHomePermissions(client, resolved.SpriteName)
 	})
-	if err := prologue.Run(); err != nil {
+	if err := prologue.RunSequential(); err != nil {
 		return err
 	}
 
-	// Claude auth path decision: prefer the env-token path (~/.claude-token
-	// or CLAUDE_CODE_OAUTH_TOKEN) whenever a token is available. The
-	// Keychain credentials.json path is the fallback for users who don't
-	// have a setup-token but do have Claude Code creds in the local
-	// Keychain. Reasons to prefer the token file:
-	//
-	//   - It's explicit user intent: if you ran `claude setup-token` and
-	//     dropped the result in ~/.claude-token, that's the token you
-	//     want propagated, not whatever Keychain happens to hold.
-	//   - setup-tokens are long-lived and don't auto-refresh, so the
-	//     "env goes stale across reconnects" failure mode doesn't apply
-	//     in practice.
-	//
-	// Only fall back to pushing credentials.json when there's no token.
-	var creds []byte
-	authTokenForEnv := token
-	if token == "" {
-		creds = setup.LocalClaudeCredentials()
-	}
+	// authTokenForEnv is set by the auth chain below once we know whether the
+	// sprite's credentials.json actually authenticates. Empty means "don't
+	// inject CLAUDE_CODE_OAUTH_TOKEN" — the env var sits ABOVE the
+	// credentials file in claude's auth precedence, so injecting it masks the
+	// file and breaks Remote Control (and makes an on-sprite /login look like
+	// it didn't stick).
+	var authTokenForEnv string
 
 	// Remote Control: default the command to Claude with the join feature on, so
-	// the session can be driven from claude.ai/code or the Claude app. RC needs a
-	// full-scope claude.ai login; the Go connect prefers pushing credentials.json
-	// (which satisfies RC), but if none is available it falls back to the
-	// inference-only setup-token, which RC rejects — warn in that case.
+	// the session can be driven from claude.ai/code or the Claude app.
 	if rcAlias {
 		remoteControl = true
 	}
-	if remoteControl {
-		if execCmd == "" {
-			execCmd = "claude --remote-control"
-		}
-		if creds == nil {
-			fmt.Fprintln(os.Stderr, "Warning: Remote Control needs a full claude.ai login. No local ~/.claude credentials were found to push, so the sprite will use the inference-only setup-token, which RC rejects. Run 'claude' then /login on the sprite, or log in with Claude Code locally so credentials.json can be pushed.")
-		}
+	if remoteControl && execCmd == "" {
+		execCmd = "claude --remote-control"
 	}
 
 	// Parallel setup. Five concurrent task chains:
@@ -232,6 +245,24 @@ func runConnect(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("claude credentials: %w", err)
 			}
 		}
+
+		// Decide the env-token question with evidence rather than inference:
+		// ask claude on the sprite whether the credential file authenticates.
+		// A credentials.json that exists but doesn't work (refresh token
+		// rotated out from under it) must NOT suppress the setup-token
+		// fallback, or the sprite lands on "Not logged in" with nothing to
+		// fall back to. Written here and read after parallel.Run() joins.
+		fullyAuthed, authMethod := setup.SpriteClaudeFullyAuthed(client, resolved.SpriteName)
+		switch {
+		case fullyAuthed:
+			authTokenForEnv = "" // full-scope creds work; don't mask them
+		case token != "":
+			authTokenForEnv = token
+			fmt.Fprintf(os.Stderr, "\nNote: the sprite has no working claude.ai login (auth method: %q), so falling back to the inference-only setup-token. Inference will work; Remote Control will not until you run /login on the sprite.\n", authMethod)
+		default:
+			fmt.Fprintln(os.Stderr, "\nWarning: no working Claude credential on the sprite and no ~/.claude-token to fall back on. Run 'claude' then /login on the sprite.")
+		}
+
 		if err := setup.SetupGhAuth(client, resolved.SpriteName); err != nil {
 			return fmt.Errorf("gh auth: %w", err)
 		}
@@ -282,16 +313,20 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			if err != nil || conf == nil {
 				return nil // best-effort
 			}
+			// One exec for the whole set: each upload against a cold sprite
+			// can take 30s+, and doing them serially is what pushed this past
+			// the CLI's upload timeout in the first place.
+			files := map[string]string{}
 			for _, f := range setup.GetAlwaysFiles(conf) {
 				if _, err := os.Stat(f.Source); err == nil {
-					client.Exec(sprite.ExecOptions{
-						Sprite:  resolved.SpriteName,
-						Command: []string{"true"},
-						Files:   map[string]string{f.Source: f.Dest},
-					})
+					files[f.Source] = f.Dest
 				}
 			}
-			return nil
+			// Report failures instead of discarding them. This task used to
+			// throw away every error, so a batch of timed-out uploads still
+			// printed a green check and the user found a sprite with none of
+			// their dotfiles on it and no clue why.
+			return setup.UploadFiles(client, resolved.SpriteName, files)
 		})
 	}
 
@@ -389,6 +424,8 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "Holding sprite Active until this session ends (cap %s)\n", holdCap)
 		}
 	}
+
+	reportConnectTimings(resolved.SpriteName, startStatus, time.Since(connectStart))
 
 	// Connect to sprite shell. Pass authTokenForEnv (empty when we pushed
 	// a credentials.json) so execInSprite knows whether to inject the
@@ -553,21 +590,89 @@ func startKeepWarmSentinel(spriteName, org string, dur time.Duration) error {
 }
 
 // waitForSpriteReady polls until the sprite responds to commands.
-func waitForSpriteReady(client *sprite.Client, name string) error {
-	for i := 0; i < 60; i++ {
+// slowConnectThreshold is the setup duration above which the latency profile
+// prints unasked. Below it the numbers are noise; above it they're the first
+// thing you want, and a slow connect is exactly the run you can't reproduce on
+// demand with a flag.
+const slowConnectThreshold = 45 * time.Second
+
+// reportConnectTimings prints where the setup phase's wall clock went: the
+// sprite's lifecycle status when we started (a cold sprite explains ~30s of
+// wake on its own), total elapsed, and the per-call profile from the sprite
+// trace. Prints under -v always, and unprompted when setup ran long.
+func reportConnectTimings(spriteName, startStatus string, elapsed time.Duration) {
+	slow := elapsed >= slowConnectThreshold
+	if !verbose && !slow {
+		return
+	}
+	calls, busy := sprite.TotalTraced()
+	fmt.Fprintf(os.Stderr, "\nSetup took %s — sprite %q was %q on connect; %d sprite CLI calls, %s of call time.\n",
+		elapsed.Round(time.Millisecond), spriteName, startStatus, calls, busy.Round(time.Millisecond))
+	if slow && startStatus == "cold" {
+		fmt.Fprintln(os.Stderr, "A cold sprite pays its wake on the first call (~30s observed); later calls run in well under a second.")
+	}
+	if summary := sprite.TraceSummary(); summary != "" {
+		fmt.Fprint(os.Stderr, summary)
+	}
+}
+
+// spriteReadyTimeout bounds waitForSpriteReady in wall-clock time. Sized
+// against a measured ~31s cold-start wake: enough room for a few of those,
+// short enough that a genuinely broken sprite doesn't hang the connect.
+const spriteReadyTimeout = 3 * time.Minute
+
+// waitForSpriteReadyMaxBackoff caps the sleep between probe attempts.
+const waitForSpriteReadyMaxBackoff = 8 * time.Second
+
+// waitForSpriteReady polls the sprite with a trivial exec until it answers.
+//
+// The probe itself is the wake: on a cold sprite the first exec blocks for the
+// full cold-start (~31s measured) before returning, so an attempt here is not
+// cheap and must not be retried in a tight loop.
+//
+// This replaces a loop that ran a fixed 60 iterations with no sleep, reported
+// "did not become ready within 60 seconds" regardless of how long it actually
+// ran (60 × a 31s cold exec is over half an hour), and discarded every error —
+// making it impossible to tell a slow sprite from a broken one. progress
+// reports live attempt/elapsed state, and the last error survives into the
+// returned message.
+func waitForSpriteReady(client *sprite.Client, name string, task *progress.Task) error {
+	deadline := time.Now().Add(spriteReadyTimeout)
+	backoff := time.Second
+	var lastErr error
+
+	for attempt := 1; ; attempt++ {
+		if task != nil {
+			task.SetDetail(fmt.Sprintf("probe %d", attempt))
+		}
+		started := time.Now()
 		_, err := client.Exec(sprite.ExecOptions{
 			Sprite:  name,
 			Command: []string{"echo", "ready"},
 		})
 		if err == nil {
+			if task != nil && attempt > 1 {
+				task.SetDetail(fmt.Sprintf("ready after %d probes", attempt))
+			} else if task != nil {
+				task.SetDetail("")
+			}
 			return nil
 		}
-		// Previously printed a `.` per retry, but the spinner now provides
-		// progress indication so the dots would interleave with the live
-		// render. Verbose mode could re-add this if useful, but for now
-		// the spinner duration counter suffices.
+		lastErr = err
+		if task != nil {
+			task.SetDetail(fmt.Sprintf("probe %d failed after %s, retrying",
+				attempt, time.Since(started).Round(time.Second)))
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("sprite %q not ready after %s (%d probes); last error: %w",
+				name, spriteReadyTimeout, attempt, lastErr)
+		}
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > waitForSpriteReadyMaxBackoff {
+			backoff = waitForSpriteReadyMaxBackoff
+		}
 	}
-	return fmt.Errorf("sprite did not become ready within 60 seconds")
 }
 
 // cloneRepoOnSprite runs `git clone` inside the sprite for the given GitHub
@@ -933,6 +1038,27 @@ func buildTmuxEnvRefreshScript(vars map[string]string) string {
 	return strings.Join(sets, "\n")
 }
 
+// buildTmuxEnvUnsetScript is the mirror image of buildTmuxEnvRefreshScript:
+// it removes the named vars from the tmux global environment AND from every
+// existing session's environment. The per-session sweep matters as much here
+// as it does for setting — `tmux new-session -A` attaches to a live session
+// whose env was snapshotted from global at creation time, so a `setenv -gu`
+// alone leaves the stale value reachable by every new pane.
+func buildTmuxEnvUnsetScript(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	var unsets []string
+	for _, k := range names {
+		unsets = append(unsets, fmt.Sprintf("tmux setenv -gu %s 2>/dev/null || true", k))
+		unsets = append(unsets, fmt.Sprintf(
+			`for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do tmux setenv -t "$s" -u %s 2>/dev/null || true; done`,
+			k,
+		))
+	}
+	return strings.Join(unsets, "\n")
+}
+
 // attachToSpriteSession reattaches to an existing sprite-env session by
 // its numeric ID via `sprite attach`. Before attaching, it refreshes
 // the tmux global environment with the current GH_TOKEN and
@@ -952,10 +1078,31 @@ func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID str
 	if ghToken := setup.LocalGhToken(); ghToken != "" {
 		vars["GH_TOKEN"] = ghToken
 	}
-	if claudeToken, err := setup.NewTokenProvider().LocalToken(); err == nil && claudeToken != "" {
+
+	// Claude auth on reattach mirrors the connect path: push the local
+	// full-scope credential when it's fresher than the sprite's (a sprite
+	// that's been cold for a while can hold an expired one, which would
+	// otherwise surface as a /login prompt), and inject the setup-token env
+	// var ONLY when no credentials.json exists anywhere. Injecting it
+	// unconditionally — as this used to — re-masks the sprite's own
+	// credential on every single reconnect, which is why a /login performed
+	// on the sprite never survived to the next session.
+	var unset []string
+	creds := setup.LocalClaudeCredentials()
+	if creds != nil {
+		if _, err := setup.PushClaudeCredentialsIfNewer(client, spriteName, creds); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: refreshing Claude credentials: %v\n", err)
+		}
+	}
+	claudeToken, _ := setup.NewTokenProvider().LocalToken()
+	if fullyAuthed, _ := setup.SpriteClaudeFullyAuthed(client, spriteName); fullyAuthed {
+		unset = append(unset, "CLAUDE_CODE_OAUTH_TOKEN")
+	} else if claudeToken != "" {
 		vars["CLAUDE_CODE_OAUTH_TOKEN"] = claudeToken
 	}
-	if script := buildTmuxEnvRefreshScript(vars); script != "" {
+
+	script := strings.TrimSpace(buildTmuxEnvUnsetScript(unset) + "\n" + buildTmuxEnvRefreshScript(vars))
+	if script != "" {
 		client.Exec(sprite.ExecOptions{
 			Sprite:  spriteName,
 			Command: []string{"sh", "-c", script},
@@ -1044,7 +1191,11 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 		tokenRefresh += "\n"
 	}
 	if token == "" {
-		tokenRefresh = "tmux setenv -gu CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null || true\n" + tokenRefresh
+		// Clear the var everywhere, not just globally: `new-session -A` can
+		// attach to a pre-existing session that snapshotted an old value, and
+		// a lingering CLAUDE_CODE_OAUTH_TOKEN masks ~/.claude/.credentials.json
+		// for every pane opened in it.
+		tokenRefresh = buildTmuxEnvUnsetScript([]string{"CLAUDE_CODE_OAUTH_TOKEN"}) + "\n" + tokenRefresh
 	}
 	// Remote Control: give the session a readable name prefix so the sprite is
 	// easy to find in the claude.ai/code session list (defaults to hostname).
