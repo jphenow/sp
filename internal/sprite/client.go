@@ -6,7 +6,43 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// runCapture runs a sprite CLI command, returning stdout and — on failure — an
+// error carrying the tail of stderr.
+//
+// The API commands parse JSON from stdout, so CombinedOutput isn't an option;
+// but plain .Output() drops stderr entirely, which is where the sprite CLI puts
+// the only useful part of a failure. That's how a platform outage surfaced as
+// the bare, undiagnosable "exit status 35" instead of
+// "curl: (35) Recv failure: Connection reset by peer".
+func runCapture(args ...string) ([]byte, error) {
+	cmd := exec.Command("sprite", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := lastMeaningfulLine(stderr.String()); msg != "" {
+			return out, fmt.Errorf("%w: %s", err, msg)
+		}
+		return out, err
+	}
+	return out, nil
+}
+
+// lastMeaningfulLine picks the final non-empty line of stderr, which for the
+// sprite CLI is the actual failure (curl progress meters and "Calling API:"
+// banners precede it).
+func lastMeaningfulLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			return l
+		}
+	}
+	return ""
+}
 
 // Client provides access to the Sprites API and CLI.
 type Client struct {
@@ -26,7 +62,9 @@ func (c *Client) List() ([]Info, error) {
 	}
 	args = append(args, "/sprites")
 
-	out, err := exec.Command("sprite", args...).Output()
+	start := time.Now()
+	out, err := runCapture(args...)
+	record("api", "/sprites", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("listing sprites: %w", err)
 	}
@@ -46,7 +84,9 @@ func (c *Client) Get(name string) (*Info, error) {
 	}
 	args = append(args, "-s", name, "/")
 
-	out, err := exec.Command("sprite", args...).Output()
+	start := time.Now()
+	out, err := runCapture(args...)
+	record("api", name+": info", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("getting sprite %q: %w", name, err)
 	}
@@ -68,7 +108,10 @@ func (c *Client) Create(name string) error {
 	args = append(args, name)
 
 	cmd := exec.Command("sprite", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	start := time.Now()
+	out, err := cmd.CombinedOutput()
+	record("create", name, start, err)
+	if err != nil {
 		return fmt.Errorf("creating sprite %q: %w\n%s", name, err, string(out))
 	}
 	return nil
@@ -98,7 +141,9 @@ func (c *Client) Destroy(name string) error {
 func (c *Client) Exec(opts ExecOptions) ([]byte, error) {
 	args := c.BuildExecArgs(opts)
 	cmd := exec.Command("sprite", args...)
+	start := time.Now()
 	out, err := cmd.CombinedOutput()
+	record("exec", describeExec(opts), start, err)
 	if err != nil {
 		return out, fmt.Errorf("exec on sprite %q: %w\n%s", opts.Sprite, err, string(out))
 	}
@@ -212,7 +257,7 @@ func (c *Client) GetURL(name string) (string, error) {
 	}
 	args = append(args, "-s", name)
 
-	out, err := exec.Command("sprite", args...).Output()
+	out, err := runCapture(args...)
 	if err != nil {
 		return "", fmt.Errorf("getting URL for sprite %q: %w", name, err)
 	}
@@ -222,24 +267,39 @@ func (c *Client) GetURL(name string) (string, error) {
 // Exists checks if a sprite with the given name exists by attempting to get it.
 // Returns true only when the API returns a sprite with a non-empty ID.
 func (c *Client) Exists(name string) (bool, error) {
+	_, ok, err := c.ExistsInfo(name)
+	return ok, err
+}
+
+// ExistsInfo is Exists plus the Info it already had to fetch to answer. Callers
+// that want the sprite's Status (running / warm / cold) should use this rather
+// than a second Get — the whole reason to know the status is that a cold sprite
+// makes every subsequent call expensive, so paying an extra round trip to learn
+// it would be self-defeating. Info is nil when the answer came from the list
+// fallback or the sprite doesn't exist.
+func (c *Client) ExistsInfo(name string) (*Info, bool, error) {
 	info, err := c.Get(name)
 	if err != nil {
 		// If we get an error, the sprite might not exist or there's a network issue.
 		// Check the sprite list as fallback.
 		sprites, listErr := c.List()
 		if listErr != nil {
-			return false, fmt.Errorf("checking sprite existence: %w", err)
+			return nil, false, fmt.Errorf("checking sprite existence: %w", err)
 		}
 		for _, s := range sprites {
 			if s.Name == name {
-				return true, nil
+				found := s
+				return &found, true, nil
 			}
 		}
-		return false, nil
+		return nil, false, nil
 	}
 	// Guard against the API returning an empty/null JSON body that
 	// deserialises into a zero-value Info struct.
-	return info != nil && info.ID != "", nil
+	if info == nil || info.ID == "" {
+		return nil, false, nil
+	}
+	return info, true, nil
 }
 
 // Use associates the current directory with a sprite name (creates .sprite file).

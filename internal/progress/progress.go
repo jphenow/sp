@@ -44,6 +44,25 @@ type Task struct {
 	Ended   time.Time
 
 	fn func() error
+
+	detailMu sync.Mutex
+	detail   string
+}
+
+// SetDetail attaches a short live note to a running task, rendered after the
+// name ("Waiting for sprite — attempt 3, last: exec timeout"). Safe to call
+// from inside the task's own function while the renderer is drawing.
+func (t *Task) SetDetail(s string) {
+	t.detailMu.Lock()
+	t.detail = s
+	t.detailMu.Unlock()
+}
+
+// Detail returns the current live note, or "".
+func (t *Task) Detail() string {
+	t.detailMu.Lock()
+	defer t.detailMu.Unlock()
+	return t.detail
 }
 
 // Duration returns how long the task has been running, or its total
@@ -136,6 +155,43 @@ func (g *Group) Run() error {
 		}
 	}
 	return nil
+}
+
+// RunSequential executes tasks one at a time, in registration order, stopping
+// at the first failure. Use it for steps that depend on each other — they get
+// their own progress line each (so a slow step is attributable) without the
+// caller having to hide the ordering inside one opaque task.
+//
+// Remaining tasks stay pending and are rendered as such when one fails.
+func (g *Group) RunSequential() error {
+	if len(g.tasks) == 0 {
+		return nil
+	}
+
+	g.render()
+
+	var rendererStop chan struct{}
+	if !g.verbose {
+		rendererStop = make(chan struct{})
+		go g.renderLoop(rendererStop)
+	}
+
+	var firstErr error
+	for _, t := range g.tasks {
+		g.markRunning(t)
+		err := safeRun(t.fn)
+		g.markDone(t, err)
+		if err != nil {
+			firstErr = err
+			break
+		}
+	}
+
+	if rendererStop != nil {
+		close(rendererStop)
+	}
+	g.render()
+	return firstErr
 }
 
 // safeRun catches a panic in a task function and converts it to an error
@@ -236,10 +292,16 @@ func (g *Group) render() {
 			sb.WriteString(runStyle.Render(spinnerFrames[frame] + " "))
 			sb.WriteString(t.Name)
 			sb.WriteString(dimStyle.Render(" " + t.Duration().Round(100*time.Millisecond).String()))
+			if d := t.Detail(); d != "" {
+				sb.WriteString(dimStyle.Render(" — " + d))
+			}
 		case StatusOK:
 			sb.WriteString(okStyle.Render("✓ "))
 			sb.WriteString(t.Name)
 			sb.WriteString(dimStyle.Render(" " + t.Duration().Round(time.Millisecond).String()))
+			if d := t.Detail(); d != "" {
+				sb.WriteString(dimStyle.Render(" — " + d))
+			}
 		case StatusFail:
 			sb.WriteString(failStyle.Render("✗ "))
 			sb.WriteString(t.Name)
