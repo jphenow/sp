@@ -285,8 +285,12 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	})
 
 	parallel.Add("Syncing Claude config", func() error {
+		// Non-fatal: this is preferences, skills and commands, not something
+		// the session needs to start. A flaky upload here shouldn't cost you
+		// the connect — warn and carry on to the settings merge, which is
+		// what actually makes claude usable (bypass-permissions defaults).
 		if err := setup.PushClaudeConfig(client, resolved.SpriteName); err != nil {
-			return fmt.Errorf("push claude config: %w", err)
+			fmt.Fprintf(os.Stderr, "\nWarning: Claude config not pushed (your skills/commands may be missing on the sprite): %v\n", err)
 		}
 		return setup.EnsureSpriteClaudeSettings(client, resolved.SpriteName)
 	})
@@ -331,10 +335,14 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := parallel.Run(); err != nil {
-		// Don't fail the whole connect on a single setup-task error —
-		// the user probably still wants the shell. Surface the error to
-		// stderr (the spinner already showed the failed task) and keep going.
-		fmt.Fprintf(os.Stderr, "Warning: setup task failed: %v\n", err)
+		// Don't fail the whole connect on a single setup-task error — the
+		// user probably still wants the shell. Report EVERY failure, not
+		// just the first Run() returns: during an API outage several tasks
+		// fail together, and the progress line truncates each error to fit
+		// the terminal, so this is where the full text has to come out.
+		for _, t := range parallel.Failures() {
+			fmt.Fprintf(os.Stderr, "\nWarning: setup task %q failed: %v\n", t.Name, t.Err)
+		}
 	}
 
 	// Setup web service if requested — always reconfigure to ensure correct state

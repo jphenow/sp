@@ -169,15 +169,23 @@ func PushClaudeConfig(client *sprite.Client, spriteName string) error {
 		return fmt.Errorf("closing temp file: %w", err)
 	}
 
-	// Upload and extract into the sprite's ~/.claude/. mkdir -p first so a
-	// fresh sprite without ~/.claude/ doesn't fail the extract. The --strip
-	// is avoided because tar entries are already stored with paths relative
-	// to ~/.claude/ (see addToTarFollowingSymlinks).
-	extractCmd := "mkdir -p ~/.claude && cd ~/.claude && tar xzf /tmp/sp-claude-config.tar.gz && rm -f /tmp/sp-claude-config.tar.gz"
+	// Upload via UploadFiles so the tarball push gets the same retry the
+	// other uploads do — this is a small payload (the 40MB of
+	// plugins/marketplaces is excluded), so a failure here is the API
+	// being flaky, exactly the case a retry is for.
+	const remoteTar = "/tmp/sp-claude-config.tar.gz"
+	if err := UploadFiles(client, spriteName, map[string]string{tmpFile.Name(): remoteTar}); err != nil {
+		return fmt.Errorf("uploading claude config: %w", err)
+	}
+
+	// Extract into the sprite's ~/.claude/. mkdir -p first so a fresh sprite
+	// without ~/.claude/ doesn't fail the extract. --strip is avoided because
+	// tar entries are already stored with paths relative to ~/.claude/ (see
+	// addToTarFollowingSymlinks).
+	extractCmd := "mkdir -p ~/.claude && cd ~/.claude && tar xzf " + remoteTar + " && rm -f " + remoteTar
 	if _, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
 		Command: []string{"sh", "-c", extractCmd},
-		Files:   map[string]string{tmpFile.Name(): "/tmp/sp-claude-config.tar.gz"},
 	}); err != nil {
 		return fmt.Errorf("extracting claude config on sprite: %w", err)
 	}

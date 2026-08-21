@@ -194,6 +194,23 @@ func (g *Group) RunSequential() error {
 	return firstErr
 }
 
+// Failures returns every task that failed, in registration order. Run() only
+// returns the first error, which understates things badly when an API outage
+// takes down several tasks at once — the progress line truncates each error to
+// fit the terminal, so this is the only place the full text of the others is
+// still reachable.
+func (g *Group) Failures() []*Task {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var failed []*Task
+	for _, t := range g.tasks {
+		if t.Status == StatusFail {
+			failed = append(failed, t)
+		}
+	}
+	return failed
+}
+
 // safeRun catches a panic in a task function and converts it to an error
 // so a single broken task doesn't take down the whole connect flow.
 func safeRun(fn func() error) (err error) {
