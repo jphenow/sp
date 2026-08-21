@@ -298,38 +298,56 @@ func claudeCredsExpiry(creds []byte) int64 {
 	return d.ClaudeAiOauth.ExpiresAt
 }
 
-// spriteClaudeCredsExpiry reads the sprite's ~/.claude/.credentials.json and
-// returns its expiresAt (epoch millis), or 0 if the file is missing/unreadable.
-func spriteClaudeCredsExpiry(client *sprite.Client, spriteName string) int64 {
-	out, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", "cat ~/.claude/.credentials.json 2>/dev/null"},
-	})
-	if err != nil {
-		return 0
+// SyncClaudeCredentials installs the local credential if it's fresher than the
+// sprite's and reports whether the sprite ends up with a working full-scope
+// claude.ai login — all in ONE sprite call.
+//
+// It replaces three separate calls (read the sprite's expiresAt, push, probe
+// auth status). That mattered once a call was measured to spend ~all of its
+// time dialing the sprite and ~0.02s running the command: three dials to
+// decide one question is three times the cost for no extra information.
+//
+// The freshness comparison moves onto the sprite because that's where both
+// copies can be compared without a round trip. Overwriting a credential the
+// sprite already refreshed with a staler local copy is a key cause of repeated
+// /login prompts — OAuth refresh tokens rotate, and the staler copy loses.
+//
+// creds may be nil, in which case nothing is installed and this is purely the
+// auth probe. Returns (fullyAuthed, observed auth method).
+func SyncClaudeCredentials(client *sprite.Client, spriteName string, creds []byte) (bool, string) {
+	install := ""
+	if len(creds) > 0 {
+		// Base64 in standard encoding has no shell-special characters, so it's
+		// safe to interpolate into an sh -c command without quoting.
+		install = fmt.Sprintf(`
+printf '%%s' '%s' | base64 -d > /tmp/sp-creds.json
+python3 - <<'SPPY'
+import json, os, shutil
+new = '/tmp/sp-creds.json'
+cur = os.path.expanduser('~/.claude/.credentials.json')
+def expiry(p):
+    try:
+        with open(p) as f:
+            return int(json.load(f).get('claudeAiOauth', {}).get('expiresAt', 0))
+    except Exception:
+        return 0
+# Install only when ours is strictly fresher, or the sprite has nothing usable.
+if expiry(new) > expiry(cur):
+    shutil.copyfile(new, cur)
+    os.chmod(cur, 0o600)
+SPPY
+rm -f /tmp/sp-creds.json
+`, base64.StdEncoding.EncodeToString(creds))
 	}
-	return claudeCredsExpiry(out)
-}
 
-// SpriteClaudeAuthOK asks claude ON THE SPRITE whether its credentials.json
-// actually works, returning (loggedIn, authMethod).
-//
-// This exists because the presence of a credentials.json says nothing about
-// whether it's usable. Claude's OAuth refresh tokens ROTATE: once this machine
-// or another sprite refreshes the shared credential, every other copy's refresh
-// token is dead. A file with a future expiresAt can therefore be completely
-// unusable, and treating "file exists" as "authenticated" is how you end up
-// suppressing the fallback token and landing on "Not logged in · Please run
-// /login" with no way back.
-//
-// `claude auth status` emits JSON and costs no inference. The probe explicitly
-// unsets CLAUDE_CODE_OAUTH_TOKEN so it measures the FILE — with the env var
-// visible, claude would report on the token instead and the answer would be
-// meaningless for this decision.
-func SpriteClaudeAuthOK(client *sprite.Client, spriteName string) (bool, string) {
+	// The probe must run AFTER any install, and with the env token stripped so
+	// it reports on the FILE — see SpriteClaudeAuthOK.
 	script := `
+mkdir -p ~/.claude
+chmod 700 ~/.claude
+` + install + `
 CLAUDE=$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")
-[ -x "$CLAUDE" ] || exit 127
+[ -x "$CLAUDE" ] || exit 0
 env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$CLAUDE" auth status 2>/dev/null
 `
 	out, err := client.Exec(sprite.ExecOptions{
@@ -339,8 +357,13 @@ env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$CL
 	if err != nil {
 		return false, ""
 	}
-	// `claude auth status` prints a JSON object; anything before it (shell
-	// noise, MOTD) is skipped by seeking to the first brace.
+	loggedIn, method := parseAuthStatus(out)
+	return loggedIn && method == claudeAiAuthMethod, method
+}
+
+// parseAuthStatus pulls loggedIn/authMethod out of `claude auth status` output,
+// skipping any shell noise or MOTD before the JSON object.
+func parseAuthStatus(out []byte) (bool, string) {
 	i := bytes.IndexByte(out, '{')
 	if i < 0 {
 		return false, ""
@@ -362,53 +385,6 @@ env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$CL
 // authMethod="oauth_token"), which is why the method must be checked and not
 // just the loggedIn flag.
 const claudeAiAuthMethod = "claude.ai"
-
-// SpriteClaudeFullyAuthed reports whether the sprite's credentials FILE gives a
-// working full-scope claude.ai login — the condition under which it's safe, and
-// necessary, to withhold CLAUDE_CODE_OAUTH_TOKEN. Returns the observed method
-// for use in diagnostics.
-func SpriteClaudeFullyAuthed(client *sprite.Client, spriteName string) (bool, string) {
-	loggedIn, method := SpriteClaudeAuthOK(client, spriteName)
-	return loggedIn && method == claudeAiAuthMethod, method
-}
-
-// PushClaudeCredentialsIfNewer pushes the local credentials only when the sprite
-// has none or the local copy is strictly fresher (later expiresAt). This avoids
-// clobbering a credential the sprite's own Claude already refreshed with a
-// staler copy from this machine — the overwrite is a key driver of repeated
-// /login prompts, because OAuth refresh tokens rotate and a stale copy loses the
-// race. Returns whether a push happened.
-func PushClaudeCredentialsIfNewer(client *sprite.Client, spriteName string, creds []byte) (bool, error) {
-	localExp := claudeCredsExpiry(creds)
-	spriteExp := spriteClaudeCredsExpiry(client, spriteName)
-	// Push if the sprite has no usable credential, or ours is newer. When we
-	// can't read a local expiry (localExp == 0) but the sprite already has one,
-	// don't clobber it.
-	if spriteExp != 0 && localExp <= spriteExp {
-		return false, nil
-	}
-	return true, PushClaudeCredentials(client, spriteName, creds)
-}
-
-func PushClaudeCredentials(client *sprite.Client, spriteName string, creds []byte) error {
-	if len(creds) == 0 {
-		return fmt.Errorf("empty credentials blob")
-	}
-	// Base64 in standard encoding has no shell-special characters, so
-	// it's safe to interpolate into a sh -c command without quoting.
-	encoded := base64.StdEncoding.EncodeToString(creds)
-	script := fmt.Sprintf(`
-mkdir -p ~/.claude
-chmod 700 ~/.claude
-printf '%%s' '%s' | base64 -d > ~/.claude/.credentials.json
-chmod 600 ~/.claude/.credentials.json
-`, encoded)
-	_, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", script},
-	})
-	return err
-}
 
 // LocalGhToken returns the user's active gh OAuth token from their local
 // gh installation, or the empty string if gh is not installed or not
@@ -449,49 +425,39 @@ func SetupGhAuth(client *sprite.Client, spriteName string) error {
 		return nil
 	}
 
-	// Clean up any prior GH_TOKEN exports from rc files left by older sp
-	// versions. We no longer write tokens to disk — they're injected via
-	// sprite exec -env + tmux setenv -g on every connect, so they only
-	// exist in running processes and vanish when the sprite cold-stops.
-	// This avoids leaving a valid GitHub token in plaintext on a dormant
-	// sprite's filesystem.
-	cleanScript := `
+	// One call does all three pieces of gh setup. They used to be three
+	// separate execs (rc cleanup, config.yml upload, chmod), and since a call
+	// spends nearly all its time dialing the sprite rather than running the
+	// command, three calls cost three dials for work that fits in one.
+	//
+	// The rc cleanup removes GH_TOKEN exports left by older sp versions: tokens
+	// are now injected via sprite exec -env + tmux setenv -g on every connect,
+	// so they only exist in running processes and vanish when the sprite
+	// cold-stops, rather than sitting in plaintext on a dormant filesystem.
+	script := `
 for RC in .bashrc .zshrc .profile; do
     sed -i '/# sp-gh-auth-begin/,/# sp-gh-auth-end/d' ~/$RC 2>/dev/null || true
 done
+chmod 700 ~/.config/gh 2>/dev/null || true
+chmod 600 ~/.config/gh/config.yml 2>/dev/null || true
 `
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", cleanScript},
-	}); err != nil {
-		// Non-fatal: cleanup of old state shouldn't block connect.
-		_ = err
+
+	// Push config.yml (preferences) if it exists. Non-critical — gh works fine
+	// without it, just uses defaults.
+	files := map[string]string{}
+	if home, err := os.UserHomeDir(); err == nil {
+		configPath := filepath.Join(home, ".config", "gh", "config.yml")
+		if _, err := os.Stat(configPath); err == nil {
+			files[configPath] = "/home/sprite/.config/gh/config.yml"
+		}
 	}
 
-	// Push config.yml (preferences) if it exists. Non-critical — gh
-	// works fine without it, just uses defaults.
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil // gracefully skip the file push, token export already succeeded
-	}
-	configPath := filepath.Join(home, ".config", "gh", "config.yml")
-	if _, err := os.Stat(configPath); err != nil {
-		return nil
-	}
-	// Non-fatal, as the doc comment above promises: this file is pure
-	// preferences (editor, aliases) and gh works fine without it. Returning
-	// the error used to abort the whole auth chain this runs in — taking the
-	// open wrapper and the repo clone down with it — because an upload of a
-	// ~1KB config file hit the sprite API's timeout.
-	if err := UploadFiles(client, spriteName, map[string]string{configPath: "/home/sprite/.config/gh/config.yml"}); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: gh config.yml not pushed (gh still works, minus your preferences): %v\n", err)
-		return nil
-	}
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", "chmod 700 ~/.config/gh 2>/dev/null; chmod 600 ~/.config/gh/config.yml 2>/dev/null || true"},
-	}); err != nil {
-		_ = err // cosmetic perms only
+	// Non-fatal, as the doc comment above promises: config.yml is pure
+	// preferences (editor, aliases). Returning the error used to abort the
+	// whole auth chain this runs in — taking the open wrapper and the repo
+	// clone down with it — because an upload of a ~1KB file hit a timeout.
+	if err := UploadFilesRunning(client, spriteName, files, script); err != nil {
+		fmt.Fprintf(os.Stderr, "\nWarning: gh config not fully applied (gh still works, minus your preferences): %v\n", err)
 	}
 	return nil
 }
@@ -516,35 +482,46 @@ done
 // All chowns are idempotent and best-effort: failures (no sudo, dir
 // doesn't exist) are silently swallowed.
 func FixSpriteHomePermissions(client *sprite.Client, spriteName string) error {
-	// Only fix the top-level directories, NOT recursive. The -R flag on
-	// chown was causing indefinite hangs when ~/.claude contained broken
-	// inodes, FUSE mounts, or deep plugin trees. Files inside these dirs
-	// are already sprite-owned because PushClaudeConfig uses tar extract
-	// and PushClaudeCredentials uses base64 shell redirect — both run as
-	// the sprite user. The only ownership issue is the dirs themselves
-	// (created by sprite-exec file uploads as ubuntu).
-	script := `
+	_, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", HomePermissionsScript},
+	})
+	return err
+}
+
+// HomePermissionsScript is the body of FixSpriteHomePermissions, exported so
+// the readiness probe can use it as its probe command instead of a bare `echo`.
+//
+// Merging the two saves a whole sprite CLI call, which matters far more than it
+// looks: measured against a degraded API, a call spends ALL of its time
+// establishing the connection (135s observed) and ~0.02s running the command.
+// Connect cost is therefore driven by the number of calls, not by the work in
+// them — so any two calls that can share a dial should.
+//
+// Every line ends in `|| true`, so the script's exit status reflects "the
+// sprite answered", exactly what the probe needs to test. Only top-level
+// directories are fixed, NOT recursive: the -R flag caused indefinite hangs
+// when ~/.claude contained broken inodes, FUSE mounts, or deep plugin trees.
+// Files inside are already sprite-owned because PushClaudeConfig uses tar
+// extract and PushClaudeCredentials uses a base64 shell redirect — both run as
+// the sprite user. The only ownership issue is the dirs themselves (created by
+// sprite-exec file uploads as ubuntu).
+const HomePermissionsScript = `
 sudo -n chown sprite:sprite /home/sprite 2>/dev/null || true
 sudo -n chmod 755 /home/sprite 2>/dev/null || true
 sudo -n chown sprite:sprite /home/sprite/.claude 2>/dev/null || true
 sudo -n chown sprite:sprite /home/sprite/.ssh 2>/dev/null || true
 `
-	_, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", script},
-	})
-	return err
-}
 
 // SetupSpriteAuth provisions SSH keys, claude.json onboarding bypass, and
 // shell config on a sprite in as few exec calls as possible to minimize
 // websocket overhead.
 //
-// Phase 1: upload SSH keys (needs -file flag, so one exec per file).
-// Phase 2: one mega-script exec that writes all rc files, claude.json, and
-//
-//	SSH config in a single shell invocation. This is the key
-//	optimization: prior versions did 8+ separate execs at ~5-10s each.
+// Everything happens in ONE exec: the SSH keys, the rc-file auth blocks,
+// claude.json, and the SSH config. Prior versions did 8+ separate execs at
+// ~5-10s each; the keys were later folded in too, once a call was measured to
+// spend nearly all its time dialing the sprite (135s observed) and ~0.02s
+// running the command. Call count, not command complexity, is the cost.
 //
 // CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT written into rc files —
 // it's injected per-connect via sprite exec -env + tmux setenv -g so the
@@ -560,7 +537,7 @@ func SetupSpriteAuth(client *sprite.Client, spriteName string) error {
 	sshKeyPath := filepath.Join(home, ".ssh", "id_ed25519")
 	sshPubPath := sshKeyPath + ".pub"
 
-	// --- Phase 1: install SSH keys ---
+	// --- SSH key material, written into the single script below ---
 	// Read the key bytes locally and write them onto the sprite via a
 	// base64 shell redirect rather than `sprite exec --file`. The --file
 	// upload path creates files (and any auto-created parent dirs) owned by
@@ -580,17 +557,6 @@ func SetupSpriteAuth(client *sprite.Client, spriteName string) error {
 			"printf '%%s' '%s' | base64 -d > ~/.ssh/id_ed25519.pub\nchmod 644 ~/.ssh/id_ed25519.pub",
 			base64.StdEncoding.EncodeToString(data)))
 	}
-	if len(keyParts) > 0 {
-		script := "set -e\nmkdir -p ~/.ssh && chmod 700 ~/.ssh\n" + strings.Join(keyParts, "\n") + "\n"
-		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite:  spriteName,
-			Command: []string{"sh", "-c", script},
-		}); err != nil {
-			return fmt.Errorf("uploading SSH keys: %w", err)
-		}
-	}
-
-	// --- Phase 2: one mega-script for all shell writes ---
 	// Build the auth block. CLAUDE_CODE_OAUTH_TOKEN is NOT written here —
 	// see the function-level comment. The block carries only non-secret
 	// shell hygiene (unsets of competing auth env vars + the bypass alias).
@@ -610,6 +576,8 @@ alias claude='command claude --dangerously-skip-permissions'
 	// 8 × 5-10s = 40-80s.
 	megaScript := fmt.Sprintf(`
 set -e
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+%s
 # --- Auth block for .bashrc, .zshrc, .profile ---
 for RC in .bashrc .zshrc .profile; do
     touch ~/$RC
@@ -636,7 +604,7 @@ Host github.com
 # sp-managed-github-end
 SSHEOF
 chmod 600 ~/.ssh/config
-`, authBlock, claudeConfig)
+`, strings.Join(keyParts, "\n"), authBlock, claudeConfig)
 
 	if _, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,

@@ -140,10 +140,24 @@ func (c *Client) Destroy(name string) error {
 // For interactive (TTY) sessions, use ExecInteractive instead.
 func (c *Client) Exec(opts ExecOptions) ([]byte, error) {
 	args := c.BuildExecArgs(opts)
+	// --debug is a global flag, so it precedes the subcommand. It writes to the
+	// named file and leaves stdout clean (verified), so CombinedOutput is
+	// unaffected. The log is analyzed only if this call turns out slow.
+	debugFlag, finishDebug := withDebugLog()
+	if debugFlag != "" {
+		args = append([]string{debugFlag}, args...)
+	}
 	cmd := exec.Command("sprite", args...)
 	start := time.Now()
+	detail := describeExec(opts)
+	id := beginCall(detail, start)
 	out, err := cmd.CombinedOutput()
-	record("exec", describeExec(opts), start, err)
+	endCall(id)
+	dur := time.Since(start)
+	if gap := finishDebug(dur); gap != "" {
+		detail += " [" + gap + "]"
+	}
+	record("exec", detail, start, err)
 	if err != nil {
 		return out, fmt.Errorf("exec on sprite %q: %w\n%s", opts.Sprite, err, string(out))
 	}

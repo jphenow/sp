@@ -90,6 +90,20 @@ type Group struct {
 	mu       sync.Mutex
 	tasks    []*Task
 	rendered int // line count of the previous frame, for in-place redraw
+	footer   func() []string
+}
+
+// SetFooter installs a callback rendered as extra dim lines below the task
+// list on every frame. Used to show which sprite calls are currently in flight
+// — without it a stalled task is just a spinner, with no way to tell whether
+// it's stuck on a dial, on which command, or for how long.
+//
+// The callback runs on the render goroutine at every frame, so it must be
+// cheap and must not block.
+func (g *Group) SetFooter(fn func() []string) {
+	g.mu.Lock()
+	g.footer = fn
+	g.mu.Unlock()
 }
 
 // New constructs a Group rendering to stderr. If verbose is true OR
@@ -329,8 +343,24 @@ func (g *Group) render() {
 		sb.WriteByte('\n')
 	}
 
+	lines := len(g.tasks)
+	if g.footer != nil {
+		for _, l := range g.footer() {
+			sb.WriteString("\033[K")
+			sb.WriteString(dimStyle.Render("  " + l))
+			sb.WriteByte('\n')
+			lines++
+		}
+	}
+	// Clear any lines the previous frame drew that this one doesn't, so a
+	// shrinking footer doesn't leave stale text behind.
+	for i := lines; i < g.rendered; i++ {
+		sb.WriteString("\033[K\n")
+		lines++
+	}
+
 	g.out.Write([]byte(sb.String()))
-	g.rendered = len(g.tasks)
+	g.rendered = lines
 }
 
 // summarizeErr trims long multi-line errors to a single line for the

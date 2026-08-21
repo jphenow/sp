@@ -162,3 +162,63 @@ func describeExec(opts ExecOptions) string {
 	}
 	return line
 }
+
+// InFlight is a sprite CLI call that started and hasn't returned.
+type InFlight struct {
+	Detail string
+	Since  time.Time
+}
+
+var (
+	inFlightMu   sync.Mutex
+	inFlightNext int
+	inFlightCall = map[int]InFlight{}
+)
+
+// beginCall registers an in-flight call and returns its id.
+func beginCall(detail string, start time.Time) int {
+	inFlightMu.Lock()
+	defer inFlightMu.Unlock()
+	inFlightNext++
+	inFlightCall[inFlightNext] = InFlight{Detail: detail, Since: start}
+	return inFlightNext
+}
+
+// endCall deregisters an in-flight call.
+func endCall(id int) {
+	inFlightMu.Lock()
+	delete(inFlightCall, id)
+	inFlightMu.Unlock()
+}
+
+// InFlightCalls returns the currently-running sprite CLI calls, longest-running
+// first.
+//
+// This exists so a stalled connect can say WHICH call is stuck. A sprite call
+// spends nearly all of its time dialing the sprite before the command runs, so
+// a task that looks frozen is almost always sitting in one identifiable dial —
+// and without this the user just watches a spinner for three minutes.
+func InFlightCalls() []InFlight {
+	inFlightMu.Lock()
+	defer inFlightMu.Unlock()
+	calls := make([]InFlight, 0, len(inFlightCall))
+	for _, c := range inFlightCall {
+		calls = append(calls, c)
+	}
+	sort.Slice(calls, func(i, j int) bool { return calls[i].Since.Before(calls[j].Since) })
+	return calls
+}
+
+// InFlightSummary renders in-flight calls as display lines, showing only those
+// running longer than minAge so routine fast calls don't cause flicker.
+func InFlightSummary(minAge time.Duration) []string {
+	var lines []string
+	for _, c := range InFlightCalls() {
+		age := time.Since(c.Since)
+		if age < minAge {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("in flight %s  %s", age.Round(time.Second), c.Detail))
+	}
+	return lines
+}

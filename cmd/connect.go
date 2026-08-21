@@ -174,6 +174,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	// slow wake from a slow chown. RunSequential keeps the ordering and gives
 	// each step its own timed line.
 	prologue := progress.New(verbose)
+	prologue.SetFooter(inFlightFooter)
 	if !exists {
 		prologue.Add("Creating sprite", func() error {
 			if err := client.Create(resolved.SpriteName); err != nil {
@@ -182,12 +183,12 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			return nil
 		})
 	}
+	// The readiness probe doubles as the home-permissions fix: both are one
+	// trivial command, and a call's cost is almost entirely the dial, so
+	// merging them saves a full round trip on every connect.
 	var readyTask *progress.Task
 	readyTask = prologue.Add("Waiting for sprite", func() error {
 		return waitForSpriteReady(client, resolved.SpriteName, readyTask)
-	})
-	prologue.Add("Fixing home permissions", func() error {
-		return setup.FixSpriteHomePermissions(client, resolved.SpriteName)
 	})
 	if err := prologue.RunSequential(); err != nil {
 		return err
@@ -228,6 +229,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	//   5. New-sprite-only setup.conf + initial file upload, OR for existing
 	//      sprites the lighter "[always] files" copy. Independent.
 	parallel := progress.New(verbose)
+	parallel.SetFooter(inFlightFooter)
 
 	parallel.Add("Setting up auth + gh + clone", func() error {
 		// Auth must complete before clone because the clone needs the SSH
@@ -237,22 +239,15 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		if err := setup.SetupSpriteAuth(client, resolved.SpriteName); err != nil {
 			return fmt.Errorf("sprite auth: %w", err)
 		}
-		if creds != nil {
-			// Only push if the sprite has no credential or ours is fresher —
-			// overwriting a sprite-refreshed credential with a staler copy is a
-			// key cause of repeated /login prompts (rotating refresh tokens).
-			if _, err := setup.PushClaudeCredentialsIfNewer(client, resolved.SpriteName, creds); err != nil {
-				return fmt.Errorf("claude credentials: %w", err)
-			}
-		}
-
-		// Decide the env-token question with evidence rather than inference:
-		// ask claude on the sprite whether the credential file authenticates.
-		// A credentials.json that exists but doesn't work (refresh token
-		// rotated out from under it) must NOT suppress the setup-token
-		// fallback, or the sprite lands on "Not logged in" with nothing to
-		// fall back to. Written here and read after parallel.Run() joins.
-		fullyAuthed, authMethod := setup.SpriteClaudeFullyAuthed(client, resolved.SpriteName)
+		// Install the credential (only if fresher than the sprite's) and find
+		// out whether the sprite ends up authenticated — one call, not three.
+		//
+		// Decide the env-token question with evidence rather than inference: a
+		// credentials.json that exists but doesn't work (refresh token rotated
+		// out from under it) must NOT suppress the setup-token fallback, or the
+		// sprite lands on "Not logged in" with nothing to fall back to. Written
+		// here and read after parallel.Run() joins.
+		fullyAuthed, authMethod := setup.SyncClaudeCredentials(client, resolved.SpriteName, creds)
 		switch {
 		case fullyAuthed:
 			authTokenForEnv = "" // full-scope creds work; don't mask them
@@ -598,6 +593,17 @@ func startKeepWarmSentinel(spriteName, org string, dur time.Duration) error {
 }
 
 // waitForSpriteReady polls until the sprite responds to commands.
+// inFlightMinAge is how long a sprite call must be running before it shows up
+// in the progress footer. Short enough to catch a stall early, long enough that
+// the healthy case (calls returning in ~0.2s) never flickers.
+const inFlightMinAge = 3 * time.Second
+
+// inFlightFooter reports the sprite CLI calls currently in flight, so a task
+// that appears frozen names the call it's waiting on.
+func inFlightFooter() []string {
+	return sprite.InFlightSummary(inFlightMinAge)
+}
+
 // slowConnectThreshold is the setup duration above which the latency profile
 // prints unasked. Below it the numbers are noise; above it they're the first
 // thing you want, and a slow connect is exactly the run you can't reproduce on
@@ -656,7 +662,7 @@ func waitForSpriteReady(client *sprite.Client, name string, task *progress.Task)
 		started := time.Now()
 		_, err := client.Exec(sprite.ExecOptions{
 			Sprite:  name,
-			Command: []string{"echo", "ready"},
+			Command: []string{"sh", "-c", setup.HomePermissionsScript},
 		})
 		if err == nil {
 			if task != nil && attempt > 1 {
@@ -1096,14 +1102,8 @@ func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID str
 	// credential on every single reconnect, which is why a /login performed
 	// on the sprite never survived to the next session.
 	var unset []string
-	creds := setup.LocalClaudeCredentials()
-	if creds != nil {
-		if _, err := setup.PushClaudeCredentialsIfNewer(client, spriteName, creds); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: refreshing Claude credentials: %v\n", err)
-		}
-	}
 	claudeToken, _ := setup.NewTokenProvider().LocalToken()
-	if fullyAuthed, _ := setup.SpriteClaudeFullyAuthed(client, spriteName); fullyAuthed {
+	if fullyAuthed, _ := setup.SyncClaudeCredentials(client, spriteName, setup.LocalClaudeCredentials()); fullyAuthed {
 		unset = append(unset, "CLAUDE_CODE_OAUTH_TOKEN")
 	} else if claudeToken != "" {
 		vars["CLAUDE_CODE_OAUTH_TOKEN"] = claudeToken
