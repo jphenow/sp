@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/jphenow/sp/internal/sprite"
 )
@@ -52,14 +54,28 @@ func UploadFilesRunning(client *sprite.Client, spriteName string, files map[stri
 	// bad destination takes the rest of the set with it. Fall back to one
 	// upload per file to get partial success and to name the file that's
 	// actually broken instead of blaming the whole batch.
+	//
+	// CONCURRENTLY. Each upload is its own call and a call is almost entirely
+	// dial time, so running them in sequence multiplies the stall by the file
+	// count — measured: three files fell back serially and took 3m36s. They're
+	// independent writes to distinct paths, so there's nothing to serialize.
+	var mu sync.Mutex
 	var failed []string
 	var last error
+	var wg sync.WaitGroup
 	for local, remote := range files {
-		if err := uploadBatch(client, spriteName, map[string]string{local: remote}, ""); err != nil {
-			failed = append(failed, local)
-			last = err
-		}
+		wg.Add(1)
+		go func(local, remote string) {
+			defer wg.Done()
+			if err := uploadBatch(client, spriteName, map[string]string{local: remote}, ""); err != nil {
+				mu.Lock()
+				failed = append(failed, local)
+				last = err
+				mu.Unlock()
+			}
+		}(local, remote)
 	}
+	wg.Wait()
 	if len(failed) == 0 {
 		// Every file landed individually; the command never ran, so run it now.
 		if command != "" {
@@ -79,6 +95,7 @@ func uploadBatch(client *sprite.Client, spriteName string, files map[string]stri
 	}
 	var err error
 	for attempt := 0; attempt < uploadAttempts; attempt++ {
+		start := time.Now()
 		_, err = client.Exec(sprite.ExecOptions{
 			Sprite:  spriteName,
 			Command: []string{"sh", "-c", command},
@@ -87,6 +104,19 @@ func uploadBatch(client *sprite.Client, spriteName string, files map[string]stri
 		if err == nil {
 			return nil
 		}
+		// Don't retry a call that died on the dial timeout. Measured stalls
+		// come in exact multiples of ~31.4s — a fixed timeout in connection
+		// establishment — so a retry after one doesn't find a healthier path,
+		// it just burns another 31s. Retrying is only worth it when the
+		// failure was fast, which means something other than the dial.
+		if time.Since(start) >= dialTimeoutFloor {
+			return err
+		}
 	}
 	return err
 }
+
+// dialTimeoutFloor is the point past which a failure is assumed to be the
+// sprite dial timing out rather than a transient error worth retrying. Set
+// below the observed ~31.4s stall with room to spare.
+const dialTimeoutFloor = 20 * time.Second
