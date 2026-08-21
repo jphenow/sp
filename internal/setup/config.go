@@ -207,22 +207,11 @@ func copySetupFile(client *sprite.Client, spriteName string, entry FileEntry) er
 		// If remote stat fails, file doesn't exist remotely - proceed with copy
 	}
 
-	// Ensure remote directory exists
-	remoteDir := filepath.Dir(entry.Dest)
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"mkdir", "-p", remoteDir},
-	}); err != nil {
-		return fmt.Errorf("creating remote directory %q: %w", remoteDir, err)
-	}
-
-	// Upload the file
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"true"},
-		Files:   map[string]string{entry.Source: entry.Dest},
-	}); err != nil {
-		return fmt.Errorf("uploading %q to %q: %w", entry.Source, entry.Dest, err)
+	// Upload the file. No separate mkdir -p: the fs/write API already takes
+	// mkdirParents, so the extra exec was a wasted round trip against an API
+	// slow enough that round trips are what make these uploads time out.
+	if err := UploadFiles(client, spriteName, map[string]string{entry.Source: entry.Dest}); err != nil {
+		return err
 	}
 
 	// Preserve executable bit
