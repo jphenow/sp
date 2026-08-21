@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jphenow/sp/internal/progress"
 	"github.com/jphenow/sp/internal/sprite"
 )
 
@@ -155,7 +156,7 @@ func PushClaudeConfig(client *sprite.Client, spriteName string) error {
 			// Non-fatal: warn and skip. We want PushClaudeConfig to be
 			// best-effort so a single broken entry (unreadable file,
 			// stale symlink) doesn't block the whole connect flow.
-			fmt.Fprintf(os.Stderr, "Warning: packing %s: %v\n", name, err)
+			progress.Warnf("Warning: packing %s: %v", name, err)
 		}
 	}
 

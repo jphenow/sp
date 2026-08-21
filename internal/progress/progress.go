@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/sys/unix"
 )
 
 // TaskStatus is the lifecycle state of a single task within a Group.
@@ -136,6 +137,9 @@ func (g *Group) Run() error {
 		return nil
 	}
 
+	beginWarnCapture()
+	defer flushWarnings()
+
 	g.render() // initial draw of pending state
 
 	var rendererStop chan struct{}
@@ -181,6 +185,9 @@ func (g *Group) RunSequential() error {
 	if len(g.tasks) == 0 {
 		return nil
 	}
+
+	beginWarnCapture()
+	defer flushWarnings()
 
 	g.render()
 
@@ -303,6 +310,8 @@ func (g *Group) render() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	width := terminalWidth()
+
 	var sb strings.Builder
 	if g.rendered > 0 {
 		// Move cursor up to the start of the previous frame.
@@ -313,42 +322,47 @@ func (g *Group) render() {
 	// visually in sync rather than each having its own phase.
 	frame := int(time.Now().UnixMilli()/int64(renderInterval/time.Millisecond)) % len(spinnerFrames)
 
-	for _, t := range g.tasks {
+	// emit writes one line, clipped to the terminal width. Clipping is not
+	// cosmetic: this renderer repositions the cursor by counting the lines it
+	// wrote, and a line longer than the terminal soft-wraps into TWO physical
+	// lines while still counting as one. The cursor math then drifts by a line
+	// per frame and the display scrolls away instead of updating in place.
+	emit := func(line string) {
 		sb.WriteString("\033[K") // clear to end of line
+		sb.WriteString(clip(line, width))
+		sb.WriteByte('\n')
+	}
+
+	for _, t := range g.tasks {
+		var line string
 		switch t.Status {
 		case StatusPending:
-			sb.WriteString(dimStyle.Render("⏳ "))
-			sb.WriteString(t.Name)
+			line = dimStyle.Render("⏳ ") + t.Name
 		case StatusRunning:
-			sb.WriteString(runStyle.Render(spinnerFrames[frame] + " "))
-			sb.WriteString(t.Name)
-			sb.WriteString(dimStyle.Render(" " + t.Duration().Round(100*time.Millisecond).String()))
+			line = runStyle.Render(spinnerFrames[frame]+" ") + t.Name +
+				dimStyle.Render(" "+t.Duration().Round(100*time.Millisecond).String())
 			if d := t.Detail(); d != "" {
-				sb.WriteString(dimStyle.Render(" — " + d))
+				line += dimStyle.Render(" — " + d)
 			}
 		case StatusOK:
-			sb.WriteString(okStyle.Render("✓ "))
-			sb.WriteString(t.Name)
-			sb.WriteString(dimStyle.Render(" " + t.Duration().Round(time.Millisecond).String()))
+			line = okStyle.Render("✓ ") + t.Name +
+				dimStyle.Render(" "+t.Duration().Round(time.Millisecond).String())
 			if d := t.Detail(); d != "" {
-				sb.WriteString(dimStyle.Render(" — " + d))
+				line += dimStyle.Render(" — " + d)
 			}
 		case StatusFail:
-			sb.WriteString(failStyle.Render("✗ "))
-			sb.WriteString(t.Name)
+			line = failStyle.Render("✗ ") + t.Name
 			if t.Err != nil {
-				sb.WriteString(failStyle.Render(": " + summarizeErr(t.Err)))
+				line += failStyle.Render(": " + summarizeErr(t.Err))
 			}
 		}
-		sb.WriteByte('\n')
+		emit(line)
 	}
 
 	lines := len(g.tasks)
 	if g.footer != nil {
 		for _, l := range g.footer() {
-			sb.WriteString("\033[K")
-			sb.WriteString(dimStyle.Render("  " + l))
-			sb.WriteByte('\n')
+			emit(dimStyle.Render("  " + l))
 			lines++
 		}
 	}
@@ -377,6 +391,29 @@ func summarizeErr(err error) string {
 	return s
 }
 
+// clip truncates a possibly-ANSI-styled line to n display columns.
+// lipgloss.MaxWidth counts display width, so escape sequences aren't charged
+// against the budget and aren't cut mid-sequence.
+func clip(line string, n int) string {
+	if n <= 0 {
+		return line
+	}
+	return lipgloss.NewStyle().MaxWidth(n).Render(line)
+}
+
+// defaultWidth is used when the terminal size can't be determined.
+const defaultWidth = 100
+
+// terminalWidth returns the current width of stderr in columns. Read every
+// frame rather than cached, so resizing mid-run doesn't corrupt the display.
+func terminalWidth() int {
+	ws, err := unix.IoctlGetWinsize(int(os.Stderr.Fd()), unix.TIOCGWINSZ)
+	if err != nil || ws.Col == 0 {
+		return defaultWidth
+	}
+	return int(ws.Col)
+}
+
 var (
 	okStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green
 	failStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red
@@ -396,4 +433,52 @@ func isTerminalWriter(w io.Writer) bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// Buffered warnings.
+//
+// A progress Group owns the cursor on stderr while it renders: it repositions
+// by counting the lines it wrote. Anything else writing to stderr mid-run
+// shifts the display out from under that arithmetic, and the frame ends up
+// scrolling instead of updating in place. Setup code legitimately needs to warn
+// ("gh config not pushed", "packing skills failed"), so those warnings are
+// buffered here and flushed once the renderer has drawn its final frame.
+var (
+	warnMu     sync.Mutex
+	warnActive bool
+	warnBuf    []string
+)
+
+// Warnf reports a non-fatal problem. Safe to call from inside a task: while a
+// Group is rendering the message is held and printed after the final frame,
+// and outside a run it goes straight to stderr.
+func Warnf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	warnMu.Lock()
+	if warnActive {
+		warnBuf = append(warnBuf, msg)
+		warnMu.Unlock()
+		return
+	}
+	warnMu.Unlock()
+	fmt.Fprintln(os.Stderr, msg)
+}
+
+// beginWarnCapture starts buffering warnings for the duration of a run.
+func beginWarnCapture() {
+	warnMu.Lock()
+	warnActive = true
+	warnMu.Unlock()
+}
+
+// flushWarnings stops buffering and prints everything collected.
+func flushWarnings() {
+	warnMu.Lock()
+	msgs := warnBuf
+	warnBuf = nil
+	warnActive = false
+	warnMu.Unlock()
+	for _, m := range msgs {
+		fmt.Fprintln(os.Stderr, m)
+	}
 }

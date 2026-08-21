@@ -55,8 +55,11 @@ func TestDescribeExecUsesFirstRealLineAndUploads(t *testing.T) {
 	if strings.Contains(got, "chmod 700") {
 		t.Errorf("expected only the first line, got %q", got)
 	}
-	if !strings.Contains(got, "/home/sprite/.tmux.conf") {
+	if !strings.Contains(got, ".tmux.conf") {
 		t.Errorf("expected upload destination, got %q", got)
+	}
+	if strings.Contains(got, "/home/sprite/") {
+		t.Errorf("upload label should use basenames, not full paths: %q", got)
 	}
 }
 
@@ -93,5 +96,19 @@ func TestTraceSummaryEmpty(t *testing.T) {
 	t.Cleanup(ResetTrace)
 	if got := TraceSummary(); got != "" {
 		t.Errorf("want empty summary with no spans, got %q", got)
+	}
+}
+
+func TestDescribeExecCapsUploadList(t *testing.T) {
+	files := map[string]string{}
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		files["/local/"+n] = "/home/sprite/" + n
+	}
+	got := describeExec(ExecOptions{Sprite: "s", Command: []string{"true"}, Files: files})
+	if !strings.Contains(got, "+3 more") {
+		t.Errorf("expected the destination list to be capped, got %q", got)
+	}
+	if len(got) > 120 {
+		t.Errorf("label should stay short for the in-flight footer, got %d chars: %q", len(got), got)
 	}
 }

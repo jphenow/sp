@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/jphenow/sp/internal/progress"
 	"github.com/jphenow/sp/internal/sprite"
 )
 
@@ -87,7 +88,7 @@ func (tp *TokenProvider) promptForToken() (string, error) {
 
 	// Save for future use
 	if err := os.WriteFile(tp.tokenPath, []byte(token), 0o600); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not save token: %v\n", err)
+		progress.Warnf("Warning: could not save token: %v", err)
 	}
 
 	return token, nil
@@ -457,7 +458,7 @@ chmod 600 ~/.config/gh/config.yml 2>/dev/null || true
 	// whole auth chain this runs in — taking the open wrapper and the repo
 	// clone down with it — because an upload of a ~1KB file hit a timeout.
 	if err := UploadFilesRunning(client, spriteName, files, script); err != nil {
-		fmt.Fprintf(os.Stderr, "\nWarning: gh config not fully applied (gh still works, minus your preferences): %v\n", err)
+		progress.Warnf("Warning: gh config not fully applied (gh still works, minus your preferences): %v", err)
 	}
 	return nil
 }

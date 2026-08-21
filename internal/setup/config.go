@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jphenow/sp/internal/progress"
 	"github.com/jphenow/sp/internal/sprite"
 )
 
@@ -158,14 +159,14 @@ func RunSetupConf(client *sprite.Client, spriteName string, conf *SetupConf) err
 	// Process files
 	for _, f := range conf.Files {
 		if err := copySetupFile(client, spriteName, f); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to copy %s: %v\n", f.Source, err)
+			progress.Warnf("Warning: failed to copy %s: %v", f.Source, err)
 		}
 	}
 
 	// Process commands
 	for _, c := range conf.Commands {
 		if err := runSetupCommand(client, spriteName, c); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to run command: %v\n", err)
+			progress.Warnf("Warning: failed to run command: %v", err)
 		}
 	}
 

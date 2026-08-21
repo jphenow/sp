@@ -2,6 +2,7 @@ package sprite
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -150,12 +151,20 @@ func describeExec(opts ExecOptions) string {
 		line = line[:maxLen-1] + "…"
 	}
 	if len(opts.Files) > 0 {
+		// Basenames, capped. The full remote paths made this label longer than
+		// a terminal line, which is noise in the trace and actively harmful in
+		// the live in-flight footer.
 		dests := make([]string, 0, len(opts.Files))
 		for _, remote := range opts.Files {
-			dests = append(dests, remote)
+			dests = append(dests, path.Base(remote))
 		}
 		sort.Strings(dests)
-		line = fmt.Sprintf("upload[%s] %s", strings.Join(dests, ","), line)
+		const maxDests = 2
+		label := strings.Join(dests, ",")
+		if len(dests) > maxDests {
+			label = fmt.Sprintf("%s +%d more", strings.Join(dests[:maxDests], ","), len(dests)-maxDests)
+		}
+		line = fmt.Sprintf("upload[%s] %s", label, line)
 	}
 	if opts.Sprite != "" {
 		return opts.Sprite + ": " + line

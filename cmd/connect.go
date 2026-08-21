@@ -253,9 +253,9 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			authTokenForEnv = "" // full-scope creds work; don't mask them
 		case token != "":
 			authTokenForEnv = token
-			fmt.Fprintf(os.Stderr, "\nNote: the sprite has no working claude.ai login (auth method: %q), so falling back to the inference-only setup-token. Inference will work; Remote Control will not until you run /login on the sprite.\n", authMethod)
+			progress.Warnf("Note: the sprite has no working claude.ai login (auth method: %q), so falling back to the inference-only setup-token. Inference will work; Remote Control will not until you run /login on the sprite.", authMethod)
 		default:
-			fmt.Fprintln(os.Stderr, "\nWarning: no working Claude credential on the sprite and no ~/.claude-token to fall back on. Run 'claude' then /login on the sprite.")
+			progress.Warnf("Warning: no working Claude credential on the sprite and no ~/.claude-token to fall back on. Run 'claude' then /login on the sprite.")
 		}
 
 		if err := setup.SetupGhAuth(client, resolved.SpriteName); err != nil {
@@ -285,7 +285,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// the connect — warn and carry on to the settings merge, which is
 		// what actually makes claude usable (bypass-permissions defaults).
 		if err := setup.PushClaudeConfig(client, resolved.SpriteName); err != nil {
-			fmt.Fprintf(os.Stderr, "\nWarning: Claude config not pushed (your skills/commands may be missing on the sprite): %v\n", err)
+			progress.Warnf("Warning: Claude config not pushed (your skills/commands may be missing on the sprite): %v", err)
 		}
 		return setup.EnsureSpriteClaudeSettings(client, resolved.SpriteName)
 	})
