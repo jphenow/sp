@@ -262,43 +262,6 @@ PYEOF
 	return err
 }
 
-// PushClaudeCredentials writes the raw Claude OAuth credentials JSON to
-// ~/.claude/.credentials.json on the sprite with 600 perms. Meant to be
-// called with the output of LocalClaudeCredentials; caller decides
-// whether the bytes are worth pushing.
-//
-// Implementation note: the credentials are base64-encoded into a shell
-// command and decoded on the sprite via `base64 -d`, NOT uploaded via
-// `sprite exec -file`. The reason is that the -file upload path on the
-// sprite runtime creates files (and any auto-created parent directories)
-// owned by `ubuntu:ubuntu`, not the sprite user. With ~/.claude ending
-// up as ubuntu:700, the sprite user can't even traverse it, so claude
-// gets "Permission denied" when trying to read its own credentials and
-// silently falls back to an interactive login. Shell-redirect writes
-// run as the sprite user and produce sprite-owned files, sidestepping
-// the entire ownership tangle.
-//
-// After this runs, the sprite's claude will read credentials from the
-// file (position 6 in the auth precedence hierarchy) and use the
-// embedded refreshToken to auto-refresh the accessToken as needed.
-// CLAUDE_CODE_OAUTH_TOKEN should NOT be set in the same session —
-// it sits at position 5 and would mask the file, preventing refresh
-// when the access token in the env var goes stale.
-// claudeCredsExpiry extracts the claudeAiOauth.expiresAt field (epoch millis)
-// from a credentials.json blob, or 0 if absent/unparseable. Used to decide
-// whether one credential copy is fresher than another.
-func claudeCredsExpiry(creds []byte) int64 {
-	var d struct {
-		ClaudeAiOauth struct {
-			ExpiresAt int64 `json:"expiresAt"`
-		} `json:"claudeAiOauth"`
-	}
-	if err := json.Unmarshal(creds, &d); err != nil {
-		return 0
-	}
-	return d.ClaudeAiOauth.ExpiresAt
-}
-
 // SyncClaudeCredentials installs the local credential if it's fresher than the
 // sprite's and reports whether the sprite ends up with a working full-scope
 // claude.ai login — all in ONE sprite call.
@@ -315,6 +278,22 @@ func claudeCredsExpiry(creds []byte) int64 {
 //
 // creds may be nil, in which case nothing is installed and this is purely the
 // auth probe. Returns (fullyAuthed, observed auth method).
+//
+// Implementation note (from the former PushClaudeCredentials): the credentials
+// are base64-encoded into the shell command and decoded on the sprite via
+// `base64 -d`, NOT uploaded via `sprite exec --file`. The --file upload path on
+// the sprite runtime creates files (and any auto-created parent directories)
+// owned by `ubuntu:ubuntu`, not the sprite user. With ~/.claude ending up as
+// ubuntu:700, the sprite user can't even traverse it, so claude gets
+// "Permission denied" when trying to read its own credentials and silently
+// falls back to an interactive login. Shell-redirect writes run as the sprite
+// user and produce sprite-owned files, sidestepping the entire ownership tangle.
+//
+// Once installed, the sprite's claude reads credentials from the file and uses
+// the embedded refreshToken to auto-refresh the accessToken as needed.
+// CLAUDE_CODE_OAUTH_TOKEN should NOT be set in the same session — it takes
+// precedence and would mask the file, preventing refresh when the access token
+// in the env var goes stale.
 func SyncClaudeCredentials(client *sprite.Client, spriteName string, creds []byte) (bool, string) {
 	install := ""
 	if len(creds) > 0 {
@@ -463,11 +442,11 @@ chmod 600 ~/.config/gh/config.yml 2>/dev/null || true
 	return nil
 }
 
-// FixSpriteHomePermissions papers over a base-image quirk where /home/sprite
+// HomePermissionsScript papers over a base-image quirk where /home/sprite
 // ships as ubuntu:ubuntu 0750, and additionally cleans up any ubuntu-owned
 // state under /home/sprite/.claude that earlier sp versions may have left
 // behind via the sprite-exec -file upload path (which creates files as
-// ubuntu, not sprite — see PushClaudeCredentials for the gory details).
+// ubuntu, not sprite — see SyncClaudeCredentials for the gory details).
 //
 // Normal file ops on /home/sprite work through some runtime override (ACL
 // or similar), but git's stricter path-walk refuses to operate inside a
@@ -482,16 +461,9 @@ chmod 600 ~/.config/gh/config.yml 2>/dev/null || true
 //
 // All chowns are idempotent and best-effort: failures (no sudo, dir
 // doesn't exist) are silently swallowed.
-func FixSpriteHomePermissions(client *sprite.Client, spriteName string) error {
-	_, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", HomePermissionsScript},
-	})
-	return err
-}
-
-// HomePermissionsScript is the body of FixSpriteHomePermissions, exported so
-// the readiness probe can use it as its probe command instead of a bare `echo`.
+//
+// It runs as the readiness probe's command (see waitForSpriteReady) instead of
+// a bare `echo`; it was previously a separate FixSpriteHomePermissions call.
 //
 // Merging the two saves a whole sprite CLI call, which matters far more than it
 // looks: measured against a degraded API, a call spends ALL of its time
@@ -504,7 +476,7 @@ func FixSpriteHomePermissions(client *sprite.Client, spriteName string) error {
 // directories are fixed, NOT recursive: the -R flag caused indefinite hangs
 // when ~/.claude contained broken inodes, FUSE mounts, or deep plugin trees.
 // Files inside are already sprite-owned because PushClaudeConfig uses tar
-// extract and PushClaudeCredentials uses a base64 shell redirect — both run as
+// extract and SyncClaudeCredentials uses a base64 shell redirect — both run as
 // the sprite user. The only ownership issue is the dirs themselves (created by
 // sprite-exec file uploads as ubuntu).
 const HomePermissionsScript = `
@@ -546,7 +518,7 @@ func SetupSpriteAuth(client *sprite.Client, spriteName string) error {
 	// outright with "input/output error" when opening the destination. A
 	// shell redirect runs as the sprite user, produces sprite-owned files
 	// with correct perms, and sidesteps the CLI upload path entirely — the
-	// same reasoning (and the same base64 -d trick) as PushClaudeCredentials.
+	// same reasoning (and the same base64 -d trick) as SyncClaudeCredentials.
 	var keyParts []string
 	if data, err := os.ReadFile(sshKeyPath); err == nil {
 		keyParts = append(keyParts, fmt.Sprintf(

@@ -213,7 +213,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	// Parallel setup. Five concurrent task chains:
 	//
-	//   1. Auth chain (SetupSpriteAuth → PushClaudeCredentials if creds →
+	//   1. Auth chain (SetupSpriteAuth → SyncClaudeCredentials →
 	//      SetupGhAuth → InstallOpenWrapper). All four touch shell rc files,
 	//      so they must serialize within this chain. Internal sed -i edits
 	//      against .bashrc would race if these ran in parallel.
@@ -995,7 +995,7 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 // ID of the first active tmux session, or "" if none. Only matches
 // sessions whose Command column contains "tmux" to avoid accidentally
 // reattaching to stale non-interactive exec sessions (e.g. leftover
-// setup commands like FixSpriteHomePermissions that sprite-env keeps
+// setup commands like the home-permissions probe that sprite-env keeps
 // around as "Active" sessions).
 func findExistingSpriteSession(spriteName, org string) string {
 	args := []string{"sessions", "list"}

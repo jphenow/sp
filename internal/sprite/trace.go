@@ -120,7 +120,7 @@ func ResetTrace() {
 }
 
 // secretish matches long unbroken base64/token-shaped runs. Several exec
-// scripts embed credentials directly (PushClaudeCredentials base64s the OAuth
+// scripts embed credentials directly (SyncClaudeCredentials base64s the OAuth
 // blob into its shell command), so nothing derived from a command string may
 // be printed without stripping these first.
 var secretish = regexp.MustCompile(`[A-Za-z0-9+/_-]{40,}={0,2}`)
