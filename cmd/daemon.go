@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -40,8 +41,8 @@ var daemonStartCmd = &cobra.Command{
 		}
 
 		// Set up file-only logging. When backgrounded by EnsureRunning,
-		// stderr is already redirected to the log file, so SetupMulti would
-		// double every line. Use file-only logging unconditionally.
+		// stderr is already redirected to the log file, so also logging to
+		// stderr would double every line. Use file-only logging unconditionally.
 		if err := logging.Setup(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: log setup failed: %v\n", err)
 		}
@@ -66,24 +67,33 @@ var daemonStopCmd = &cobra.Command{
 	Short: "Stop the running daemon",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		config := daemon.DefaultConfig()
-		if !daemon.IsRunning(config) {
+		pid, running := daemon.RunningPID(config)
+		if !running {
 			fmt.Println("Daemon is not running")
 			return nil
 		}
 
-		// Connect and tell it to stop
-		dc, err := daemon.ConnectTo(config.SocketPath)
-		if err != nil {
-			return fmt.Errorf("connecting to daemon: %w", err)
+		// SIGTERM is the daemon's graceful-shutdown path: it kills its sync
+		// proxies and exits. This command used to only print that the daemon
+		// "will stop on idle timeout" and stop nothing.
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+			return fmt.Errorf("signaling daemon (pid %d): %w", pid, err)
 		}
-		defer dc.Close()
-
-		// Just close the connection - daemon will idle-stop eventually
-		// For immediate stop, we'd need a shutdown RPC
-		fmt.Println("Daemon will stop on idle timeout")
-		return nil
+		deadline := time.Now().Add(daemonStopTimeout)
+		for time.Now().Before(deadline) {
+			if !daemon.IsRunning(config) {
+				fmt.Println("Daemon stopped")
+				return nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return fmt.Errorf("daemon (pid %d) did not exit within %s", pid, daemonStopTimeout)
 	},
 }
+
+// daemonStopTimeout bounds how long `sp daemon stop` waits for the daemon to
+// finish shutting down (it kills each sync proxy on the way out).
+const daemonStopTimeout = 10 * time.Second
 
 // daemonStatusCmd shows daemon status.
 var daemonStatusCmd = &cobra.Command{

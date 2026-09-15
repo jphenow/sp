@@ -602,21 +602,28 @@ func (d *Daemon) removePID() {
 
 // IsRunning checks if a daemon is already running by verifying the PID file.
 func IsRunning(config Config) bool {
+	_, ok := RunningPID(config)
+	return ok
+}
+
+// RunningPID returns the PID recorded in the daemon's PID file and whether
+// that process is alive.
+func RunningPID(config Config) (int, bool) {
 	data, err := os.ReadFile(config.PIDPath)
 	if err != nil {
-		return false
+		return 0, false
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
-		return false
+		return 0, false
 	}
 	// Check if process exists
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return false
+		return 0, false
 	}
 	// Signal 0 checks if process exists without actually sending a signal
-	return proc.Signal(syscall.Signal(0)) == nil
+	return pid, proc.Signal(syscall.Signal(0)) == nil
 }
 
 // EnsureRunning starts the daemon as a background process if it's not already running.
