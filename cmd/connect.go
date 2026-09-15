@@ -975,6 +975,11 @@ func startSyncInline(client *sprite.Client, resolved *setup.ResolvedTarget) erro
 // `sprite attach`, which means tmux, claude, and anything else running
 // inside the session survive network drops and reconnects.
 func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token string) error {
+	// Forward Claude /login callback ports for the life of the attach, so the
+	// browser login completes on its own instead of asking for a pasted code.
+	stopLoginForwarder := startLoginCallbackForwarder(client, resolved.SpriteName, resolved.Org)
+	defer stopLoginForwarder()
+
 	// Check for an existing persistent session from a prior connect.
 	// If found, reattach directly — tmux + claude are still running.
 	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" {
