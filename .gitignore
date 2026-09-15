@@ -1,6 +1,5 @@
 # Build artifacts
 sp-bin
-sp-linux-amd64
 
 # Go
 *.exe

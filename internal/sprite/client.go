@@ -137,7 +137,7 @@ func (c *Client) Destroy(name string) error {
 }
 
 // Exec runs a command on a sprite and returns its combined output.
-// For interactive (TTY) sessions, use ExecInteractive instead.
+// Interactive (TTY) sessions build their args with BuildExecArgs instead.
 func (c *Client) Exec(opts ExecOptions) ([]byte, error) {
 	args := c.BuildExecArgs(opts)
 	// --debug is a global flag, so it precedes the subcommand. It writes to the
@@ -162,19 +162,6 @@ func (c *Client) Exec(opts ExecOptions) ([]byte, error) {
 		return out, fmt.Errorf("exec on sprite %q: %w\n%s", opts.Sprite, err, string(out))
 	}
 	return out, nil
-}
-
-// ExecInteractive runs an interactive command on a sprite with TTY attached.
-// This replaces the current process's stdin/stdout/stderr.
-func (c *Client) ExecInteractive(opts ExecOptions) error {
-	opts.TTY = true
-	args := c.BuildExecArgs(opts)
-
-	cmd := exec.Command("sprite", args...)
-	cmd.Stdin = nil // will be set by caller or syscall.Exec
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run()
 }
 
 // BuildExecArgs constructs the argument list for sprite exec.
@@ -263,21 +250,6 @@ func ProxyStderr(cmd *exec.Cmd) string {
 	return ""
 }
 
-// GetURL returns the public URL for a sprite.
-func (c *Client) GetURL(name string) (string, error) {
-	args := []string{"url"}
-	if c.org != "" {
-		args = append(args, "-o", c.org)
-	}
-	args = append(args, "-s", name)
-
-	out, err := runCapture(args...)
-	if err != nil {
-		return "", fmt.Errorf("getting URL for sprite %q: %w", name, err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 // Exists checks if a sprite with the given name exists by attempting to get it.
 // Returns true only when the API returns a sprite with a non-empty ID.
 func (c *Client) Exists(name string) (bool, error) {
@@ -314,21 +286,6 @@ func (c *Client) ExistsInfo(name string) (*Info, bool, error) {
 		return nil, false, nil
 	}
 	return info, true, nil
-}
-
-// Use associates the current directory with a sprite name (creates .sprite file).
-func (c *Client) Use(name string) error {
-	args := []string{"use"}
-	if c.org != "" {
-		args = append(args, "-o", c.org)
-	}
-	args = append(args, name)
-
-	cmd := exec.Command("sprite", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("sprite use %q: %w\n%s", name, err, string(out))
-	}
-	return nil
 }
 
 // Sessions lists active tmux/exec sessions on a sprite.

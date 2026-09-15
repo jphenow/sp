@@ -88,11 +88,6 @@ type spriteListMsg struct {
 	tags    map[string][]string
 }
 
-// stateUpdateMsg is sent when the daemon broadcasts a state change.
-type stateUpdateMsg struct {
-	update daemon.StateUpdate
-}
-
 // errMsg wraps an error for the TUI.
 type errMsg struct {
 	err error
@@ -226,10 +221,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.binaryChanged = true
 		// Auto re-exec: the TUI replaces itself with the new binary
 		return m, m.reExec
-
-	case stateUpdateMsg:
-		// Refresh sprite list on any state change
-		return m, m.fetchSprites
 
 	case consoleFinishedMsg:
 		// Console session ended — refresh sprites to pick up any changes.

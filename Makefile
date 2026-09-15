@@ -1,12 +1,8 @@
-.PHONY: build build-sprite install test clean proto
+.PHONY: build install test clean
 
 # Build the sp binary for the local machine
 build:
 	go build -o sp-bin .
-
-# Build the sp binary for sprite environments (linux/amd64)
-build-sprite:
-	GOOS=linux GOARCH=amd64 go build -o sp-linux-amd64 .
 
 # Install sp to GOPATH/bin
 install:
@@ -22,15 +18,11 @@ test-race:
 
 # Clean build artifacts
 clean:
-	rm -f sp-bin sp-linux-amd64
+	rm -f sp-bin
 
 # Tidy dependencies
 tidy:
 	go mod tidy
-
-# Generate protobuf (for future gRPC integration)
-proto:
-	@echo "Proto generation not yet configured"
 
 # Lint (requires golangci-lint)
 lint:
