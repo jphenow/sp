@@ -1,0 +1,122 @@
+package setup
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jphenow/sp/internal/sprite"
+)
+
+// uploadAttempts is how many times UploadFiles tries a push before giving up.
+// The sprite fs/write API regularly blows its (non-configurable) HTTP client
+// timeout on a cold sprite — "request canceled (Client.Timeout exceeded while
+// awaiting headers)" — and the sprite is usually warm by the second try.
+const uploadAttempts = 2
+
+// UploadFiles pushes local→remote file pairs to a sprite in a SINGLE exec.
+// `sprite exec --file` is repeatable, so batching N files into one call costs
+// one round trip instead of N — which matters a lot here, because each exec
+// against a cold sprite has been observed to take 30s+ and the whole point is
+// to stay under the CLI's upload timeout.
+//
+// Retries the whole batch on failure (see uploadAttempts). Returns the last
+// error; callers decide whether a missing dotfile is fatal (it generally
+// isn't) but MUST NOT discard the error silently — a swallowed timeout here
+// is indistinguishable from success and leaves the user staring at a sprite
+// with none of their config on it.
+func UploadFiles(client *sprite.Client, spriteName string, files map[string]string) error {
+	return UploadFilesRunning(client, spriteName, files, "")
+}
+
+// UploadFilesRunning is UploadFiles plus a shell command executed on the sprite
+// in the SAME call, after the files land. Use it whenever an upload is
+// immediately followed by work on the uploaded file (untar it, chmod it, fix
+// the rc files around it): the command rides the dial the upload already paid
+// for, and a call's cost is almost entirely the dial.
+//
+// The command runs once per attempt, so it must be idempotent — retries will
+// re-run it.
+func UploadFilesRunning(client *sprite.Client, spriteName string, files map[string]string, command string) error {
+	if len(files) == 0 && command == "" {
+		return nil
+	}
+	if err := uploadBatch(client, spriteName, files, command); err == nil {
+		return nil
+	}
+	if len(files) <= 1 {
+		// Nothing to salvage — uploadBatch already retried.
+		return uploadBatch(client, spriteName, files, command)
+	}
+	// The CLI uploads a batch serially and aborts on the first failure, so one
+	// bad destination takes the rest of the set with it. Fall back to one
+	// upload per file to get partial success and to name the file that's
+	// actually broken instead of blaming the whole batch.
+	//
+	// CONCURRENTLY. Each upload is its own call and a call is almost entirely
+	// dial time, so running them in sequence multiplies the stall by the file
+	// count — measured: three files fell back serially and took 3m36s. They're
+	// independent writes to distinct paths, so there's nothing to serialize.
+	var mu sync.Mutex
+	var failed []string
+	var last error
+	var wg sync.WaitGroup
+	for local, remote := range files {
+		wg.Add(1)
+		go func(local, remote string) {
+			defer wg.Done()
+			if err := uploadBatch(client, spriteName, map[string]string{local: remote}, ""); err != nil {
+				mu.Lock()
+				failed = append(failed, local)
+				last = err
+				mu.Unlock()
+			}
+		}(local, remote)
+	}
+	wg.Wait()
+	if len(failed) == 0 {
+		// Every file landed individually; the command never ran, so run it now.
+		if command != "" {
+			return uploadBatch(client, spriteName, nil, command)
+		}
+		return nil
+	}
+	sort.Strings(failed)
+	return fmt.Errorf("uploading to sprite %q failed for %s: %w", spriteName, strings.Join(failed, ", "), last)
+}
+
+// uploadBatch runs one `sprite exec --file ... -- sh -c <command>` call,
+// retrying the whole set.
+func uploadBatch(client *sprite.Client, spriteName string, files map[string]string, command string) error {
+	if command == "" {
+		command = "true"
+	}
+	var err error
+	for attempt := 0; attempt < uploadAttempts; attempt++ {
+		start := time.Now()
+		_, err = client.Exec(sprite.ExecOptions{
+			Sprite:  spriteName,
+			Command: []string{"sh", "-c", command},
+			Files:   files,
+		})
+		if err == nil {
+			return nil
+		}
+		// Don't retry a call that died on the dial timeout. Measured stalls
+		// come in exact multiples of ~31.4s — a fixed timeout in connection
+		// establishment — so a retry after one doesn't find a healthier path,
+		// it just burns another 31s. Retrying is only worth it when the
+		// failure was fast, which means something other than the dial.
+		if time.Since(start) >= dialTimeoutFloor {
+			return err
+		}
+	}
+	return err
+}
+
+// dialTimeoutFloor is the point past which a failure is assumed to be the
+// sprite dial timing out rather than a transient error worth retrying. Set
+// below the observed ~31.4s stall with room to spare.
+const dialTimeoutFloor = 20 * time.Second

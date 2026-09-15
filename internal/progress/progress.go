@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/sys/unix"
 )
 
 // TaskStatus is the lifecycle state of a single task within a Group.
@@ -44,6 +45,25 @@ type Task struct {
 	Ended   time.Time
 
 	fn func() error
+
+	detailMu sync.Mutex
+	detail   string
+}
+
+// SetDetail attaches a short live note to a running task, rendered after the
+// name ("Waiting for sprite — attempt 3, last: exec timeout"). Safe to call
+// from inside the task's own function while the renderer is drawing.
+func (t *Task) SetDetail(s string) {
+	t.detailMu.Lock()
+	t.detail = s
+	t.detailMu.Unlock()
+}
+
+// Detail returns the current live note, or "".
+func (t *Task) Detail() string {
+	t.detailMu.Lock()
+	defer t.detailMu.Unlock()
+	return t.detail
 }
 
 // Duration returns how long the task has been running, or its total
@@ -71,6 +91,20 @@ type Group struct {
 	mu       sync.Mutex
 	tasks    []*Task
 	rendered int // line count of the previous frame, for in-place redraw
+	footer   func() []string
+}
+
+// SetFooter installs a callback rendered as extra dim lines below the task
+// list on every frame. Used to show which sprite calls are currently in flight
+// — without it a stalled task is just a spinner, with no way to tell whether
+// it's stuck on a dial, on which command, or for how long.
+//
+// The callback runs on the render goroutine at every frame, so it must be
+// cheap and must not block.
+func (g *Group) SetFooter(fn func() []string) {
+	g.mu.Lock()
+	g.footer = fn
+	g.mu.Unlock()
 }
 
 // New constructs a Group rendering to stderr. If verbose is true OR
@@ -102,6 +136,9 @@ func (g *Group) Run() error {
 	if len(g.tasks) == 0 {
 		return nil
 	}
+
+	beginWarnCapture()
+	defer flushWarnings()
 
 	g.render() // initial draw of pending state
 
@@ -136,6 +173,63 @@ func (g *Group) Run() error {
 		}
 	}
 	return nil
+}
+
+// RunSequential executes tasks one at a time, in registration order, stopping
+// at the first failure. Use it for steps that depend on each other — they get
+// their own progress line each (so a slow step is attributable) without the
+// caller having to hide the ordering inside one opaque task.
+//
+// Remaining tasks stay pending and are rendered as such when one fails.
+func (g *Group) RunSequential() error {
+	if len(g.tasks) == 0 {
+		return nil
+	}
+
+	beginWarnCapture()
+	defer flushWarnings()
+
+	g.render()
+
+	var rendererStop chan struct{}
+	if !g.verbose {
+		rendererStop = make(chan struct{})
+		go g.renderLoop(rendererStop)
+	}
+
+	var firstErr error
+	for _, t := range g.tasks {
+		g.markRunning(t)
+		err := safeRun(t.fn)
+		g.markDone(t, err)
+		if err != nil {
+			firstErr = err
+			break
+		}
+	}
+
+	if rendererStop != nil {
+		close(rendererStop)
+	}
+	g.render()
+	return firstErr
+}
+
+// Failures returns every task that failed, in registration order. Run() only
+// returns the first error, which understates things badly when an API outage
+// takes down several tasks at once — the progress line truncates each error to
+// fit the terminal, so this is the only place the full text of the others is
+// still reachable.
+func (g *Group) Failures() []*Task {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var failed []*Task
+	for _, t := range g.tasks {
+		if t.Status == StatusFail {
+			failed = append(failed, t)
+		}
+	}
+	return failed
 }
 
 // safeRun catches a panic in a task function and converts it to an error
@@ -216,6 +310,8 @@ func (g *Group) render() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	width := terminalWidth()
+
 	var sb strings.Builder
 	if g.rendered > 0 {
 		// Move cursor up to the start of the previous frame.
@@ -226,32 +322,59 @@ func (g *Group) render() {
 	// visually in sync rather than each having its own phase.
 	frame := int(time.Now().UnixMilli()/int64(renderInterval/time.Millisecond)) % len(spinnerFrames)
 
-	for _, t := range g.tasks {
+	// emit writes one line, clipped to the terminal width. Clipping is not
+	// cosmetic: this renderer repositions the cursor by counting the lines it
+	// wrote, and a line longer than the terminal soft-wraps into TWO physical
+	// lines while still counting as one. The cursor math then drifts by a line
+	// per frame and the display scrolls away instead of updating in place.
+	emit := func(line string) {
 		sb.WriteString("\033[K") // clear to end of line
-		switch t.Status {
-		case StatusPending:
-			sb.WriteString(dimStyle.Render("⏳ "))
-			sb.WriteString(t.Name)
-		case StatusRunning:
-			sb.WriteString(runStyle.Render(spinnerFrames[frame] + " "))
-			sb.WriteString(t.Name)
-			sb.WriteString(dimStyle.Render(" " + t.Duration().Round(100*time.Millisecond).String()))
-		case StatusOK:
-			sb.WriteString(okStyle.Render("✓ "))
-			sb.WriteString(t.Name)
-			sb.WriteString(dimStyle.Render(" " + t.Duration().Round(time.Millisecond).String()))
-		case StatusFail:
-			sb.WriteString(failStyle.Render("✗ "))
-			sb.WriteString(t.Name)
-			if t.Err != nil {
-				sb.WriteString(failStyle.Render(": " + summarizeErr(t.Err)))
-			}
-		}
+		sb.WriteString(clip(line, width))
 		sb.WriteByte('\n')
 	}
 
+	for _, t := range g.tasks {
+		var line string
+		switch t.Status {
+		case StatusPending:
+			line = dimStyle.Render("⏳ ") + t.Name
+		case StatusRunning:
+			line = runStyle.Render(spinnerFrames[frame]+" ") + t.Name +
+				dimStyle.Render(" "+t.Duration().Round(100*time.Millisecond).String())
+			if d := t.Detail(); d != "" {
+				line += dimStyle.Render(" — " + d)
+			}
+		case StatusOK:
+			line = okStyle.Render("✓ ") + t.Name +
+				dimStyle.Render(" "+t.Duration().Round(time.Millisecond).String())
+			if d := t.Detail(); d != "" {
+				line += dimStyle.Render(" — " + d)
+			}
+		case StatusFail:
+			line = failStyle.Render("✗ ") + t.Name
+			if t.Err != nil {
+				line += failStyle.Render(": " + summarizeErr(t.Err))
+			}
+		}
+		emit(line)
+	}
+
+	lines := len(g.tasks)
+	if g.footer != nil {
+		for _, l := range g.footer() {
+			emit(dimStyle.Render("  " + l))
+			lines++
+		}
+	}
+	// Clear any lines the previous frame drew that this one doesn't, so a
+	// shrinking footer doesn't leave stale text behind.
+	for i := lines; i < g.rendered; i++ {
+		sb.WriteString("\033[K\n")
+		lines++
+	}
+
 	g.out.Write([]byte(sb.String()))
-	g.rendered = len(g.tasks)
+	g.rendered = lines
 }
 
 // summarizeErr trims long multi-line errors to a single line for the
@@ -266,6 +389,29 @@ func summarizeErr(err error) string {
 		s = s[:maxLen-1] + "…"
 	}
 	return s
+}
+
+// clip truncates a possibly-ANSI-styled line to n display columns.
+// lipgloss.MaxWidth counts display width, so escape sequences aren't charged
+// against the budget and aren't cut mid-sequence.
+func clip(line string, n int) string {
+	if n <= 0 {
+		return line
+	}
+	return lipgloss.NewStyle().MaxWidth(n).Render(line)
+}
+
+// defaultWidth is used when the terminal size can't be determined.
+const defaultWidth = 100
+
+// terminalWidth returns the current width of stderr in columns. Read every
+// frame rather than cached, so resizing mid-run doesn't corrupt the display.
+func terminalWidth() int {
+	ws, err := unix.IoctlGetWinsize(int(os.Stderr.Fd()), unix.TIOCGWINSZ)
+	if err != nil || ws.Col == 0 {
+		return defaultWidth
+	}
+	return int(ws.Col)
 }
 
 var (
@@ -287,4 +433,52 @@ func isTerminalWriter(w io.Writer) bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// Buffered warnings.
+//
+// A progress Group owns the cursor on stderr while it renders: it repositions
+// by counting the lines it wrote. Anything else writing to stderr mid-run
+// shifts the display out from under that arithmetic, and the frame ends up
+// scrolling instead of updating in place. Setup code legitimately needs to warn
+// ("gh config not pushed", "packing skills failed"), so those warnings are
+// buffered here and flushed once the renderer has drawn its final frame.
+var (
+	warnMu     sync.Mutex
+	warnActive bool
+	warnBuf    []string
+)
+
+// Warnf reports a non-fatal problem. Safe to call from inside a task: while a
+// Group is rendering the message is held and printed after the final frame,
+// and outside a run it goes straight to stderr.
+func Warnf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	warnMu.Lock()
+	if warnActive {
+		warnBuf = append(warnBuf, msg)
+		warnMu.Unlock()
+		return
+	}
+	warnMu.Unlock()
+	fmt.Fprintln(os.Stderr, msg)
+}
+
+// beginWarnCapture starts buffering warnings for the duration of a run.
+func beginWarnCapture() {
+	warnMu.Lock()
+	warnActive = true
+	warnMu.Unlock()
+}
+
+// flushWarnings stops buffering and prints everything collected.
+func flushWarnings() {
+	warnMu.Lock()
+	msgs := warnBuf
+	warnBuf = nil
+	warnActive = false
+	warnMu.Unlock()
+	for _, m := range msgs {
+		fmt.Fprintln(os.Stderr, m)
+	}
 }

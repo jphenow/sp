@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -76,16 +75,10 @@ func runDefault(cmd *cobra.Command, args []string) error {
 			noHold = true
 		}
 
-		// Handle -- separator for exec command
-		connectArgs := args
-		for i, a := range args {
-			if a == "--" {
-				connectArgs = args[:i]
-				if i+1 < len(args) {
-					execCmd = strings.Join(args[i+1:], " ")
-				}
-				break
-			}
+		// Handle -- separator for exec command (`sp . -- claude`).
+		connectArgs, command := splitAtDash(args, cmd.ArgsLenAtDash())
+		if command != "" {
+			execCmd = command
 		}
 
 		return runConnect(connectCmd, connectArgs)
@@ -134,15 +127,17 @@ func init() {
 	rootCmd.DisableSuggestions = true
 }
 
-// findExecSeparator returns the index of "--" in os.Args and the remaining args.
-func findExecSeparator() (beforeArgs []string, execArgs string) {
-	args := os.Args[1:]
-	for i, a := range args {
-		if a == "--" {
-			before := args[:i]
-			after := args[i+1:]
-			return before, strings.Join(after, " ")
-		}
+// splitAtDash splits positional args at the "--" separator into connect
+// arguments and the command to run, joined with spaces.
+//
+// dashAt must come from cobra's cmd.ArgsLenAtDash(): cobra REMOVES the "--"
+// token itself while parsing, so args never contain it and scanning them for
+// "--" can't work. That's what used to happen — `sp . -- claude` arrived as
+// [".", "claude"], "claude" was taken as a variant name, and sp created a new
+// sprite called <name>--claude. dashAt is -1 when there was no separator.
+func splitAtDash(args []string, dashAt int) (connectArgs []string, command string) {
+	if dashAt < 0 || dashAt > len(args) {
+		return args, ""
 	}
-	return args, ""
+	return args[:dashAt], strings.Join(args[dashAt:], " ")
 }

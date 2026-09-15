@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jphenow/sp/internal/progress"
 	"github.com/jphenow/sp/internal/sprite"
 )
 
@@ -155,7 +156,7 @@ func PushClaudeConfig(client *sprite.Client, spriteName string) error {
 			// Non-fatal: warn and skip. We want PushClaudeConfig to be
 			// best-effort so a single broken entry (unreadable file,
 			// stale symlink) doesn't block the whole connect flow.
-			fmt.Fprintf(os.Stderr, "Warning: packing %s: %v\n", name, err)
+			progress.Warnf("Warning: packing %s: %v", name, err)
 		}
 	}
 
@@ -169,17 +170,21 @@ func PushClaudeConfig(client *sprite.Client, spriteName string) error {
 		return fmt.Errorf("closing temp file: %w", err)
 	}
 
-	// Upload and extract into the sprite's ~/.claude/. mkdir -p first so a
-	// fresh sprite without ~/.claude/ doesn't fail the extract. The --strip
-	// is avoided because tar entries are already stored with paths relative
-	// to ~/.claude/ (see addToTarFollowingSymlinks).
-	extractCmd := "mkdir -p ~/.claude && cd ~/.claude && tar xzf /tmp/sp-claude-config.tar.gz && rm -f /tmp/sp-claude-config.tar.gz"
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", extractCmd},
-		Files:   map[string]string{tmpFile.Name(): "/tmp/sp-claude-config.tar.gz"},
-	}); err != nil {
-		return fmt.Errorf("extracting claude config on sprite: %w", err)
+	// Upload and extract in ONE call. The extract rides the dial the upload
+	// already paid for — a sprite call spends nearly all its time connecting
+	// and ~0.02s running the command, so splitting these doubled the cost for
+	// nothing. UploadFilesRunning also brings the retry this push was missing;
+	// the payload is small (~44K — the 40MB of plugins/marketplaces is
+	// excluded), so a failure here is the API being flaky.
+	//
+	// mkdir -p first so a fresh sprite without ~/.claude/ doesn't fail the
+	// extract. --strip is avoided because tar entries are already stored with
+	// paths relative to ~/.claude/ (see addToTarFollowingSymlinks). Idempotent,
+	// as UploadFilesRunning requires: re-extracting the same tar is a no-op.
+	const remoteTar = "/tmp/sp-claude-config.tar.gz"
+	extract := "mkdir -p ~/.claude && cd ~/.claude && tar xzf " + remoteTar + " && rm -f " + remoteTar
+	if err := UploadFilesRunning(client, spriteName, map[string]string{tmpFile.Name(): remoteTar}, extract); err != nil {
+		return fmt.Errorf("pushing claude config: %w", err)
 	}
 	return nil
 }

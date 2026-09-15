@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jphenow/sp/internal/progress"
 	"github.com/jphenow/sp/internal/sprite"
 )
 
@@ -158,14 +159,14 @@ func RunSetupConf(client *sprite.Client, spriteName string, conf *SetupConf) err
 	// Process files
 	for _, f := range conf.Files {
 		if err := copySetupFile(client, spriteName, f); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to copy %s: %v\n", f.Source, err)
+			progress.Warnf("Warning: failed to copy %s: %v", f.Source, err)
 		}
 	}
 
 	// Process commands
 	for _, c := range conf.Commands {
 		if err := runSetupCommand(client, spriteName, c); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to run command: %v\n", err)
+			progress.Warnf("Warning: failed to run command: %v", err)
 		}
 	}
 
@@ -207,22 +208,11 @@ func copySetupFile(client *sprite.Client, spriteName string, entry FileEntry) er
 		// If remote stat fails, file doesn't exist remotely - proceed with copy
 	}
 
-	// Ensure remote directory exists
-	remoteDir := filepath.Dir(entry.Dest)
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"mkdir", "-p", remoteDir},
-	}); err != nil {
-		return fmt.Errorf("creating remote directory %q: %w", remoteDir, err)
-	}
-
-	// Upload the file
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"true"},
-		Files:   map[string]string{entry.Source: entry.Dest},
-	}); err != nil {
-		return fmt.Errorf("uploading %q to %q: %w", entry.Source, entry.Dest, err)
+	// Upload the file. No separate mkdir -p: the fs/write API already takes
+	// mkdirParents, so the extra exec was a wasted round trip against an API
+	// slow enough that round trips are what make these uploads time out.
+	if err := UploadFiles(client, spriteName, map[string]string{entry.Source: entry.Dest}); err != nil {
+		return err
 	}
 
 	// Preserve executable bit
@@ -289,13 +279,4 @@ func GetAlwaysFiles(conf *SetupConf) []FileEntry {
 		}
 	}
 	return always
-}
-
-// ConfModifiedSince checks if setup.conf has been modified since the given time.
-func ConfModifiedSince(confPath string, since int64) bool {
-	info, err := os.Stat(confPath)
-	if err != nil {
-		return false
-	}
-	return info.ModTime().Unix() > since
 }

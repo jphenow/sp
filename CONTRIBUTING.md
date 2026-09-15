@@ -1,292 +1,80 @@
 # Contributing to sp
 
-Thank you for your interest in contributing to `sp` (Sprite Repository Manager)! This document provides guidelines for contributing to the project.
+`sp` is a Go program. This covers building it, how the code is laid out, and what to check before opening a pull request. For what the tool does, see [README.md](README.md).
 
-## Getting Started
-
-1. Fork the repository on GitHub
-2. Clone your fork locally:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/sp.git
-   cd sp
-   ```
-3. Create a branch for your changes:
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-## Development Workflow
-
-### Using sp to Develop sp
-
-You can use `sp` itself to develop `sp`:
+## Getting started
 
 ```bash
-# Work with your local changes
-cd /path/to/sp
-sp .
-
-# Claude Code will open in a sprite with your local changes
-# Make changes, test them, and iterate
+git clone https://github.com/YOUR_USERNAME/sp.git
+cd sp
+git checkout -b feature/your-feature-name
+make build        # -> ./sp-bin
 ```
 
-This gives you an isolated environment to test your changes without affecting your local `sp` installation.
+You need the Go version in `go.mod` (1.25.5), plus the `sprite` CLI, Mutagen and an `~/.ssh/id_ed25519` key to exercise anything end to end.
 
-### Testing Your Changes
+## Make targets
 
-Before submitting a pull request:
+| Target | What it does |
+|--------|--------------|
+| `make build` | `go build -o sp-bin .` |
+| `make install` | `go install .` |
+| `make test` | `go test ./... -v` |
+| `make test-race` | `go test ./... -race -v` |
+| `make lint` | `golangci-lint run ./...` (install golangci-lint separately) |
+| `make tidy` | `go mod tidy` |
+| `make clean` | Remove `sp-bin` and `sp-linux-amd64` |
+| `make all` | `tidy`, `build`, `install` |
 
-1. Test the basic workflows:
-   ```bash
-   # Test repo mode
-   ./sp test-owner/test-repo
+## Layout
 
-   # Test current directory mode
-   cd /path/to/some/repo
-   /path/to/your/sp .
-   ```
+| Path | Contents |
+|------|----------|
+| `main.go` | Calls `cmd.Execute()` and prints any returned error |
+| `cmd/` | Cobra commands, one file per command. `root.go` maps `sp <target>` to `connect`; `connect.go` is the connect flow and session handling; `keepalive.go` has the Tasks API heartbeat used by holds, `--keep-warm`, `keepalive` and `rc`. |
+| `internal/setup/` | Target resolution (`resolve.go`), credential and config pushes (`auth.go`, `claude_config.go`), `setup.conf` parsing and execution (`config.go`), batched uploads with retry (`upload.go`) |
+| `internal/sprite/` | Wrapper around the `sprite` CLI, plus call tracing (`trace.go`) and debug-log stall analysis (`dialgap.go`) |
+| `internal/progress/` | The multi-task progress display used during connect |
+| `internal/daemon/` | Background daemon (Unix socket JSON RPC), its client, and the sync/proxy health monitor |
+| `internal/sync/` | Mutagen sessions, the `sprite proxy` SSH tunnel, `~/.ssh/config` entries, `.gitignore` conversion |
+| `internal/store/` | SQLite database at `~/.config/sp/sp.db` |
+| `internal/tui/` | Bubble Tea dashboard |
+| `internal/serve/` | Reverse proxy run on the sprite by `sp serve` (`--web-proxy`) |
+| `internal/logging/` | Daemon logging to `~/.config/sp/sp.log` |
 
-2. Test authentication flows:
-   - Delete `~/.claude-token` and test first-time setup
-   - Test with missing SSH keys
-   - Test with existing sprites
+## Developing
 
-3. Test error handling:
-   - Invalid repository names
-   - Non-existent repositories
-   - Network failures
-   - Permission issues
+Run your build directly: `./sp-bin .`, `./sp-bin tui`, and so on.
 
-4. Test cleanup:
-    - Verify no temp files are left behind
-    - Check that sprites are properly configured
-    - Verify sync grace period: after exiting, proxy + mutagen stay alive for ~30s
-    - Verify reconnecting within the grace period reuses existing sync (no restart)
-    - Verify sync tears down after grace period expires with no reconnection
+Keep in mind that the daemon is shared. Whichever binary starts it first owns it, and later commands from any `sp` binary talk to that process over `~/.config/sp/sp.sock`. The daemon and the TUI re-exec themselves when their own binary changes on disk, so rebuilding the binary the daemon was started from is enough; if it was started from a different binary (for example the installed `sp`), run `sp daemon restart` from that binary or kill it and let your build start a new one. Daemon output goes to `~/.config/sp/sp.log` (`sp daemon logs -f`).
 
-5. Test new commands:
-    ```bash
-    # Check sync health
-    /path/to/your/sp status .
+A connect's cost is dominated by the number of `sprite` CLI calls, each of which pays a connection to the sprite. When adding setup work, fold it into an existing call (see `UploadFilesRunning` and `HomePermissionsScript`) rather than adding a new one. `-v` prints the per-call timing profile.
 
-    # Reset sync (picks up .gitignore changes)
-    /path/to/your/sp resync .
-    ```
+Never print or trace command environments or scripts that embed credentials; `describeExec` in `internal/sprite/trace.go` redacts token-shaped strings and excludes `Env` for this reason.
 
-## Code Style
-
-### Shell Script Guidelines
-
-- Use `bash` (not `sh`) for the script
-- Set strict error handling: `set -euo pipefail`
-- Use meaningful function names with `snake_case`
-- Add comments for complex logic
-- Use `local` for function-scoped variables
-- Quote all variable expansions: `"$var"`
-- Use `[[` for conditionals instead of `[`
-- Prefer `${var:-default}` for default values
-
-### Example
+## Before submitting
 
 ```bash
-# Good: Clear function name, proper quoting, local variables
-setup_authentication() {
-    local sprite_name="$1"
-    local token="${2:-}"
-
-    if [[ -z "$token" ]]; then
-        error "Token is required"
-    fi
-
-    info "Setting up authentication for: $sprite_name"
-}
+go build ./... && go vet ./... && go test ./...
 ```
 
-## Adding New Features
+Unit tests don't touch a real sprite. For changes to the connect flow, sync, or the daemon, also test against a real sprite and say what you tried in the PR. Useful cases:
 
-### Feature Proposal
+- **New sprite and existing sprite**: `./sp-bin .` in a GitHub checkout and in a non-git directory; `./sp-bin owner/repo`. Reconnect to confirm it reattaches to the running tmux session.
+- **Claude auth**: with local Claude Code credentials, the sprite shouldn't get `CLAUDE_CODE_OAUTH_TOKEN` (`echo $CLAUDE_CODE_OAUTH_TOKEN` in a new pane is empty and `claude auth status` reports `claude.ai`). With only `~/.claude-token`, `sp` prints the setup-token note and Claude still works.
+- **Remote Control**: `./sp-bin . --rc` on a fresh sprite, then join from the Claude app.
+- **setup.conf**: `sp conf init`; `[files]` with `[newest]`, `[always]` and `src -> dest`; `[commands]` with and without `!`; `sp setup .`.
+- **Sync**: edits in both directions; a new `.gitignore` rule picked up by `sp resync .`; `.git` state (commit on the sprite, see it locally); a conflict shows in `sp status <name>` and the TUI; sync stops when the sprite pauses and resumes when it wakes.
+- **Variants and cleanup**: `./sp-bin . test-variant`, `sp status --variants`, `sp pin`/`sp unpin`, `sp prune` (dry run), `sp rm`.
+- **Holds**: after exiting a session (killing the tmux session), the sprite is released within a minute or so; `--no-hold`; `sp keepalive . --stop`.
+- **Failure paths**: a missing SSH key, no Claude credentials at all (prompt), an invalid `owner/repo`, and a slow sprite (the stall notes and timing profile should make the cause clear).
 
-For significant features, please:
-1. Open an issue first to discuss the proposal
-2. Explain the use case and expected behavior
-3. Get feedback before implementing
+## Pull requests
 
-### Implementation Guidelines
-
-- Follow existing patterns in the codebase
-- Add appropriate error handling
-- Include user-facing messages (using `info`, `warn`, `error`)
-- Update the README.md if adding user-visible features
-- Update AGENTS.md if the feature affects Claude Code workflows
-
-## Documentation
-
-When adding features or making changes:
-
-1. Update `README.md`:
-   - Add new features to the Features section
-   - Add new usage examples if applicable
-   - Update troubleshooting section if relevant
-
-2. Update `AGENTS.md`:
-   - Add new agent patterns if applicable
-   - Update workflows that are affected
-   - Add tips for using the new feature with Claude Code
-
-3. Update code comments:
-   - Add comments to complex functions
-   - Document function parameters and return values
-   - Explain non-obvious logic
-
-## Error Handling
-
-- Use the `error()` function for fatal errors
-- Use the `warn()` function for non-fatal issues
-- Use the `info()` function for informational messages
-- Provide clear, actionable error messages
-- Include relevant context in error messages
-
-Example:
-```bash
-# Bad
-error "Failed"
-
-# Good
-error "Failed to create sprite '$sprite_name'. Check that you're authenticated with 'sprite list'"
-```
-
-## Authentication and Security
-
-When working with authentication:
-- Never log tokens or sensitive data
-- Use environment variables for tokens
-- Set appropriate file permissions (600 for secrets)
-- Validate token format before saving
-- Handle token errors gracefully
-
-## Sprite Management
-
-When modifying sprite-related code:
-- Always check if a sprite exists before creating
-- Wait for sprites to be ready before using
-- Handle sprite creation failures gracefully
-- Clean up temporary files and resources
-- Use absolute paths for file uploads
-
-## Pull Request Process
-
-1. **Create a Pull Request**:
-   - Provide a clear title and description
-   - Reference any related issues
-   - Explain what changes were made and why
-
-2. **PR Description Should Include**:
-   - What problem does this solve?
-   - How was it tested?
-   - Any breaking changes?
-   - Screenshots/examples if applicable
-
-3. **Review Process**:
-   - Address review feedback
-   - Keep the PR focused and reasonably sized
-   - Rebase on main if needed
-
-4. **Before Merging**:
-   - Ensure all discussions are resolved
-   - Verify tests pass
-   - Update documentation if needed
-
-## Commit Messages
-
-Use clear, descriptive commit messages:
-
-```bash
-# Good
-git commit -m "Add support for custom SSH key paths"
-git commit -m "Fix token validation for wrapped input"
-git commit -m "Update README with troubleshooting steps"
-
-# Less helpful
-git commit -m "Fix bug"
-git commit -m "Update docs"
-git commit -m "Changes"
-```
-
-## Testing Scenarios
-
-Test these scenarios before submitting:
-
-### New Sprite Creation
-- [ ] Create sprite for first time
-- [ ] Verify authentication setup
-- [ ] Verify SSH keys copied
-- [ ] Verify git config copied
-- [ ] Verify repository cloned
-
-### Existing Sprite
-- [ ] Connect to existing sprite
-- [ ] Verify repository updates (git pull)
-- [ ] Verify auth files not re-copied unnecessarily
-
-### Setup Config
-- [ ] `sp conf init` creates starter config
-- [ ] `sp conf edit` opens in $EDITOR
-- [ ] `sp conf show` prints contents
-- [ ] `[files]` entries copy to sprite on first connect
-- [ ] `source -> dest` syntax maps different local/remote paths
-- [ ] `[commands]` entries run when condition succeeds
-- [ ] Editing setup.conf re-triggers setup on next connect
-
-### Current Directory Mode
-- [ ] Sync local directory (tar upload only on new sprites; Mutagen for reconnects)
-- [ ] Verify `.gitignore` patterns are respected (files ignored in git should not sync)
-- [ ] Verify nested `.gitignore` files are picked up (e.g., `subdir/.gitignore`)
-- [ ] Verify `.git` is included in sync (explicitly un-ignored)
-- [ ] Verify `.git` lock files and rebase state are excluded (`.git/*.lock`, `.git/rebase-merge`, etc.)
-- [ ] Verify `.git/index`, `.git/refs/`, `.git/logs/` ARE synced (commits/pushes on sprite reflected locally)
-- [ ] Verify git repository state maintained
-- [ ] Test with uncommitted changes
-- [ ] Verify reconnecting to existing sprite does NOT re-tar-sync (remote edits preserved)
-
-### Sync Status and Resync
-- [ ] `sp status .` shows sync health, proxy state, and mode (`two-way-safe`)
-- [ ] `sp status .` reports conflicts when both sides modify the same file
-- [ ] `sp resync .` tears down and restarts sync without blocking the terminal
-- [ ] `sp resync .` picks up new `.gitignore` rules added after initial sync
-- [ ] Verify conflict detection during normal `sp .` connection (check_sync_conflicts)
-
-### Sync Conflict Scenarios
-- [ ] Modify a file on both local and sprite before sync catches up — verify conflict is reported
-- [ ] Run `mutagen sync reset` after conflict — verify resolution works
-- [ ] Verify `two-way-safe` mode does NOT silently overwrite sprite-side changes
-- [ ] Recreate a sync session (simulating recovery) — verify no silent data loss
-
-### Error Conditions
-- [ ] Invalid repository format
-- [ ] Non-existent repository
-- [ ] Missing SSH key
-- [ ] Missing Claude token
-- [ ] Sprite creation failure
-- [ ] Network timeout
-
-## Getting Help
-
-If you need help:
-- Open an issue with your question
-- Check existing issues for similar questions
-- Review the README.md and AGENTS.md documentation
-
-## Code of Conduct
-
-- Be respectful and constructive
-- Welcome newcomers and help them get started
-- Focus on the technical merits of contributions
-- Assume good intentions
+- Keep each PR focused, and describe what problem it solves and how you tested it.
+- Update README.md (and AGENTS.md if it affects Claude on the sprite) when you change commands, flags or behavior they describe.
+- Write clear commit messages that say what changed and why.
 
 ## License
 
 By contributing to `sp`, you agree that your contributions will be licensed under the MIT License.
-
-## Questions?
-
-Feel free to open an issue if you have questions about contributing!

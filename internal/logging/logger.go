@@ -2,7 +2,6 @@ package logging
 
 import (
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -37,34 +36,6 @@ func Setup() error {
 	})
 	slog.SetDefault(slog.New(handler))
 	return nil
-}
-
-// SetupMulti initialises the global slog logger to write to both the log file
-// and the provided writer (typically os.Stderr for foreground daemon mode).
-func SetupMulti(w io.Writer) error {
-	path := DefaultLogPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("creating log directory: %w", err)
-	}
-
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("opening log file %s: %w", path, err)
-	}
-	logFile = f
-
-	multi := io.MultiWriter(f, w)
-	handler := slog.NewJSONHandler(multi, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	})
-	slog.SetDefault(slog.New(handler))
-	return nil
-}
-
-// LogFile returns the open file handle for the log file, or nil if not set up.
-// Used by EnsureRunning to redirect daemon stdout/stderr.
-func LogFile() *os.File {
-	return logFile
 }
 
 // Close flushes and closes the log file.
