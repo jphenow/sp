@@ -1,144 +1,72 @@
-# Claude Code Agent Patterns for sp
+# Using Claude Code with sp
 
-This document describes how to effectively use Claude Code with the `sp` tool inside sprite environments. For installation, usage, and command reference, see [README.md](README.md).
+How to run Claude Code inside a sprite with `sp`. For installation, the full command reference, and troubleshooting, see [README.md](README.md).
 
-## Overview
-
-The `sp` tool creates isolated Fly.io sprite environments with Claude Code pre-configured. See the [README quickstart](README.md#quickstart) for setup instructions.
-
-## Quick Start with Claude Code
+## Starting Claude
 
 ```bash
-# Connect to a repository and open claude
-sp superfly/flyctl -- claude
-
-# Or boot the web UI
-sp . --web
+sp . -- claude                      # Claude as the session command
+sp owner/repo -- claude             # same, for a repo cloned on the sprite
+sp . --rc                           # claude --remote-control, joinable from the Claude app
+sp .                                # bash; run claude yourself in a tmux pane
 ```
 
-## Recommended Agent Patterns
+Each sprite has one persistent tmux session. Reconnecting reattaches to it, and Claude keeps running across disconnects, so the command you pass only matters the first time. To run another Claude alongside, open a tmux window or pane; to run one against an isolated copy of the code, use a variant (below).
 
-### 1. Exploratory Analysis
-When first examining a new codebase, ask Claude to:
-- Map out the project structure
-- Identify key components and their relationships
-- Explain architectural patterns used
-- Find the entry points and main execution flows
+## What Claude gets on the sprite
 
-**Example prompts:**
-- "Explore this codebase and explain the overall architecture"
-- "Where does the authentication flow start in this application?"
-- "What testing frameworks are used and where are the tests located?"
+- **Auth.** Your local full-scope Claude Code login (macOS Keychain or `~/.claude/.credentials.json`) is pushed if it's fresher than the sprite's copy. `sp` checks `claude auth status` on the sprite and only falls back to the setup token from `~/.claude-token` when there's no working `claude.ai` login. See [Authentication](README.md#authentication) for why the token is otherwise kept out of the environment.
+- **Permissions bypassed.** The sprite's `settings.json` gets `permissions.defaultMode: "bypassPermissions"` with the consent prompt pre-accepted, and `claude` is aliased to `claude --dangerously-skip-permissions` in the shell rc files. Sprites are disposable; treat them that way.
+- **Your config.** `CLAUDE.md`, `settings.json`, `settings.local.json`, `keybindings.json`, `statusline-command.sh`, and the `commands`, `skills`, `plugins`, `agents` and `marketplace(s)` directories from `~/.claude/` are pushed on every connect. Local home-directory paths in `settings.json`'s status line and the plugin index files are rewritten to `/home/sprite`. Conversation history, project memory and other session state stay on the sprite and are never overwritten.
+- **Competing auth removed.** `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the Bedrock/Vertex/Foundry switches are unset in the shell and tmux environment.
+- **Git and GitHub.** Your git name and email; `GH_TOKEN` from `gh auth token` in the environment; SSH-style GitHub URLs rewritten to HTTPS with a credential helper that reads `GH_TOKEN`. Claude can commit, push and use `gh` without passphrase prompts.
+- **Your files.** For a directory target, edits Claude makes on the sprite sync back to your local checkout (and yours to the sprite), including `.git`, so branches and commits show up on both sides. Conflicting edits to the same file are held as conflicts rather than overwritten.
 
-### 2. Feature Development
-Leverage Claude's ability to work across multiple files:
-- Plan the implementation strategy before coding
-- Create or modify multiple related files in one session
-- Update tests alongside implementation code
-- Ensure consistency across the codebase
+## Remote Control
 
-**Example prompts:**
-- "Add a new command to handle X, following the existing patterns"
-- "Implement feature Y with tests"
-- "Refactor the authentication module to support OAuth"
+Remote Control lets you drive a session from the Claude app or claude.ai/code. It requires a full `claude.ai` login on the sprite; the setup token is rejected.
 
-### 3. Debugging and Troubleshooting
-Use Claude to investigate and fix issues:
-- Analyze error messages and stack traces
-- Trace execution paths
-- Identify root causes of bugs
-- Suggest and implement fixes
+- `sp . --rc` starts the session with `claude --remote-control`, with the Remote Control session name prefixed by the sprite name.
+- In an existing session, run `/remote-control` from inside Claude.
+- `sp rc .` runs Claude Remote Control headless as a sprite-env service that restarts after a cold wake and resumes the last session. Stop it with `sp rc . --stop`. Experimental.
 
-**Example prompts:**
-- "This error occurs when I run X. Help me debug it."
-- "Why is this function returning unexpected results?"
-- "Trace the execution path when this condition is triggered"
+If `sp` prints "falling back to the inference-only setup-token", Remote Control won't work until the sprite has a real login: log in to Claude Code locally and reconnect, or run `/login` on the sprite. `/login` inside the session opens your local browser and completes on its own while `sp` is attached.
 
-### 4. Code Review and Refactoring
-Have Claude review and improve code quality:
-- Identify code smells and anti-patterns
-- Suggest performance optimizations
-- Ensure consistency with project conventions
-- Modernize legacy code
+## Keeping the sprite reachable
 
-### 5. Documentation
-Generate and update documentation:
-- Create inline code comments
-- Document API endpoints
-- Generate usage examples
+By default `sp` holds the sprite Active for as long as its tmux session exists (up to 8 hours), so a long-running Claude task or a Remote Control session isn't interrupted by an idle pause when you walk away from the terminal.
 
-## Working with Sprites
-
-### Environment Isolation
-Each sprite provides:
-- Fresh environment for each repository
-- No conflicts with local dependencies
-- Consistent build environment
-- Easy cleanup (just delete the sprite)
-
-### What sp auto-configures
-See [Setup Configuration](README.md#setup-configuration) in the README.
-
-### File Sync
-See [File Sync](README.md#file-sync) in the README for details on bidirectional sync, `.gitignore` handling, conflict resolution, and the daemon lifecycle.
-
-## Best Practices
-
-### 1. Start with Exploration
-Before making changes, have Claude explore the codebase to understand the project structure, patterns, testing approach, and build process.
-
-### 2. Incremental Changes
-Work in small, testable increments. Commit working code frequently. Use Claude to help with git operations.
-
-### 3. Leverage Context
-Claude has access to the entire repository. Ask about relationships between files, request consistency checks, and have Claude find similar implementations to follow.
-
-### 4. Use Sprites for Experimentation
-Create sprites for experimental work:
 ```bash
-sp myorg/myrepo
-# Make experimental changes
-# Delete the sprite if it doesn't work out
+sp . --no-hold                 # let it pause when idle
+sp . --keep-warm 1h            # hold up to 1h, release once the pane is idle ~60s
+sp keepalive . --for 3h        # hold for a fixed window, no session needed
+sp keepalive . --stop
 ```
 
-### 5. Multiple Sessions
-Run Claude and bash side by side:
+## Parallel experiments with variants
+
+A variant is a separate sprite for the same repo, useful for letting Claude try an approach without touching your main environment:
+
 ```bash
-sp . -- claude --name claude-main    # Terminal 1
-sp . --name debug                    # Terminal 2
+sp . try-sqlite -- claude
+sp owner/repo try-sqlite -- claude
 ```
 
-Use `sp sessions .` to list all active tmux sessions.
+A directory variant starts from a one-time upload of the files `git ls-files` reports (tracked plus untracked, minus ignored; no `.git`) and is not synced afterwards. For work you want to commit and push from the sprite, use an `owner/repo` variant, which is a full clone. Keep one with `sp pin owner/repo:try-sqlite`; clean up the rest with `sp prune` (dry run) and `sp prune --yes`, or `sp rm owner/repo:try-sqlite`.
 
-## Common Workflows
+## Tools for Claude on the sprite
 
-### Contributing to Open Source
-```bash
-sp opensource/project          # Create sprite
-# Ask Claude to explore contribution guidelines
-# Implement feature, review, create PR
+Install anything Claude needs with `~/.config/sprite/setup.conf` so every new sprite has it:
+
+```ini
+[commands]
+command -v npm :: npm install -g prettier
 ```
 
-### Learning a New Codebase
-```bash
-sp company/big-project         # Create sprite
-# Ask Claude for architectural overview
-# Request explanations of specific components
-```
-
-### Debugging Production Issues
-```bash
-sp myorg/production-app        # Create sprite
-# Share error logs with Claude
-# Investigate and test fixes in isolation
-```
-
-## Troubleshooting
-
-See [Troubleshooting](README.md#troubleshooting) in the README.
+New sprites run the whole file on first connect; run `sp setup .` to apply it to an existing one. See [setup.conf](README.md#setupconf).
 
 ## Resources
 
-- [README.md](README.md) — Installation, usage, command reference
-- [Sprites Documentation](https://sprites.dev)
-- [Claude Code Documentation](https://docs.anthropic.com/en/docs/claude-code)
+- [README.md](README.md)
+- [Sprites documentation](https://sprites.dev)
+- [Claude Code documentation](https://docs.anthropic.com/en/docs/claude-code)
