@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +32,14 @@ import (
 // tails that log; when an authorize URL with a localhost redirect appears, sp
 // runs `sprite proxy <port>` locally for a few minutes.
 //
+// The browser has to be opened by sp too. The shim tries to open it by writing
+// an OSC escape sequence to the pane's terminal, but tmux drops unrecognized
+// raw OSC sequences (it only forwards them inside a DCS passthrough envelope,
+// which the shim doesn't use) — so under sp nothing opens, and the URL you'd
+// copy from Claude's own output leads to the paste-a-code page instead. The
+// watcher sees the exact authorize URL at the moment it's opened, so sp opens it
+// locally right after starting the forward.
+//
 // Reading the shim's existing log, rather than installing a shim of sp's own,
 // means it also works for a claude that was already running in a pane before
 // this connect — a new $BROWSER would only reach processes started afterwards.
@@ -49,18 +59,34 @@ const loginForwardTTL = 5 * time.Minute
 var callbackPortPattern = regexp.MustCompile(
 	`(?i)redirect_uri=http(?:%3A|:)(?:%2F|/)(?:%2F|/)(?:localhost|127\.0\.0\.1)(?:%3A|:)(\d{2,5})`)
 
-// callbackPortFromLogLine returns the OAuth callback port referenced by a line
-// of the browser-open log, or 0 if the line isn't a localhost-redirect URL.
-func callbackPortFromLogLine(line string) int {
-	m := callbackPortPattern.FindStringSubmatch(line)
+// foundURLMarker precedes the URL on the shim's log line for an opened URL. The
+// same URL also appears on its START and ESCAPE_SENT lines; only this one is
+// used, so each login is seen once.
+const foundURLMarker = "FOUND_URL: "
+
+// loginURLFromLogLine returns the authorize URL and its localhost callback port
+// from a "FOUND_URL:" line of the browser-open log, or ("", 0) if the line
+// isn't an https URL with a localhost redirect. Only URLs that pass this check
+// are ever opened locally.
+func loginURLFromLogLine(line string) (string, int) {
+	i := strings.Index(line, foundURLMarker)
+	if i < 0 {
+		return "", 0
+	}
+	fields := strings.Fields(line[i+len(foundURLMarker):])
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "https://") {
+		return "", 0
+	}
+	url := fields[0]
+	m := callbackPortPattern.FindStringSubmatch(url)
 	if m == nil {
-		return 0
+		return "", 0
 	}
 	port, err := strconv.Atoi(m[1])
 	if err != nil || port < 1024 || port > 65535 {
-		return 0
+		return "", 0
 	}
-	return port
+	return url, port
 }
 
 // loginForwarder forwards OAuth callback ports from a sprite for the lifetime
@@ -119,22 +145,42 @@ func (f *loginForwarder) watch(r io.Reader) {
 	// Authorize URLs are long; don't let a big line end the watch.
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		if port := callbackPortFromLogLine(scanner.Text()); port != 0 {
-			f.forward(port)
+		url, port := loginURLFromLogLine(scanner.Text())
+		if port == 0 {
+			continue
+		}
+		if f.forward(port) {
+			openLocalBrowser(url)
 		}
 	}
 }
 
+// openLocalBrowser opens a URL in this machine's default browser. Best-effort
+// and silent, like the rest of the forwarder.
+func openLocalBrowser(url string) {
+	opener := "xdg-open"
+	if runtime.GOOS == "darwin" {
+		opener = "open"
+	}
+	cmd := exec.Command(opener, url)
+	if err := cmd.Start(); err != nil {
+		slog.Debug("login forwarder: opening browser", "err", err)
+		return
+	}
+	go func() { _ = cmd.Wait() }()
+}
+
 // forward starts `sprite proxy <port>` unless that port is already forwarded,
-// and schedules it to be torn down after loginForwardTTL.
-func (f *loginForwarder) forward(port int) {
+// and schedules it to be torn down after loginForwardTTL. Reports whether it
+// started a new forward, so the caller opens the browser once per login.
+func (f *loginForwarder) forward(port int) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.stopped {
-		return
+		return false
 	}
 	if _, ok := f.proxies[port]; ok {
-		return
+		return false
 	}
 	proxy, err := f.client.StartProxy(sprite.ProxyOptions{
 		Sprite: f.spriteName,
@@ -143,7 +189,7 @@ func (f *loginForwarder) forward(port int) {
 	})
 	if err != nil {
 		slog.Debug("login forwarder: starting proxy", "port", port, "err", err)
-		return
+		return false
 	}
 	f.proxies[port] = proxy
 	slog.Debug("login forwarder: forwarding callback port", "port", port)
@@ -160,6 +206,7 @@ func (f *loginForwarder) forward(port int) {
 			delete(f.proxies, port)
 		}
 	})
+	return true
 }
 
 // stop tears down the watcher and every live forward. Safe to call once the
