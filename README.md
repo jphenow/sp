@@ -36,7 +36,7 @@ sp .                          # create/wake the sprite, sync this dir, open tmux
 
 sp superfly/flyctl            # a GitHub repo: cloned on the sprite, no local sync
 sp . --rc                     # start Claude with Remote Control instead of bash
-sp connect . --exec claude    # run any command instead of bash
+sp . -- claude                # run any command instead of bash
 sp tui                        # dashboard of every tracked sprite
 ```
 
@@ -163,7 +163,7 @@ sp . --web --web-proxy --web-dev-port 3000  # /opencode -> opencode, /* -> port 
 
 `--web` installs opencode if needed, creates a sprite-env service with an HTTP port (so HTTP requests wake the sprite), registers with the daemon (required in this mode), prints the URL and exits without opening a shell.
 
-`--web-proxy` cross-compiles `sp` for linux/amd64 with `go build .` in the **current directory**, uploads it to `/usr/local/bin/sp`, and runs `sp serve` as the service. Because of the `go build .`, it currently only works when run from an `sp` checkout.
+`--web-proxy` cross-compiles `sp` for linux/amd64 from the Go source this `sp` was built from (your checkout, or the module cache for `go install`), uploads it to `/usr/local/bin/sp`, and runs `sp serve` as the service. It needs Go installed and that source still present.
 
 ---
 
@@ -247,7 +247,7 @@ sp daemon restart          # re-exec (starts it if not running)
 sp daemon logs -n 100      # -f to follow
 ```
 
-`sp daemon stop` doesn't stop a running daemon; it only prints that the daemon will stop on its idle timeout. `sp daemon start` runs it in the foreground.
+`sp daemon stop` shuts the daemon down gracefully (stopping its sync proxies) and waits for it to exit. `sp daemon start` runs it in the foreground.
 
 ---
 
@@ -308,8 +308,8 @@ Only sprites `sp` knows about appear: ones you've connected to, or added with `s
 |------|-------------|
 | `--rc`, `--remote-control` | Start `claude --remote-control` as the session command |
 | `--name NAME` | tmux session name (default: first word of the command) |
-| `--exec CMD` | Command to run instead of `bash`. **Only on `sp connect`**, not the shorthand. |
-| `--no-sync` | Skip the initial upload on a new sprite. The daemon still starts ongoing sync for the directory. |
+| `--exec CMD` | Command to run instead of `bash` (on `sp connect`). Everywhere, `-- CMD...` after the target does the same: `sp . -- claude --continue`. |
+| `--no-sync` | Don't sync: no initial upload, and the directory isn't registered with the daemon for ongoing sync. Sync an earlier connect already set up keeps running (stop it from the TUI sync menu). |
 | `--keep-warm DURATION` | Hold with idle-exit instead of the session-tied hold |
 | `--no-hold` | Don't hold the sprite Active |
 | `--web`, `--web-proxy`, `--web-dev-port N` | See [Web mode](#web-mode) |
@@ -317,7 +317,6 @@ Only sprites `sp` knows about appear: ones you've connected to, or added with `s
 
 Session flags (`--name`, `--exec`, `--rc`) are ignored when reattaching to an existing session.
 
-`sp . -- claude` does not work: the `--` is consumed by flag parsing and `claude` is taken as a variant name, creating a new sprite. Use `sp connect . --exec claude`.
 
 ---
 
@@ -343,7 +342,7 @@ The connect continues without that task. Any setup can be re-run by connecting a
 
 Check the note `sp` printed during setup. "No working claude.ai login ... falling back to the inference-only setup-token" means the sprite has no usable full-scope login: log in to Claude Code locally so fresh credentials get pushed, or run `claude` then `/login` on the sprite. If `CLAUDE_CODE_OAUTH_TOKEN` is set in a pane, it masks the login; open a new pane after reconnecting.
 
-Completing `/login` inside tmux currently needs the code pasted back manually; this is being worked on.
+`/login` inside an `sp` session opens your local browser and completes without pasting a code: `sp` watches the sprite for Claude's login URL, forwards its localhost callback port for five minutes, and opens the URL. If the Sprites API is slow, the callback page can load before the forward is up; reload it. If `sp` isn't attached (for example in `sp rc`'s headless service), you'll still be asked for the code.
 
 ### Sync isn't working
 

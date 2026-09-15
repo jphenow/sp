@@ -5,13 +5,11 @@ How to run Claude Code inside a sprite with `sp`. For installation, the full com
 ## Starting Claude
 
 ```bash
-sp connect . --exec claude          # Claude as the session command
-sp connect owner/repo --exec claude # same, for a repo cloned on the sprite
+sp . -- claude                      # Claude as the session command
+sp owner/repo -- claude             # same, for a repo cloned on the sprite
 sp . --rc                           # claude --remote-control, joinable from the Claude app
 sp .                                # bash; run claude yourself in a tmux pane
 ```
-
-Use `--exec` with `sp connect`. The shorthand `sp . -- claude` doesn't work: `claude` is taken as a variant name and a new sprite is created.
 
 Each sprite has one persistent tmux session. Reconnecting reattaches to it, and Claude keeps running across disconnects, so the command you pass only matters the first time. To run another Claude alongside, open a tmux window or pane; to run one against an isolated copy of the code, use a variant (below).
 
@@ -32,7 +30,7 @@ Remote Control lets you drive a session from the Claude app or claude.ai/code. I
 - In an existing session, run `/remote-control` from inside Claude.
 - `sp rc .` runs Claude Remote Control headless as a sprite-env service that restarts after a cold wake and resumes the last session. Stop it with `sp rc . --stop`. Experimental.
 
-If `sp` prints "falling back to the inference-only setup-token", Remote Control won't work until the sprite has a real login: log in to Claude Code locally and reconnect, or run `/login` on the sprite. Completing `/login` inside tmux currently needs the code pasted back manually; this is being worked on.
+If `sp` prints "falling back to the inference-only setup-token", Remote Control won't work until the sprite has a real login: log in to Claude Code locally and reconnect, or run `/login` on the sprite. `/login` inside the session opens your local browser and completes on its own while `sp` is attached.
 
 ## Keeping the sprite reachable
 
@@ -50,8 +48,8 @@ sp keepalive . --stop
 A variant is a separate sprite for the same repo, useful for letting Claude try an approach without touching your main environment:
 
 ```bash
-sp connect . try-sqlite --exec claude
-sp connect owner/repo try-sqlite --exec claude
+sp . try-sqlite -- claude
+sp owner/repo try-sqlite -- claude
 ```
 
 A directory variant starts from a one-time upload of the files `git ls-files` reports (tracked plus untracked, minus ignored; no `.git`) and is not synced afterwards. For work you want to commit and push from the sprite, use an `owner/repo` variant, which is a full clone. Keep one with `sp pin owner/repo:try-sqlite`; clean up the rest with `sp prune` (dry run) and `sp prune --yes`, or `sp rm owner/repo:try-sqlite`.
