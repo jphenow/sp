@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -59,8 +60,19 @@ ideas without disrupting your main sprite:
   sp owner/repo   new-approach      # fresh sprite for owner/repo
 For "sp . <variant>", the current dir is uploaded once at creation but no
 ongoing sync runs — edits in the variant sprite stay in the sprite.`,
-	Args: cobra.RangeArgs(0, 2),
-	RunE: runConnect,
+	// `sp connect . -- claude` needs the same "--" handling as the shorthand;
+	// only the args before the separator count toward the target/variant limit.
+	Args: func(cmd *cobra.Command, args []string) error {
+		connectArgs, _ := splitAtDash(args, cmd.ArgsLenAtDash())
+		return cobra.RangeArgs(0, 2)(cmd, connectArgs)
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		connectArgs, command := splitAtDash(args, cmd.ArgsLenAtDash())
+		if command != "" {
+			execCmd = command
+		}
+		return runConnect(cmd, connectArgs)
+	},
 }
 
 func init() {
@@ -213,7 +225,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	// Parallel setup. Five concurrent task chains:
 	//
-	//   1. Auth chain (SetupSpriteAuth → PushClaudeCredentials if creds →
+	//   1. Auth chain (SetupSpriteAuth → SyncClaudeCredentials →
 	//      SetupGhAuth → InstallOpenWrapper). All four touch shell rc files,
 	//      so they must serialize within this chain. Internal sed -i edits
 	//      against .bashrc would race if these ran in parallel.
@@ -519,6 +531,28 @@ func setupWebServiceDirect(client *sprite.Client, spriteName string) error {
 	return nil
 }
 
+// spSourceDir returns the root of the sp module this binary was built from, so
+// --web-proxy can cross-compile sp for the sprite from any working directory.
+//
+// It used to run `go build .` in the current directory, which only worked when
+// you happened to be standing in an sp checkout — from any project you'd
+// actually want a web proxy for, it failed. runtime.Caller reports this file's
+// path as compiled, which is the checkout for `make build` / `make install` and
+// the module cache for `go install github.com/jphenow/sp@...`; both still hold
+// the source. A -trimpath build records no absolute path, and a moved or
+// deleted checkout leaves nothing to build — both get a clear error.
+func spSourceDir() (string, error) {
+	_, file, _, ok := runtime.Caller(0)
+	if ok && filepath.IsAbs(file) {
+		root := filepath.Dir(filepath.Dir(file)) // <root>/cmd/connect.go
+		if data, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil &&
+			strings.Contains(string(data), "module github.com/jphenow/sp\n") {
+			return root, nil
+		}
+	}
+	return "", fmt.Errorf("--web-proxy needs sp's Go source to build a linux binary, but it isn't where this binary was built from (%s); rebuild sp from a checkout with `make install`", file)
+}
+
 // setupWebServiceProxy uploads the sp binary to the sprite and creates a service
 // running `sp serve` as a reverse proxy with /opencode routing and dev server fallthrough.
 func setupWebServiceProxy(client *sprite.Client, spriteName string) error {
@@ -527,7 +561,12 @@ func setupWebServiceProxy(client *sprite.Client, spriteName string) error {
 
 	// Build the linux binary for the sprite
 	fmt.Println("  Building sp binary for sprite (linux/amd64)...")
+	srcDir, err := spSourceDir()
+	if err != nil {
+		return err
+	}
 	buildCmd := exec.Command("go", "build", "-o", "/tmp/sp-linux-amd64", ".")
+	buildCmd.Dir = srcDir
 	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("building sp binary: %w\n%s", err, string(out))
@@ -892,8 +931,16 @@ func registerWithDaemon(resolved *setup.ResolvedTarget, client *sprite.Client) e
 	// registered with a LocalPath, or the daemon will start an ongoing mutagen
 	// session that conflicts with the base sprite's sync. Storing the base's
 	// LocalPath on a variant would also give the daemon a sibling to watch.
+	//
+	// --no-sync withholds it for the same reason. Registering the path is
+	// what makes the daemon start sync (on upsert, and on every later wake),
+	// so passing it anyway meant --no-sync only skipped the initial upload
+	// while ongoing sync started regardless. This doesn't tear down sync an
+	// earlier connect already configured: the store keeps a previously
+	// registered path, and that sprite stays daemon-synced (see sp resync /
+	// the TUI sync menu to stop it).
 	localPath := resolved.LocalPath
-	if resolved.Variant != "" {
+	if resolved.Variant != "" || noSync {
 		localPath = ""
 	}
 
@@ -975,6 +1022,11 @@ func startSyncInline(client *sprite.Client, resolved *setup.ResolvedTarget) erro
 // `sprite attach`, which means tmux, claude, and anything else running
 // inside the session survive network drops and reconnects.
 func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token string) error {
+	// Forward Claude /login callback ports for the life of the attach, so the
+	// browser login completes on its own instead of asking for a pasted code.
+	stopLoginForwarder := startLoginCallbackForwarder(client, resolved.SpriteName, resolved.Org)
+	defer stopLoginForwarder()
+
 	// Check for an existing persistent session from a prior connect.
 	// If found, reattach directly — tmux + claude are still running.
 	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" {
@@ -990,7 +1042,7 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 // ID of the first active tmux session, or "" if none. Only matches
 // sessions whose Command column contains "tmux" to avoid accidentally
 // reattaching to stale non-interactive exec sessions (e.g. leftover
-// setup commands like FixSpriteHomePermissions that sprite-env keeps
+// setup commands like the home-permissions probe that sprite-env keeps
 // around as "Active" sessions).
 func findExistingSpriteSession(spriteName, org string) string {
 	args := []string{"sessions", "list"}

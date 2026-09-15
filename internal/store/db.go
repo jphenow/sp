@@ -201,8 +201,3 @@ func (d *DB) addColumnIfMissing(table, column, ddl string) error {
 	_, err = d.db.Exec(ddl)
 	return err
 }
-
-// SQL returns the underlying *sql.DB for advanced queries. Use sparingly.
-func (d *DB) SQL() *sql.DB {
-	return d.db
-}

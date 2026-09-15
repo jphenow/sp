@@ -290,27 +290,3 @@ func (c *Client) StopSync(name string) error {
 	_, err := c.call("stop_sync", map[string]string{"name": name})
 	return err
 }
-
-// Subscribe registers for real-time state updates from the daemon.
-// Returns a channel that receives updates. The channel is closed when
-// the connection ends.
-func (c *Client) Subscribe() (<-chan StateUpdate, error) {
-	_, err := c.call("subscribe", nil)
-	if err != nil {
-		return nil, err
-	}
-
-	ch := make(chan StateUpdate, 100)
-	go func() {
-		defer close(ch)
-		for {
-			var update StateUpdate
-			if err := c.decoder.Decode(&update); err != nil {
-				return
-			}
-			ch <- update
-		}
-	}()
-
-	return ch, nil
-}

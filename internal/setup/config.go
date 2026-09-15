@@ -280,12 +280,3 @@ func GetAlwaysFiles(conf *SetupConf) []FileEntry {
 	}
 	return always
 }
-
-// ConfModifiedSince checks if setup.conf has been modified since the given time.
-func ConfModifiedSince(confPath string, since int64) bool {
-	info, err := os.Stat(confPath)
-	if err != nil {
-		return false
-	}
-	return info.ModTime().Unix() > since
-}
