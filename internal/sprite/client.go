@@ -78,16 +78,14 @@ func (c *Client) List() ([]Info, error) {
 		}
 		args = append(args, path)
 
-		start := time.Now()
-		out, err := runCapture(args...)
-		record("api", path, start, err)
+		out, err := listPage(args)
 		if err != nil {
-			return nil, fmt.Errorf("listing sprites: %w", err)
+			return nil, err
 		}
 
 		var resp ListResponse
 		if err := json.Unmarshal(out, &resp); err != nil {
-			return nil, fmt.Errorf("parsing sprite list: %w", err)
+			return nil, fmt.Errorf("parsing sprite list (%d bytes, starting %.60q): %w", len(out), out, err)
 		}
 		all = append(all, resp.Sprites...)
 		// Follow pagination: a truncated first page would otherwise read as
@@ -97,6 +95,39 @@ func (c *Client) List() ([]Info, error) {
 		}
 		cursor = *resp.NextContinuationToken
 	}
+}
+
+// emptyBodyAttempts is how many times listPage will retry a response with no
+// body at all.
+const emptyBodyAttempts = 3
+
+// listPage fetches one page of the sprite listing, retrying when the API
+// answers with an empty body.
+//
+// An empty body arrives with a SUCCESSFUL exit status, so it isn't an error the
+// CLI reports — it surfaced as "parsing sprite list: unexpected end of JSON
+// input" and, before that error existed, as sp deciding a live sprite didn't
+// exist. It's transient (a dropped connection mid-body, or the API returning
+// nothing), so retry, and if it persists say what actually happened rather than
+// blaming the JSON.
+func listPage(args []string) ([]byte, error) {
+	var out []byte
+	for attempt := 1; attempt <= emptyBodyAttempts; attempt++ {
+		start := time.Now()
+		var err error
+		out, err = runCapture(args...)
+		record("api", args[len(args)-1], start, err)
+		if err != nil {
+			return nil, fmt.Errorf("listing sprites: %w", err)
+		}
+		if len(bytes.TrimSpace(out)) > 0 {
+			return out, nil
+		}
+		if attempt < emptyBodyAttempts {
+			time.Sleep(time.Second)
+		}
+	}
+	return nil, fmt.Errorf("listing sprites: the Sprites API returned an empty response %d times; check your network connection or api.sprites.dev", emptyBodyAttempts)
 }
 
 // Get returns a single sprite's info by name, or nil if no sprite has that name.
