@@ -1169,54 +1169,36 @@ func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID str
 		})
 	}
 
-	args := []string{"attach", sessionID}
-	if org != "" {
-		args = append(args, "-o", org)
-	}
-	args = append(args, "-s", spriteName)
-
 	binary, err := exec.LookPath("sprite")
 	if err != nil {
 		return fmt.Errorf("sprite binary not found: %w", err)
 	}
 
-	runErr := runAttachWithRetry(binary, args)
-	resetTerminal()
-	return runErr
+	return runWithReconnect(binary,
+		attachTarget{args: attachArgs(spriteName, org, sessionID), label: spriteName},
+		reattachTarget(spriteName, org))
 }
 
-// attachFailFastWindow bounds how quickly an attach must fail to be considered
-// "never got going". Past this, the user had a real session and an exit is
-// theirs, not a connection error to paper over.
-const attachFailFastWindow = 10 * time.Second
+// attachArgs builds the argv for `sprite attach` against one session.
+func attachArgs(spriteName, org, sessionID string) []string {
+	args := []string{"attach", sessionID}
+	if org != "" {
+		args = append(args, "-o", org)
+	}
+	return append(args, "-s", spriteName)
+}
 
-// runAttachWithRetry runs `sprite attach`, retrying once if it dies almost
-// immediately.
-//
-// Setup can take minutes against a degraded API, and losing all of it to a
-// connection error on the very last step is the worst possible outcome —
-// observed: six and a half minutes of successful setup, then "failed to
-// connect: read tcp ...: i/o timeout" and exit 1. The dial is the flaky part
-// (see the trace: essentially all of a call's time is spent connecting), and a
-// dial that fails fast is exactly the case a retry fixes.
-//
-// Only fast failures are retried. Once the attach has been up long enough to
-// hand the terminal over, a non-zero exit means the user's session ended and
-// re-running it would be wrong.
-func runAttachWithRetry(binary string, args []string) error {
-	for attempt := 1; ; attempt++ {
-		cmd := exec.Command(binary, args...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		start := time.Now()
-		err := cmd.Run()
-		if err == nil || attempt > 1 || time.Since(start) > attachFailFastWindow {
-			return err
+// reattachTarget re-resolves the sprite's tmux session for a reconnect attempt,
+// returning nil when the session is gone. The id is looked up again each time
+// rather than reused: the tmux session survives a dropped connection, but the
+// sprite-side session it was reached through may not have.
+func reattachTarget(spriteName, org string) func() *attachTarget {
+	return func() *attachTarget {
+		sessionID := findExistingSpriteSession(spriteName, org)
+		if sessionID == "" {
+			return nil
 		}
-		fmt.Fprintf(os.Stderr, "\nAttach failed after %s (%v) — retrying once.\n",
-			time.Since(start).Round(time.Millisecond), err)
+		return &attachTarget{args: attachArgs(spriteName, org, sessionID), label: spriteName}
 	}
 }
 
@@ -1352,14 +1334,12 @@ done
 		return fmt.Errorf("sprite binary not found: %w", err)
 	}
 
-	cmd := exec.Command(binary, args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	runErr := cmd.Run()
-	resetTerminal()
-	return runErr
+	// On a dropped connection, reconnect by ATTACHING: the tmux session this
+	// call created is still running on the sprite, and re-running the exec
+	// would start a second one.
+	return runWithReconnect(binary,
+		attachTarget{args: args, label: resolved.SpriteName},
+		reattachTarget(resolved.SpriteName, resolved.Org))
 }
 
 // localTerminalSize returns the local controlling terminal's size (rows,
@@ -1383,5 +1363,24 @@ func resetTerminal() {
 	// Disable X10 mouse reporting (mode 1000)
 	// Disable any-event mouse tracking (mode 1003)
 	// Disable SGR extended mouse mode (mode 1006)
-	fmt.Fprintf(os.Stderr, "\033[?1000l\033[?1003l\033[?1006l")
+	//
+	// The rest undoes the terminal state the sprite client sets up and normally
+	// restores itself. It can't when the connection drops and it dies
+	// abnormally, and then the damage lands on the LOCAL terminal: left in the
+	// alternate screen, a pane in tmux has no scrollback to scroll into, which
+	// looks like output cut off and a mouse wheel that does nothing. A leftover
+	// scroll region truncates the usable area the same way.
+	//
+	// Every sequence here is a no-op when that state isn't set, so this is safe
+	// to send after a clean exit too.
+	fmt.Fprintf(os.Stderr,
+		"\033[?1000l\033[?1003l\033[?1006l"+ // mouse reporting off
+			"\033[?1049l"+ // leave alternate screen (restores scrollback)
+			"\033[r"+ // reset scroll region to the full window
+			"\033[?2004l"+ // bracketed paste off
+			"\033[?1004l"+ // focus reporting off
+			"\033[<u"+ // pop kitty keyboard protocol state
+			"\033[?7h"+ // autowrap back on
+			"\033[?25h"+ // cursor visible
+			"\033[m") // reset colors and attributes
 }
