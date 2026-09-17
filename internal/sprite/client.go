@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -19,6 +21,13 @@ import (
 // "curl: (35) Recv failure: Connection reset by peer".
 func runCapture(args ...string) ([]byte, error) {
 	cmd := exec.Command("sprite", args...)
+	// Run from a neutral directory. `sprite api` reads a `.sprite` context file
+	// from the working directory (or any parent) and, when it finds one, aims
+	// the request at THAT sprite: from anywhere under a directory holding one,
+	// `api /sprites` became `/v1/sprites/<that sprite>/sprites` and returned
+	// nothing. sp always names the sprite it means, so ambient context is only
+	// ever a hazard here.
+	cmd.Dir = os.TempDir()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -56,46 +65,59 @@ func NewClient(org string) *Client {
 
 // List returns all sprites visible to the current user from the Sprites API.
 func (c *Client) List() ([]Info, error) {
-	args := []string{"api"}
-	if c.org != "" {
-		args = append(args, "-o", c.org)
-	}
-	args = append(args, "/sprites")
+	var all []Info
+	cursor := ""
+	for {
+		args := []string{"api"}
+		if c.org != "" {
+			args = append(args, "-o", c.org)
+		}
+		path := "/sprites"
+		if cursor != "" {
+			path += "?continuation_token=" + url.QueryEscape(cursor)
+		}
+		args = append(args, path)
 
-	start := time.Now()
-	out, err := runCapture(args...)
-	record("api", "/sprites", start, err)
-	if err != nil {
-		return nil, fmt.Errorf("listing sprites: %w", err)
-	}
+		start := time.Now()
+		out, err := runCapture(args...)
+		record("api", path, start, err)
+		if err != nil {
+			return nil, fmt.Errorf("listing sprites: %w", err)
+		}
 
-	var resp ListResponse
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return nil, fmt.Errorf("parsing sprite list: %w", err)
+		var resp ListResponse
+		if err := json.Unmarshal(out, &resp); err != nil {
+			return nil, fmt.Errorf("parsing sprite list: %w", err)
+		}
+		all = append(all, resp.Sprites...)
+		// Follow pagination: a truncated first page would otherwise read as
+		// "that sprite doesn't exist" and send connect off to create it.
+		if !resp.HasMore || resp.NextContinuationToken == nil || *resp.NextContinuationToken == "" {
+			return all, nil
+		}
+		cursor = *resp.NextContinuationToken
 	}
-	return resp.Sprites, nil
 }
 
-// Get returns a single sprite's info by name from the Sprites API.
+// Get returns a single sprite's info by name, or nil if no sprite has that name.
+//
+// It finds the sprite in the org listing rather than asking for the sprite
+// directly. `/v1/sprites/<name>/` is the HTTP PROXY into the sprite, not a
+// metadata endpoint: when the sprite can't be reached it answers
+// {"error":"failed to access sprite"}, which unmarshals into an empty Info with
+// no error at all. That read as "this sprite does not exist" and sent connect
+// to Create, on a sprite that was alive the whole time.
 func (c *Client) Get(name string) (*Info, error) {
-	args := []string{"api"}
-	if c.org != "" {
-		args = append(args, "-o", c.org)
-	}
-	args = append(args, "-s", name, "/")
-
-	start := time.Now()
-	out, err := runCapture(args...)
-	record("api", name+": info", start, err)
+	sprites, err := c.List()
 	if err != nil {
 		return nil, fmt.Errorf("getting sprite %q: %w", name, err)
 	}
-
-	var info Info
-	if err := json.Unmarshal(out, &info); err != nil {
-		return nil, fmt.Errorf("parsing sprite info: %w", err)
+	for i := range sprites {
+		if sprites[i].Name == name {
+			return &sprites[i], nil
+		}
 	}
-	return &info, nil
+	return nil, nil
 }
 
 // Create creates a new sprite with the given name. Returns once the sprite exists
@@ -266,22 +288,9 @@ func (c *Client) Exists(name string) (bool, error) {
 func (c *Client) ExistsInfo(name string) (*Info, bool, error) {
 	info, err := c.Get(name)
 	if err != nil {
-		// If we get an error, the sprite might not exist or there's a network issue.
-		// Check the sprite list as fallback.
-		sprites, listErr := c.List()
-		if listErr != nil {
-			return nil, false, fmt.Errorf("checking sprite existence: %w", err)
-		}
-		for _, s := range sprites {
-			if s.Name == name {
-				found := s
-				return &found, true, nil
-			}
-		}
-		return nil, false, nil
+		return nil, false, fmt.Errorf("checking sprite existence: %w", err)
 	}
-	// Guard against the API returning an empty/null JSON body that
-	// deserialises into a zero-value Info struct.
+	// Guard against a listing entry with no id.
 	if info == nil || info.ID == "" {
 		return nil, false, nil
 	}
