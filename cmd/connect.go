@@ -91,6 +91,34 @@ func init() {
 	rootCmd.AddCommand(connectCmd)
 }
 
+// adoptExistingSprite points the target at the sprite that actually exists,
+// preferring the pre-2026-09 "--" name when sp created one before the naming
+// change, and reports its info.
+//
+// sprites-api now rejects new names containing "--", so sp generates
+// single-dash names; but every sprite sp made before that has the old name and
+// must keep working. Both spellings are checked in one listing.
+func adoptExistingSprite(client *sprite.Client, resolved *setup.ResolvedTarget) (*sprite.Info, bool, error) {
+	names := []string{resolved.SpriteName}
+	if resolved.LegacyName != "" {
+		// Legacy first: an existing sprite wins over the name we'd pick today.
+		names = []string{resolved.LegacyName, resolved.SpriteName}
+	}
+	info, exists, err := client.FindFirst(names...)
+	if err != nil {
+		return nil, false, err
+	}
+	if exists && info.Name != resolved.SpriteName {
+		resolved.SpriteName = info.Name
+		if resolved.Variant != "" {
+			resolved.BaseName = strings.TrimSuffix(info.Name, "--"+resolved.Variant)
+		} else {
+			resolved.BaseName = info.Name
+		}
+	}
+	return info, exists, nil
+}
+
 // resolveTarget determines what the user wants to connect to. The second
 // positional argument, if present, is a free-form variant label that forks
 // the sprite identity (see connectCmd.Long).
@@ -169,7 +197,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	// useful number for explaining a slow connect, since a cold sprite makes
 	// the first exec pay a ~30s wake that every later call avoids.
 	connectStart := time.Now()
-	info, exists, err := client.ExistsInfo(resolved.SpriteName)
+	info, exists, err := adoptExistingSprite(client, resolved)
 	if err != nil {
 		return fmt.Errorf("checking sprite: %w", err)
 	}

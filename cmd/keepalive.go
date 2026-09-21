@@ -73,8 +73,7 @@ func runKeepalive(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving target: %w", err)
 	}
 	client := sprite.NewClient(resolved.Org)
-
-	exists, err := client.Exists(resolved.SpriteName)
+	_, exists, err := adoptExistingSprite(client, resolved)
 	if err != nil {
 		return fmt.Errorf("checking sprite: %w", err)
 	}

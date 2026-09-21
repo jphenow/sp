@@ -130,6 +130,30 @@ func listPage(args []string) ([]byte, error) {
 	return nil, fmt.Errorf("listing sprites: the Sprites API returned an empty response %d times; check your network connection or api.sprites.dev", emptyBodyAttempts)
 }
 
+// FindFirst returns the first of the given names that exists, from ONE listing.
+//
+// Used to prefer a sprite's older "--" name over the name sp would generate
+// today: "--" became a reserved separator server-side on 2026-09-17, so new
+// sprites are named with single dashes, but sprites created before that must
+// still be found. Checking both spellings in one call keeps that from costing
+// an extra round trip.
+func (c *Client) FindFirst(names ...string) (*Info, bool, error) {
+	sprites, err := c.List()
+	if err != nil {
+		return nil, false, err
+	}
+	byName := make(map[string]*Info, len(sprites))
+	for i := range sprites {
+		byName[sprites[i].Name] = &sprites[i]
+	}
+	for _, name := range names {
+		if info, ok := byName[name]; ok && info.ID != "" {
+			return info, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
 // Get returns a single sprite's info by name, or nil if no sprite has that name.
 //
 // It finds the sprite in the org listing rather than asking for the sprite
@@ -154,7 +178,9 @@ func (c *Client) Get(name string) (*Info, error) {
 // Create creates a new sprite with the given name. Returns once the sprite exists
 // but does not wait for it to be fully ready.
 func (c *Client) Create(name string) error {
-	args := []string{"create", "-skip-console"}
+	// --skip-console: the single-dash spelling is deprecated ("Warning:
+	// -skip-console is deprecated, use --skip-console instead").
+	args := []string{"create", "--skip-console"}
 	if c.org != "" {
 		args = append(args, "-o", c.org)
 	}

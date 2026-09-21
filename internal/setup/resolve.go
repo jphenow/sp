@@ -20,12 +20,17 @@ type SpriteFile struct {
 // into a sprite name and paths.
 type ResolvedTarget struct {
 	SpriteName string // computed sprite name (includes variant suffix if any)
+	LegacyName string // pre-2026-09 "--"-separated name, when it differs from SpriteName
 	BaseName   string // sprite name without the variant suffix; equals SpriteName when Variant is empty
 	Variant    string // sanitized variant label (empty for regular sprites)
 	LocalPath  string // absolute local path
 	RemotePath string // remote path on sprite (e.g., /home/sprite/flyctl)
 	Repo       string // GitHub owner/repo if applicable
 	Org        string // Fly organization if from .sprite file
+
+	// legacyBase carries the old "--" base name between resolution and
+	// applyVariant; it is never part of the resolved result.
+	legacyBase string
 }
 
 var (
@@ -37,7 +42,7 @@ var (
 
 // ResolvePath resolves a local directory path into a sprite target.
 // Priority: .sprite file > GitHub remote > directory basename.
-// An optional variant is appended to the sprite name with a "--" delimiter,
+// An optional variant is appended to the sprite name with a "-" delimiter,
 // producing a distinct sprite that shares the same BaseName.
 func ResolvePath(dir, variant string) (*ResolvedTarget, error) {
 	absDir, err := filepath.Abs(dir)
@@ -70,14 +75,15 @@ func resolveBaseName(absDir, basename string, result *ResolvedTarget) string {
 		parts := strings.SplitN(repo, "/", 2)
 		if len(parts) == 2 {
 			result.RemotePath = "/home/sprite/" + parts[1]
-			return fmt.Sprintf("gh-%s--%s", parts[0], parts[1])
+			result.legacyBase = fmt.Sprintf("gh-%s--%s", parts[0], parts[1])
+			return fmt.Sprintf("gh-%s-%s", parts[0], parts[1])
 		}
 	}
 	return "local-" + sanitizeName(basename)
 }
 
 // ResolveRepo resolves a GitHub owner/repo string into a sprite target.
-// An optional variant is appended to the sprite name with a "--" delimiter.
+// An optional variant is appended to the sprite name with a "-" delimiter.
 func ResolveRepo(ownerRepo, variant string) (*ResolvedTarget, error) {
 	parts := strings.SplitN(ownerRepo, "/", 2)
 	if len(parts) != 2 {
@@ -88,21 +94,41 @@ func ResolveRepo(ownerRepo, variant string) (*ResolvedTarget, error) {
 		RemotePath: "/home/sprite/" + repo,
 		Repo:       ownerRepo,
 	}
-	applyVariant(result, fmt.Sprintf("gh-%s--%s", owner, repo), variant)
+	result.legacyBase = fmt.Sprintf("gh-%s--%s", owner, repo)
+	applyVariant(result, fmt.Sprintf("gh-%s-%s", owner, repo), variant)
 	return result, nil
 }
 
-// applyVariant populates BaseName, Variant, and SpriteName on the target.
-// When variant is non-empty, the sprite name is `<base>--<sanitized-variant>`.
+// applyVariant populates BaseName, Variant, SpriteName and LegacyName.
+//
+// The separator is a single "-": sprites-api rejects any new name containing
+// "--" as of 2026-09-17 ("Reject reserved separators in new sprite names"),
+// because refs are becoming `cluster/sprite` and "--" is the reserved join for
+// storage and runtime ids. Every name sp used to generate is now invalid, so
+// creating any sprite failed with 400 "invalid sprite name format".
+//
+// LegacyName keeps the old spelling so sp can still find the sprites it made
+// before the change; existing names remain valid for lookup, just not for
+// creation. It's left empty when the two spellings are identical.
 func applyVariant(target *ResolvedTarget, base, variant string) {
 	target.BaseName = base
+	legacyBase := target.legacyBase
+	if legacyBase == "" {
+		legacyBase = base
+	}
+	target.legacyBase = ""
+
 	if variant == "" {
 		target.SpriteName = base
+		if legacyBase != base {
+			target.LegacyName = legacyBase
+		}
 		return
 	}
 	v := sanitizeName(variant)
 	target.Variant = v
-	target.SpriteName = base + "--" + v
+	target.SpriteName = base + "-" + v
+	target.LegacyName = legacyBase + "--" + v
 }
 
 // readSpriteFile reads and parses a .sprite file from the given directory.
@@ -155,5 +181,11 @@ func sanitizeName(name string) string {
 		"_", "-",
 		":", "-",
 	)
-	return replacer.Replace(name)
+	name = replacer.Replace(name)
+	// Collapse runs of dashes: "--" is a reserved separator server-side, so a
+	// name like "my. project" must not sanitize into "my--project".
+	for strings.Contains(name, "--") {
+		name = strings.ReplaceAll(name, "--", "-")
+	}
+	return strings.Trim(name, "-")
 }

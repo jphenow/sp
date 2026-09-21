@@ -63,6 +63,9 @@ func runRC(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving target: %w", err)
 	}
 	client := sprite.NewClient(resolved.Org)
+	if _, _, err := adoptExistingSprite(client, resolved); err != nil {
+		return fmt.Errorf("checking sprite: %w", err)
+	}
 
 	exists, err := client.Exists(resolved.SpriteName)
 	if err != nil {
