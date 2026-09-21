@@ -3,6 +3,7 @@ package setup
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -60,11 +61,11 @@ func TestResolveRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.SpriteName != "gh-superfly--flyctl" {
-		t.Errorf("sprite name = %q, want %q", result.SpriteName, "gh-superfly--flyctl")
+	if result.SpriteName != "gh-superfly-flyctl" {
+		t.Errorf("sprite name = %q, want %q", result.SpriteName, "gh-superfly-flyctl")
 	}
-	if result.BaseName != "gh-superfly--flyctl" {
-		t.Errorf("base name = %q, want %q", result.BaseName, "gh-superfly--flyctl")
+	if result.BaseName != "gh-superfly-flyctl" {
+		t.Errorf("base name = %q, want %q", result.BaseName, "gh-superfly-flyctl")
 	}
 	if result.Variant != "" {
 		t.Errorf("variant should be empty, got %q", result.Variant)
@@ -82,11 +83,11 @@ func TestResolveRepoWithVariant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.SpriteName != "gh-superfly--flyctl--auth-ideas" {
-		t.Errorf("sprite name = %q, want %q", result.SpriteName, "gh-superfly--flyctl--auth-ideas")
+	if result.SpriteName != "gh-superfly-flyctl-auth-ideas" {
+		t.Errorf("sprite name = %q, want %q", result.SpriteName, "gh-superfly-flyctl-auth-ideas")
 	}
-	if result.BaseName != "gh-superfly--flyctl" {
-		t.Errorf("base name = %q, want %q", result.BaseName, "gh-superfly--flyctl")
+	if result.BaseName != "gh-superfly-flyctl" {
+		t.Errorf("base name = %q, want %q", result.BaseName, "gh-superfly-flyctl")
 	}
 	if result.Variant != "auth-ideas" {
 		t.Errorf("variant = %q, want %q", result.Variant, "auth-ideas")
@@ -133,8 +134,8 @@ func TestResolvePathWithSpriteFileAndVariant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.SpriteName != "my-custom-sprite--scratch" {
-		t.Errorf("sprite name = %q, want %q", result.SpriteName, "my-custom-sprite--scratch")
+	if result.SpriteName != "my-custom-sprite-scratch" {
+		t.Errorf("sprite name = %q, want %q", result.SpriteName, "my-custom-sprite-scratch")
 	}
 	if result.BaseName != "my-custom-sprite" {
 		t.Errorf("base name = %q, want %q", result.BaseName, "my-custom-sprite")
@@ -175,10 +176,68 @@ func TestResolvePathFallbackWithVariant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.SpriteName != "local-my-project--try-1" {
-		t.Errorf("sprite name = %q, want %q", result.SpriteName, "local-my-project--try-1")
+	if result.SpriteName != "local-my-project-try-1" {
+		t.Errorf("sprite name = %q, want %q", result.SpriteName, "local-my-project-try-1")
 	}
 	if result.BaseName != "local-my-project" {
 		t.Errorf("base name = %q, want %q", result.BaseName, "local-my-project")
+	}
+}
+
+// sprites-api rejects any NEW name containing "--" (reserved separator, as of
+// 2026-09-17), while old names stay valid for lookup. So generated names must
+// avoid "--" entirely, and LegacyName must still spell the old one.
+func TestNamesAvoidReservedSeparator(t *testing.T) {
+	cases := []struct {
+		name       string
+		ownerRepo  string
+		variant    string
+		wantName   string
+		wantLegacy string
+	}{
+		{"repo", "superfly/flyctl", "", "gh-superfly-flyctl", "gh-superfly--flyctl"},
+		{"repo with variant", "superfly/sprites-api", "red", "gh-superfly-sprites-api-red", "gh-superfly--sprites-api--red"},
+		{"repo with dashes", "superfly/sprite-env", "blue", "gh-superfly-sprite-env-blue", "gh-superfly--sprite-env--blue"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := ResolveRepo(c.ownerRepo, c.variant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.SpriteName != c.wantName {
+				t.Errorf("SpriteName = %q, want %q", got.SpriteName, c.wantName)
+			}
+			if got.LegacyName != c.wantLegacy {
+				t.Errorf("LegacyName = %q, want %q", got.LegacyName, c.wantLegacy)
+			}
+			if strings.Contains(got.SpriteName, "--") {
+				t.Errorf("SpriteName %q contains the reserved separator", got.SpriteName)
+			}
+		})
+	}
+}
+
+// A variant or directory name that sanitizes into a double dash would be
+// rejected by the API just the same.
+func TestSanitizeCollapsesDashes(t *testing.T) {
+	cases := map[string]string{
+		"my. project": "my-project",
+		"a__b":        "a-b",
+		"weird..name": "weird-name",
+		"-leading":    "leading",
+		"trailing-":   "trailing",
+	}
+	for in, want := range cases {
+		if got := sanitizeName(in); got != want {
+			t.Errorf("sanitizeName(%q) = %q, want %q", in, got, want)
+		}
+	}
+	got, err := ResolveRepo("superfly/flyctl", "my. idea")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got.SpriteName, "--") {
+		t.Errorf("SpriteName %q contains the reserved separator", got.SpriteName)
 	}
 }

@@ -79,6 +79,9 @@ Target defaults to "." (current directory).`,
 		}
 
 		client := sprite.NewClient(resolved.Org)
+		if _, _, err := adoptExistingSprite(client, resolved); err != nil {
+			return fmt.Errorf("checking sprite: %w", err)
+		}
 		out, err := client.Sessions(resolved.SpriteName)
 		if err != nil {
 			fmt.Println("No active tmux sessions")

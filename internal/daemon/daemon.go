@@ -909,7 +909,12 @@ func (d *Daemon) handleImport(params json.RawMessage) Response {
 		Status:    info.Status,
 	}
 
-	// Infer remote path and repo from name
+	// Infer remote path and repo from name. Only works for the pre-2026-09
+	// "gh-owner--repo" spelling: names generated since then use single dashes
+	// (the API reserved "--"), and "gh-superfly-sprite-env" can't be split back
+	// into owner and repo unambiguously. Sprites sp creates are registered by
+	// connect with these fields already set; this only affects `sp import` of a
+	// newer sprite, which lands without Repo/RemotePath.
 	if strings.HasPrefix(info.Name, "gh-") {
 		parts := strings.SplitN(strings.TrimPrefix(info.Name, "gh-"), "--", 2)
 		if len(parts) == 2 {
