@@ -272,3 +272,74 @@ func writeTarFile(tw *tar.Writer, srcPath, relName string, info os.FileInfo) err
 	}
 	return nil
 }
+
+// claudeLauncherRepairMarker prefixes the one line the repair snippet prints
+// when it actually repoints a launcher, so the caller can surface that without
+// having to interpret anything else the remote script wrote.
+const claudeLauncherRepairMarker = "sp-launcher-repaired: "
+
+// claudeLauncherRepairScript returns a shell snippet that repoints a stale
+// ~/.local/bin/claude at the newest Claude-managed build.
+//
+// Some sprite images bake a pinned claude binary under
+// ~/.local/share/sprite-agents/claude/ and point the launcher straight at it.
+// `claude update` then downloads correctly into ~/.local/share/claude/versions/
+// but won't touch a launcher that isn't already a symlink into versions/, so
+// updating is inert: the sprite keeps running the pinned build while unused
+// downloads pile up (855MB of them on one sprite here). Repointing is the whole
+// fix — a managed launcher is itself just a symlink into versions/, so there is
+// nothing to download.
+//
+// Deliberately narrow, and silent unless it does something:
+//
+//   - Acts only when the launcher resolves into sprite-agents/. A genuine
+//     launcher, a hand-rolled wrapper, or no file at all is left alone.
+//   - Repoints in ONE command. Unlinking first would leave no claude on PATH,
+//     with nothing to recreate it until the next `claude update`.
+//   - Picks the newest EXECUTABLE entry in version order. A lexical max sorts
+//     2.1.9 above 2.1.287, and a non-executable entry is a partial download
+//     rather than something to aim a launcher at.
+//   - Does nothing when versions/ is missing or empty: fetching an installer
+//     is not a thing to do on someone's connect path.
+//   - Cannot fail its host script. This rides the settings merge, and the
+//     settings merge matters more than the repair.
+func claudeLauncherRepairScript() string {
+	return `
+( set -e
+  L="$HOME/.local/bin/claude"
+  [ -L "$L" ] || exit 0
+  # The stored target, not readlink -f: -f additionally resolves symlinks in
+  # the PATH PREFIX (so a $HOME with a linked component stops matching) and on
+  # BSD it fails outright on a dangling link — which is the most broken state
+  # of all, the pinned binary deleted and no working claude at all. Both forms
+  # of $HOME are matched since either can appear in the stored path.
+  T=$(readlink "$L" 2>/dev/null) || exit 0
+  [ -n "$T" ] || exit 0
+  H=$(cd "$HOME" 2>/dev/null && pwd -P) || H="$HOME"
+  case "$T" in
+    "$HOME/.local/share/sprite-agents/claude/"*) ;;
+    "$H/.local/share/sprite-agents/claude/"*) ;;
+    *) exit 0 ;;
+  esac
+  V="$HOME/.local/share/claude/versions"
+  [ -d "$V" ] || exit 0
+  N=$(ls -1 "$V" 2>/dev/null | sort -rV | while read -r v; do
+        [ -x "$V/$v" ] && { echo "$v"; break; }
+      done)
+  [ -n "$N" ] || exit 0
+  ln -sfn "$V/$N" "$L"
+  echo "` + claudeLauncherRepairMarker + `$N"
+) 2>/dev/null || true
+`
+}
+
+// ReportClaudeLauncherRepair surfaces the repair, if one happened, from the
+// output of the script the snippet was composed into. Worth a line: it explains
+// why the sprite's claude version changed out from under the user.
+func ReportClaudeLauncherRepair(out []byte) {
+	for _, line := range strings.Split(string(out), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), claudeLauncherRepairMarker); ok {
+			progress.Warnf("Repaired a stale Claude launcher on the sprite; it now runs %s. Older builds under ~/.local/share/claude/versions/ are left in place.", v)
+		}
+	}
+}
