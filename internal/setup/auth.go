@@ -490,11 +490,25 @@ chmod 600 ~/.config/gh/config.yml 2>/dev/null || true
 // extract and SyncClaudeCredentials uses a base64 shell redirect — both run as
 // the sprite user. The only ownership issue is the dirs themselves (created by
 // sprite-exec file uploads as ubuntu).
+//
+// One sudo rather than four. Each invocation faults in its own binary, PAM
+// modules and sudoers before doing any work, which dominates on a cold sprite
+// where all of that comes off the network-backed volume: measured on one
+// sprite, the first pass took 1198ms against 62ms once warm, and dropping to a
+// single invocation took the warm pass from 52.7ms to 18.2ms. The chowns are
+// then backgrounded so their metadata faults overlap instead of serializing.
+//
+// Four PARALLEL sudos — the obvious reading of "parallelize this" — measured
+// WORSE than the sequential four it replaced, since the concurrent
+// invocations contend for exactly the cold I/O that makes sudo slow here. The
+// win is fewer invocations first and overlap second.
 const HomePermissionsScript = `
-sudo -n chown sprite:sprite /home/sprite 2>/dev/null || true
-sudo -n chmod 755 /home/sprite 2>/dev/null || true
-sudo -n chown sprite:sprite /home/sprite/.claude 2>/dev/null || true
-sudo -n chown sprite:sprite /home/sprite/.ssh 2>/dev/null || true
+sudo -n sh -c '
+chown sprite:sprite /home/sprite &
+chown sprite:sprite /home/sprite/.claude &
+chown sprite:sprite /home/sprite/.ssh &
+chmod 755 /home/sprite &
+wait' 2>/dev/null || true
 `
 
 // SetupSpriteAuth provisions SSH keys, claude.json onboarding bypass, and
