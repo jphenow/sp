@@ -648,11 +648,32 @@ func EnsureRunning() (string, error) {
 		logFile = os.Stderr // fallback
 	}
 
-	// Fork ourselves with the daemon subcommand
+	// Detach from the terminal properly, which means two things.
+	//
+	// stdin must not be the user's tty. It used to be os.Stdin, so the daemon
+	// and everything it spawns — `sprite proxy`, mutagen, and mutagen's ssh —
+	// inherited the terminal of whichever `sp` happened to start the daemon.
+	// An ssh prompting for a key passphrase then reads from that terminal,
+	// competing with the session running in the foreground: observed as a
+	// passphrase prompt bleeding into a Claude session on the sprite with only
+	// every fifth or tenth keystroke surviving, the rest eaten by ssh.
+	//
+	// Setsid puts the daemon in its own session with no controlling terminal.
+	// Without it the daemon sits in the FOREGROUND process group of that tty,
+	// so it takes the user's Ctrl-C along with the session, and its children
+	// can still reach the terminal by opening /dev/tty even with stdin
+	// redirected.
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return "", fmt.Errorf("opening %s for the daemon's stdin: %w", os.DevNull, err)
+	}
+	defer devNull.Close()
+
 	attr := &os.ProcAttr{
 		Dir:   "/",
 		Env:   os.Environ(),
-		Files: []*os.File{os.Stdin, logFile, logFile},
+		Files: []*os.File{devNull, logFile, logFile},
+		Sys:   &syscall.SysProcAttr{Setsid: true},
 	}
 
 	proc, err := os.StartProcess(exe, []string{exe, "daemon", "start"}, attr)
