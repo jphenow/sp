@@ -168,11 +168,12 @@ func readClaudeCredentialsFile() []byte {
 	return data
 }
 
-// EnsureSpriteClaudeSettings merges bypass-permissions defaults into the
-// sprite's ~/.claude/settings.json. This is sprite-scoped — the user's
-// local settings.json is never modified. PushClaudeConfig runs first
-// and drops the local settings.json onto the sprite verbatim; this
-// function then augments it with sprite-specific bypass defaults.
+// EnsureSpriteClaudeSettings fixes up the sprite's Claude installation: it
+// merges bypass-permissions defaults into ~/.claude/settings.json, rewrites
+// paths that only make sense on the local machine, and repairs a stale
+// launcher. All sprite-scoped — the user's local config is never modified.
+// PushClaudeConfig runs first and drops local config onto the sprite verbatim;
+// this function then makes it work there.
 //
 // Two fields are merged under `permissions`:
 //
@@ -204,6 +205,14 @@ func EnsureSpriteClaudeSettings(client *sprite.Client, spriteName string) error 
 	//      "/Users/jon/.claude/statusline-command.sh" wouldn't exist on
 	//      the sprite without this fixup.
 	//   3. Writes the result back with indent for readability.
+	//
+	// The launcher repair is appended after the python, not before: it rides
+	// this call rather than paying its own dial (a sprite call is almost all
+	// connect cost), and running it last means it cannot stop the settings
+	// from being written. It is also why this function, unlike
+	// PushClaudeConfig, is the right host — PushClaudeConfig returns early
+	// when there is no local config to push, and a sprite's broken launcher
+	// has nothing to do with whether this machine has config worth sending.
 	script := fmt.Sprintf(`mkdir -p ~/.claude
 python3 <<'PYEOF'
 import json, os, re
@@ -254,11 +263,13 @@ for pf, deep in plugin_files:
     except Exception:
         pass  # best-effort; missing file is fine
 PYEOF
+`+claudeLauncherRepairScript()+`
 `, home)
-	_, err := client.Exec(sprite.ExecOptions{
+	out, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
 		Command: []string{"sh", "-c", script},
 	})
+	ReportClaudeLauncherRepair(out)
 	return err
 }
 
@@ -479,11 +490,25 @@ chmod 600 ~/.config/gh/config.yml 2>/dev/null || true
 // extract and SyncClaudeCredentials uses a base64 shell redirect — both run as
 // the sprite user. The only ownership issue is the dirs themselves (created by
 // sprite-exec file uploads as ubuntu).
+//
+// One sudo rather than four. Each invocation faults in its own binary, PAM
+// modules and sudoers before doing any work, which dominates on a cold sprite
+// where all of that comes off the network-backed volume: measured on one
+// sprite, the first pass took 1198ms against 62ms once warm, and dropping to a
+// single invocation took the warm pass from 52.7ms to 18.2ms. The chowns are
+// then backgrounded so their metadata faults overlap instead of serializing.
+//
+// Four PARALLEL sudos — the obvious reading of "parallelize this" — measured
+// WORSE than the sequential four it replaced, since the concurrent
+// invocations contend for exactly the cold I/O that makes sudo slow here. The
+// win is fewer invocations first and overlap second.
 const HomePermissionsScript = `
-sudo -n chown sprite:sprite /home/sprite 2>/dev/null || true
-sudo -n chmod 755 /home/sprite 2>/dev/null || true
-sudo -n chown sprite:sprite /home/sprite/.claude 2>/dev/null || true
-sudo -n chown sprite:sprite /home/sprite/.ssh 2>/dev/null || true
+sudo -n sh -c '
+chown sprite:sprite /home/sprite &
+chown sprite:sprite /home/sprite/.claude &
+chown sprite:sprite /home/sprite/.ssh &
+chmod 755 /home/sprite &
+wait' 2>/dev/null || true
 `
 
 // SetupSpriteAuth provisions SSH keys, claude.json onboarding bypass, and
