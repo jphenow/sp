@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/jphenow/sp/internal/keepalive"
 	"github.com/jphenow/sp/internal/sprite"
 )
 
@@ -80,7 +81,7 @@ func runRC(cmd *cobra.Command, args []string) error {
 			Sprite:  resolved.SpriteName,
 			Command: []string{"sprite-env", "services", "delete", rcServiceName},
 		})
-		stopKeepAlive(client, resolved.SpriteName, resolved.Org)
+		keepalive.Stop(client, resolved.SpriteName, resolved.Org)
 		fmt.Printf("Stopped Remote Control service and released the hold on sprite %q.\n", resolved.SpriteName)
 		return nil
 	}
@@ -120,7 +121,11 @@ func runRC(cmd *cobra.Command, args []string) error {
 	}
 
 	// Hold the sprite Active so Remote Control stays connected and reachable.
-	if err := launchKeepAlive(resolved.SpriteName, resolved.Org, rcFor, "", ""); err != nil {
+	if err := keepalive.Start(keepalive.Options{
+		Sprite: resolved.SpriteName,
+		Org:    resolved.Org,
+		For:    rcFor,
+	}); err != nil {
 		fmt.Printf("Warning: Remote Control service started but keepalive failed: %v\n", err)
 	}
 

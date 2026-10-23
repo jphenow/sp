@@ -167,6 +167,61 @@ sp . --web --web-proxy --web-dev-port 3000  # /opencode -> opencode, /* -> port 
 
 ---
 
+## The hub — reviving sprites from a phone
+
+A laptop losing its connection lets sprites idle-pause, and there is no good way
+to bring one back from a phone. `sp hub` runs a small web app on one sprite that
+lists every sprite in the org and offers the revival ladder on each: wake the
+machine, start Claude, hold it Active, hand it to Remote Control.
+
+```bash
+sp hub deploy my-hub                      # build, upload and start the hub
+sp hub install gh-owner-repo --hub-url …  # install the reporting agent on a sprite
+```
+
+`deploy` cross-compiles `sp` for linux/amd64 (same requirement as `--web-proxy`),
+uploads it, and registers a `sp-hub` sprite-env service with an HTTP port — so an
+HTTP request wakes the hub itself. The page is served at the hub sprite's own URL,
+which is already behind the Sprites org login; it is private without any extra
+auth. Open it on a phone and tap.
+
+### Why there is an agent
+
+Asking a sprite anything wakes it. Without help, the page could only show what the
+org listing already knows (the machine state) and would have to wake a sprite just
+to learn whether Claude is alive — waking the whole fleet on every page load.
+
+The optional agent inverts that. `sp hub install` registers a `sp-hub-agent`
+sprite-env service that reports tmux, Claude, Remote Control and hold state *while
+its sprite happens to be awake*, so the page shows last-known state with an age and
+costs one API call for the whole list. It also reports resumable Claude sessions,
+which is what makes `--resume` usable from a phone: without it, finding out what
+could be resumed costs most of what resuming would have.
+
+A cold machine's report is ignored rather than shown — a cold restart resets the
+process namespace, so a report claiming Claude was alive describes a process that
+no longer exists.
+
+The agent posts to the hub URL with a Sprites org token (`--token`, or
+`$SPRITE_API_TOKEN`), which sprite-auth URLs accept alongside browser logins.
+
+### Repairing an expired login
+
+The `/login` browser flow redirects to `localhost`, which a phone cannot reach — so
+a sprite whose Claude credentials expired is stuck when there is no laptop around.
+`sp hub deploy --vault` uploads this machine's Claude credentials to the hub, which
+adds a "fix auth" button that re-installs them on a sprite. It is off unless you
+pass the flag, because it means your credentials live on that sprite.
+
+### Holds
+
+The hub takes the hold, not the page. A phone browser is not a reliable heartbeat —
+iOS suspends background tabs, which would drop the hold exactly when you put the
+phone down mid-task. Holds use the same Tasks API heartbeat as `sp keepalive` and
+self-release at the deadline (`--hold-for`, default 1h).
+
+---
+
 ## File sync
 
 Directory targets (except variants) are synced by the daemon with Mutagen in `two-way-safe` mode: a file changed on both sides becomes a conflict instead of being overwritten. Mutagen connects over `sprite proxy` to an `sshd` that `sp` installs on the sprite, using a `sprite-mutagen-<name>` entry it adds to `~/.ssh/config`. The Mutagen session is named `sprite-<name>`.
@@ -298,6 +353,10 @@ Only sprites `sp` knows about appear: ones you've connected to, or added with `s
 | `sp rm <sprite-or-variant>` | Destroy and untrack (`--force` for non-variants or pinned) |
 | `sp daemon start\|stop\|status\|restart\|logs` | Manage the daemon |
 | `sp serve` | The reverse proxy used by `--web-proxy`; runs on the sprite |
+| `sp hub deploy <sprite>` | Build and start the hub web app on a sprite (`--vault`) |
+| `sp hub install <sprite>` | Install the reporting agent (`--hub-url`, `--token`) |
+| `sp hub serve` | The hub web app; runs on the hub sprite |
+| `sp hub agent` | The reporting agent; runs on a watched sprite |
 | `sp completion <shell>` | Shell completion script |
 
 `<sprite-or-variant>` is a sprite name or `owner/repo:variant`.
