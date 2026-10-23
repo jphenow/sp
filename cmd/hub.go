@@ -3,6 +3,7 @@ package cmd
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -235,12 +236,47 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\nHub running on sprite %q.\n", spriteName)
-	if info, err := client.Get(spriteName); err == nil && info != nil && info.URL != "" {
-		fmt.Printf("  %s\n", info.URL)
-		fmt.Printf("\nInstall the reporting agent on sprites you want detail for:\n")
-		fmt.Printf("  sp hub install <sprite> --hub-url %s\n", info.URL)
+	url, err := hubServiceURL(client, spriteName)
+	if err != nil {
+		fmt.Printf("  (could not read the service URL: %v)\n", err)
+		return nil
 	}
+	fmt.Printf("  %s\n", url)
+	fmt.Printf("\nInstall the reporting agent on sprites you want detail for:\n")
+	fmt.Printf("  sp hub install <sprite> --hub-url %s\n", url)
 	return nil
+}
+
+// hubServiceURL reads the public URL of the hub service.
+//
+// Each service gets its own hostname — the sprite's own URL points at whatever
+// service is primary, which for a sprite that already ran something else is not
+// the hub. Reporting the sprite URL sent you to the wrong app.
+func hubServiceURL(client *sprite.Client, spriteName string) (string, error) {
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Org:     hubOrg,
+		Command: []string{"sprite-env", "services", "get", hubServiceName},
+	})
+	if err != nil {
+		return "", fmt.Errorf("reading the hub service: %w", err)
+	}
+	var svc struct {
+		PublicURL string `json:"public_url"`
+		Service   struct {
+			PublicURL string `json:"public_url"`
+		} `json:"service"`
+	}
+	if err := json.Unmarshal(out, &svc); err != nil {
+		return "", fmt.Errorf("parsing the service description: %w", err)
+	}
+	if svc.PublicURL != "" {
+		return svc.PublicURL, nil
+	}
+	if svc.Service.PublicURL != "" {
+		return svc.Service.PublicURL, nil
+	}
+	return "", fmt.Errorf("the service description carried no public URL")
 }
 
 // runHubInstall uploads sp to a sprite and registers the reporting agent.
