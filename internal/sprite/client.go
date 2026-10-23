@@ -410,8 +410,13 @@ SUM=%[5]s
 SUDO=
 [ -w "$DIR" ] || SUDO=sudo
 $SUDO mkdir -p "$DIR"
-gunzip -c "$SRC" | $SUDO tee "$DEST" > /dev/null
-$SUDO chmod +x "$DEST"
+# Write beside the target and rename over it. A service already running this
+# binary holds its inode open, and truncating that in place fails with
+# ETXTBSY ("Text file busy"); rename swaps the path atomically while the
+# running process keeps the old inode until it restarts.
+gunzip -c "$SRC" | $SUDO tee "$DEST.new" > /dev/null
+$SUDO chmod +x "$DEST.new"
+$SUDO mv -f "$DEST.new" "$DEST"
 printf '%%s' "$SUM" | $SUDO tee "$STAMP" > /dev/null
 # Best-effort cleanup: uploads land owned by another user in a sticky /tmp, so
 # an unprivileged rm fails with "Operation not permitted". The staged file is
