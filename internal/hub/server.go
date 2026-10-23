@@ -298,6 +298,10 @@ func (s *Server) runAction(req actionRequest) error {
 		s.cfg.Store.DropReport(req.Sprite)
 		return s.actions.StartRemote(req.Sprite, req.Dir)
 
+	case "t3":
+		s.cfg.Store.DropReport(req.Sprite)
+		return s.actions.StartT3(req.Sprite, s.cfg.HoldFor)
+
 	case "credentials":
 		creds, ok := s.vaultCopy()
 		if !ok {
