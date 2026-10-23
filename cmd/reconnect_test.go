@@ -109,3 +109,16 @@ func TestRunWithReconnect(t *testing.T) {
 		}
 	})
 }
+
+// TestSprites2ReconnectRefusalIsTransportFailure covers the message Sprites 2
+// emits when it declines to reconnect an exec with stdin attached. It names no
+// socket error, so none of the older markers matched and sp ended the session
+// instead of reattaching.
+func TestSprites2ReconnectRefusalIsTransportFailure(t *testing.T) {
+	stderr := "Error: connection to exec session tun-TtCSy4H9KaOQUj04 was lost " +
+		"while stdin was attached; refusing unsafe automatic reconnect because " +
+		"input delivery is uncertain: exit status 1"
+	if !isTransportFailure(stderr) {
+		t.Fatal("the Sprites 2 reconnect refusal should count as a transport failure")
+	}
+}

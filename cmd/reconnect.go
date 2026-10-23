@@ -54,6 +54,14 @@ var transportErrorMarkers = []string{
 	"tls handshake",
 	"client.timeout exceeded",
 	"context deadline exceeded",
+	// Sprites 2 refuses to reconnect an exec by itself when stdin is attached,
+	// because it cannot prove keystrokes were delivered. For sp that refusal is
+	// still a dropped connection and still worth retrying: sp attaches to a
+	// tmux session, so the session state lives on the sprite and a fresh attach
+	// picks it up intact — the uncertain input the CLI is protecting is a
+	// keystroke in flight, not the work.
+	"was lost while stdin was attached",
+	"refusing unsafe automatic reconnect",
 }
 
 // isTransportFailure reports whether captured stderr indicates a dropped
