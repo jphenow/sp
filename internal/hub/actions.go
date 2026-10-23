@@ -29,6 +29,10 @@ const (
 	// t3ServiceName is the sprite-env service that keeps the sprite joined to
 	// the T3 relay.
 	t3ServiceName = "sp-t3"
+	// t3BinGlob finds the T3 executable. Its launcher installs a self-
+	// contained binary under a version directory, so the path moves with each
+	// upgrade and has to be resolved at run time rather than pinned.
+	t3BinGlob = "$(ls -1d $HOME/.t3/runtime/versions/*/t3 2>/dev/null | tail -1)"
 	// agentHome is the home directory the agent reads Claude's transcripts
 	// from. Services start with no HOME, so it is passed in.
 	agentHome = "/home/sprite"
@@ -216,13 +220,23 @@ func (a *Actions) StartT3(spriteName string, hold time.Duration) error {
 		Command: []string{"sprite-env", "services", "delete", t3ServiceName},
 	})
 
-	// HOME matters more than usual here: T3's relay credentials live under the
-	// home directory, and a service that starts without one would come up
-	// unauthenticated and sit there failing to join.
+	// HOME matters more than usual here: T3 keeps its runtime, its relay
+	// client and its credentials under the home directory, and a service that
+	// starts without one would come up unable to find any of them.
 	env := fmt.Sprintf("HOME=%s,PATH=%s", agentHome, agentPath)
+
+	// `yes` answers the prompt T3 raises when its relay client is missing
+	// ("Download and install version ...? (y/N)"). A service has no terminal,
+	// so unanswered it defaults to no and connect exits having done nothing —
+	// which looks exactly like a service that started and failed silently.
+	//
+	// The binary is resolved by glob rather than run through npx: npx would
+	// re-resolve and possibly re-download the launcher on every restart, and
+	// a cold-woken sprite restarting its services is the common case here.
+	run := fmt.Sprintf("yes y | %s connect", t3BinGlob)
 	createCmd := fmt.Sprintf(
 		"sprite-env services create %s --restart always --env %s -- /bin/sh -lc %s",
-		t3ServiceName, shellQuote(env), shellQuote("npx -y t3 connect"),
+		t3ServiceName, shellQuote(env), shellQuote(run),
 	)
 	if out, err := a.client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
