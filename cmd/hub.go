@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +33,12 @@ const (
 	hubVaultPath = "/home/sprite/.config/sp/hub-vault.json"
 	// spRemotePath is where the sp binary is installed on a sprite.
 	spRemotePath = "/usr/local/bin/sp"
+	// spriteCLIDir is where the public installer puts the sprite CLI. It is
+	// already on a sprite's PATH, and unlike /usr/local/bin it needs no sudo.
+	spriteCLIDir = "/home/sprite/.local/bin"
+	// spriteCLIInstaller is the public one-line installer for the sprite CLI,
+	// which sprites do not ship with.
+	spriteCLIInstaller = "https://sprites.dev/install.sh"
 )
 
 var (
@@ -110,6 +117,7 @@ func init() {
 	hubAgentCmd.Flags().DurationVar(&hubAgentEvery, "interval", time.Minute, "how often to report")
 
 	hubDeployCmd.Flags().StringVar(&hubOrg, "org", "", "Sprites organization (default: the CLI default)")
+	hubDeployCmd.Flags().StringVar(&hubToken, "token", "", "sprite CLI token for the hub (default: $SPRITE_API_TOKEN)")
 	hubDeployCmd.Flags().BoolVar(&hubUseVault, "vault", false, "also upload this machine's Claude credentials so the hub can repair expired logins")
 
 	hubInstallCmd.Flags().StringVar(&hubOrg, "org", "", "Sprites organization (default: the CLI default)")
@@ -217,15 +225,22 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if err := installSpriteCLI(client, spriteName); err != nil {
+		return err
+	}
+
 	client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
 		Org:     hubOrg,
 		Command: []string{"sprite-env", "services", "delete", hubServiceName},
 	})
 
+	// Services do not source a login profile, so the hub would not find the
+	// sprite CLI or its config without being told where both live.
+	env := fmt.Sprintf("HOME=/home/sprite,PATH=%s:/usr/local/bin:/usr/bin:/bin", spriteCLIDir)
 	createCmd := fmt.Sprintf(
-		"sprite-env services create %s --cmd /usr/local/bin/sp --args %s --http-port %d --duration 10s",
-		hubServiceName, serveArgs, hubPort,
+		"sprite-env services create %s --cmd /usr/local/bin/sp --args %s --env %s --http-port %d --duration 10s",
+		hubServiceName, serveArgs, env, hubPort,
 	)
 	if out, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
@@ -277,6 +292,60 @@ func hubServiceURL(client *sprite.Client, spriteName string) (string, error) {
 		return svc.Service.PublicURL, nil
 	}
 	return "", fmt.Errorf("the service description carried no public URL")
+}
+
+// installSpriteCLI puts the sprite CLI on the hub and authenticates it.
+//
+// Sprites do not ship the CLI — /.sprite/bin has fly, flyctl and sprite-env,
+// but not sprite — and sprite-env's own cross-sprite commands only reach
+// sprites that this one created, so they cannot drive an existing fleet. The
+// hub therefore needs the real CLI and a token of its own.
+//
+// Installing is skipped when the CLI is already present and authenticated, so
+// a redeploy does not re-download it or need the token again.
+func installSpriteCLI(client *sprite.Client, spriteName string) error {
+	probe, _ := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Org:     hubOrg,
+		Command: []string{"sh", "-lc", spriteCLIDir + "/sprite list >/dev/null 2>&1 && echo READY || echo MISSING"},
+	})
+	if strings.Contains(string(probe), "READY") {
+		fmt.Println("Sprite CLI already installed and authenticated.")
+		return nil
+	}
+
+	if hubToken == "" {
+		hubToken = os.Getenv("SPRITE_API_TOKEN")
+	}
+	if hubToken == "" {
+		return fmt.Errorf("the hub needs its own sprite CLI token: pass --token or set SPRITE_API_TOKEN\n" +
+			"generate one with 'sprite org auth' locally; it looks like org-slug/org-id/token-id/token-value")
+	}
+
+	fmt.Println("Installing and authenticating the sprite CLI on the hub...")
+	script := fmt.Sprintf(`set -e
+export SPRITE_INSTALL_BIN_DIR=%[1]s
+mkdir -p "$SPRITE_INSTALL_BIN_DIR"
+if [ ! -x "$SPRITE_INSTALL_BIN_DIR/sprite" ]; then
+  curl -fsSL %[2]s | sh >/dev/null 2>&1
+fi
+"$SPRITE_INSTALL_BIN_DIR/sprite" auth setup --token %[3]s >/dev/null
+"$SPRITE_INSTALL_BIN_DIR/sprite" list >/dev/null
+`, spriteCLIDir, spriteCLIInstaller, shellQuoteArg(hubToken))
+
+	if out, err := client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Org:     hubOrg,
+		Command: []string{"sh", "-c", script},
+	}); err != nil {
+		return fmt.Errorf("installing the sprite CLI on %s: %w\n%s", spriteName, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// shellQuoteArg wraps a value in single quotes for safe use in a shell command.
+func shellQuoteArg(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // runHubInstall uploads sp to a sprite and registers the reporting agent.
