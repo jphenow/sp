@@ -26,6 +26,12 @@ const (
 	rcServiceName = "sp-rc"
 	// spRemotePath is where the sp binary is installed on a sprite.
 	spRemotePath = "/usr/local/bin/sp"
+	// agentHome is the home directory the agent reads Claude's transcripts
+	// from. Services start with no HOME, so it is passed in.
+	agentHome = "/home/sprite"
+	// agentPath is the PATH the agent runs with. It needs tmux, and services
+	// start with a PATH that may not include the sprite's own bin directories.
+	agentPath = "/home/sprite/.local/bin:/usr/local/bin:/usr/bin:/bin"
 )
 
 // Actions performs ladder operations on sprites, on behalf of the hub page.
@@ -210,14 +216,20 @@ func (a *Actions) InstallAgent(opts InstallAgentOptions) error {
 		Command: []string{"sprite-env", "services", "delete", AgentServiceName},
 	})
 
-	// The token is passed through the service environment rather than on the
-	// command line, where it would show up in every process listing on the
-	// sprite.
+	// The token goes in the service environment rather than on the command
+	// line, where it would show up in every process listing on the sprite.
+	//
+	// HOME and PATH have to be set explicitly too: services don't source a
+	// login profile, and without them the agent can't find the home directory
+	// holding Claude's transcripts (so it reports no resumable sessions) or
+	// the tmux binary (so it reports tmux as down on a sprite where it is up).
+	env := fmt.Sprintf("SP_HUB_TOKEN=%s,HOME=%s,PATH=%s",
+		opts.Token, agentHome, agentPath)
 	createCmd := fmt.Sprintf(
-		"sprite-env services create %s --cmd /usr/local/bin/sp --args %s --env SP_HUB_TOKEN=%s --duration 10s",
+		"sprite-env services create %s --cmd /usr/local/bin/sp --args %s --env %s --duration 10s",
 		AgentServiceName,
 		fmt.Sprintf("hub,agent,--hub-url,%s,--sprite,%s", opts.HubURL, opts.Sprite),
-		shellQuote(opts.Token),
+		shellQuote(env),
 	)
 	if out, err := a.client.Exec(sprite.ExecOptions{
 		Sprite:  opts.Sprite,
