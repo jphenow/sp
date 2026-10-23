@@ -25,8 +25,17 @@ const pageHTML = `<!doctype html>
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body {
-    margin: 0; padding: 0 16px 48px; background: var(--bg); color: var(--text);
+    margin: 0 auto; max-width: 1500px; padding: 0 16px 48px;
+    background: var(--bg); color: var(--text);
     font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  /* One column on a phone, because that is the screen the ladder buttons were
+     sized for. On a desktop the same cards tile instead: a fleet this size is
+     mostly idle sprites, and reading them as a single stack means scrolling
+     past dozens of cards to reach the few that are running. */
+  main { display: grid; gap: 10px; grid-template-columns: 1fr; align-items: start; }
+  @media (min-width: 760px) {
+    main { grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
   }
   header {
     position: sticky; top: 0; z-index: 2; background: var(--bg);
@@ -37,7 +46,7 @@ const pageHTML = `<!doctype html>
   .meta { color: var(--dim); font-size: 12px; margin-left: auto; }
   .card {
     background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-    padding: 12px 14px; margin-top: 10px;
+    padding: 12px 14px;
   }
   .card.watched { border-color: var(--accent); }
   .row { display: flex; align-items: center; gap: 8px; }
