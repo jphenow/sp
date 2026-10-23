@@ -194,6 +194,13 @@ func (a *Actions) StartRemote(spriteName, dir string) error {
 
 // StartT3 brings the sprite back onto the T3 relay and holds it Active.
 //
+// Two T3 commands are involved and only one of them runs here. `t3 connect`
+// authorizes the machine against a T3 account; it is interactive, it is done
+// once, and it exits. `t3 serve` is the process that actually makes the
+// machine reachable, and it is what this (re)starts. A server started before
+// the machine was authorized does not pick the authorization up, so this
+// stops any server already running rather than leaving it in place.
+//
 // T3's mobile client reaches a machine over a relay the machine dials out to,
 // so a sprite that has paused simply disappears from the phone with no way to
 // call it back — the phone cannot wake a sprite and T3 has no hook to try.
@@ -225,15 +232,25 @@ func (a *Actions) StartT3(spriteName string, hold time.Duration) error {
 	// starts without one would come up unable to find any of them.
 	env := fmt.Sprintf("HOME=%s,PATH=%s", agentHome, agentPath)
 
+	// Only one server may own T3's data directory, so an existing one is
+	// stopped first. T3's own `service` subcommands are systemd-user based and
+	// systemd user sessions aren't available here, which is the whole reason
+	// this runs as a sprite service instead.
+	a.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Org:     a.org,
+		Command: []string{"pkill", "-f", "t3 serve"},
+	})
+
 	// `yes` answers the prompt T3 raises when its relay client is missing
 	// ("Download and install version ...? (y/N)"). A service has no terminal,
-	// so unanswered it defaults to no and connect exits having done nothing —
-	// which looks exactly like a service that started and failed silently.
+	// so unanswered it defaults to no and the command exits having done
+	// nothing — which looks exactly like a service that started and failed.
 	//
 	// The binary is resolved by glob rather than run through npx: npx would
 	// re-resolve and possibly re-download the launcher on every restart, and
 	// a cold-woken sprite restarting its services is the common case here.
-	run := fmt.Sprintf("yes y | %s connect", t3BinGlob)
+	run := fmt.Sprintf("yes y | %s serve --no-browser", t3BinGlob)
 	createCmd := fmt.Sprintf(
 		"sprite-env services create %s --restart always --env %s -- /bin/sh -lc %s",
 		t3ServiceName, shellQuote(env), shellQuote(run),
