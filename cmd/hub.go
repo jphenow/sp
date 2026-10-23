@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -282,7 +283,14 @@ func hubServiceURL(client *sprite.Client, spriteName string) (string, error) {
 			PublicURL string `json:"public_url"`
 		} `json:"service"`
 	}
-	if err := json.Unmarshal(out, &svc); err != nil {
+	// Exec folds the sprite CLI's stderr into its output, and the CLI warns
+	// about implicit stdin forwarding on every call, so the reply routinely
+	// starts "Warning: ..." rather than "{".
+	body := out
+	if i := bytes.IndexByte(body, '{'); i > 0 {
+		body = body[i:]
+	}
+	if err := json.Unmarshal(body, &svc); err != nil {
 		return "", fmt.Errorf("parsing the service description: %w", err)
 	}
 	if svc.PublicURL != "" {
