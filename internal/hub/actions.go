@@ -24,6 +24,8 @@ const (
 	// rcServiceName is the sprite-env service that runs Claude in Remote
 	// Control mode, matching the name `sp rc` uses so the two don't collide.
 	rcServiceName = "sp-rc"
+	// spRemotePath is where the sp binary is installed on a sprite.
+	spRemotePath = "/usr/local/bin/sp"
 )
 
 // Actions performs ladder operations on sprites, on behalf of the hub page.
@@ -198,13 +200,8 @@ func (a *Actions) InstallAgent(opts InstallAgentOptions) error {
 	if err := validateURL(opts.HubURL); err != nil {
 		return err
 	}
-	if _, err := a.client.Exec(sprite.ExecOptions{
-		Sprite:  opts.Sprite,
-		Org:     a.org,
-		Command: []string{"sh", "-c", "chmod +x /usr/local/bin/sp"},
-		Files:   map[string]string{opts.BinaryPath: "/usr/local/bin/sp"},
-	}); err != nil {
-		return fmt.Errorf("uploading sp binary to %s: %w", opts.Sprite, err)
+	if err := a.client.UploadBinary(opts.Sprite, a.org, opts.BinaryPath, spRemotePath); err != nil {
+		return err
 	}
 
 	a.client.Exec(sprite.ExecOptions{
@@ -240,7 +237,7 @@ type InstallAgentOptions struct {
 	HubURL string
 	// Token is the Sprites org token the agent authenticates with.
 	Token string
-	// BinaryPath is the local path to a linux/amd64 sp binary to upload.
+	// BinaryPath is the local path to a gzipped linux/amd64 sp binary.
 	BinaryPath string
 }
 

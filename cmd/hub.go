@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,10 +22,15 @@ import (
 const (
 	// hubServiceName is the sprite-env service running the hub web app.
 	hubServiceName = "sp-hub"
-	// hubPort is the port the hub listens on inside its sprite.
-	hubPort = 842
+	// hubPort is the port the hub listens on inside its sprite. It must be
+	// above 1024: sprite-env services run as the unprivileged "sprite" user,
+	// and a privileged port fails with "bind: permission denied". It also
+	// avoids 8080 and 9000, which --web and --web-proxy already use.
+	hubPort = 8420
 	// hubVaultPath is where the credential vault lives on the hub sprite.
 	hubVaultPath = "/home/sprite/.config/sp/hub-vault.json"
+	// spRemotePath is where the sp binary is installed on a sprite.
+	spRemotePath = "/usr/local/bin/sp"
 )
 
 var (
@@ -179,7 +186,9 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 	defer cleanup()
 
 	fmt.Println("Uploading sp binary...")
-	files := map[string]string{binary: "/usr/local/bin/sp"}
+	if err := client.UploadBinary(spriteName, hubOrg, binary, spRemotePath); err != nil {
+		return err
+	}
 	serveArgs := fmt.Sprintf("hub,serve,--addr,:%d", hubPort)
 	if hubOrg != "" {
 		serveArgs += ",--org," + hubOrg
@@ -195,18 +204,16 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		defer os.Remove(local)
-		files[local] = hubVaultPath
 		serveArgs += ",--vault"
 		fmt.Println("Uploading Claude credentials to the hub vault...")
-	}
-
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Org:     hubOrg,
-		Command: []string{"sh", "-c", "mkdir -p /home/sprite/.config/sp && chmod +x /usr/local/bin/sp"},
-		Files:   files,
-	}); err != nil {
-		return fmt.Errorf("uploading to sprite: %w", err)
+		if _, err := client.Exec(sprite.ExecOptions{
+			Sprite:  spriteName,
+			Org:     hubOrg,
+			Command: []string{"sh", "-c", "mkdir -p /home/sprite/.config/sp"},
+			Files:   map[string]string{local: hubVaultPath},
+		}); err != nil {
+			return fmt.Errorf("uploading the credential vault: %w", err)
+		}
 	}
 
 	client.Exec(sprite.ExecOptions{
@@ -270,8 +277,11 @@ func runHubInstall(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// buildLinuxSp cross-compiles sp for the sprite and returns the binary path
-// plus a cleanup function.
+// buildLinuxSp cross-compiles sp for the sprite, gzips it, and returns the
+// path to the compressed binary plus a cleanup function.
+//
+// It is built with -s -w and shipped gzipped because sprite uploads go through
+// a proxy that rejects large bodies with HTTP 413 — see Client.UploadBinary.
 func buildLinuxSp() (string, func(), error) {
 	srcDir, err := spSourceDir()
 	if err != nil {
@@ -279,13 +289,47 @@ func buildLinuxSp() (string, func(), error) {
 	}
 	out := filepath.Join(os.TempDir(), "sp-linux-amd64")
 	fmt.Println("Building sp for the sprite (linux/amd64)...")
-	build := exec.Command("go", "build", "-o", out, ".")
+	build := exec.Command("go", "build", "-ldflags=-s -w", "-o", out, ".")
 	build.Dir = srcDir
 	build.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
 	if combined, err := build.CombinedOutput(); err != nil {
 		return "", nil, fmt.Errorf("building sp binary: %w\n%s", err, string(combined))
 	}
-	return out, func() { os.Remove(out) }, nil
+	defer os.Remove(out)
+
+	gz := out + ".gz"
+	if err := gzipFile(out, gz); err != nil {
+		return "", nil, err
+	}
+	return gz, func() { os.Remove(gz) }, nil
+}
+
+// gzipFile compresses src into dst.
+func gzipFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("reading built binary: %w", err)
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("creating %s: %w", dst, err)
+	}
+	defer out.Close()
+
+	zw, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+	if err != nil {
+		return fmt.Errorf("starting gzip: %w", err)
+	}
+	if _, err := io.Copy(zw, in); err != nil {
+		zw.Close()
+		return fmt.Errorf("compressing binary: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("finishing gzip: %w", err)
+	}
+	return nil
 }
 
 // writeTempFile writes data to a new temporary file and returns its path.
