@@ -2,11 +2,15 @@ package sprite
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -367,4 +371,105 @@ func (c *Client) Sessions(name string) (string, error) {
 		return "", fmt.Errorf("listing sessions for sprite %q: %w", name, err)
 	}
 	return string(out), nil
+}
+
+// UploadBinary installs a gzipped local file at remotePath on the sprite,
+// decompressing it there and marking it executable.
+//
+// Uploads go through a proxy that rejects large bodies with HTTP 413: an
+// 18.7 MB sp binary fails, while 12.9 MB succeeds, putting the ceiling
+// somewhere around 16 MB. Shipping the binary gzipped (about 5 MB once it is
+// also built with -s -w) keeps it well under that as sp grows.
+//
+// A checksum of the last upload is kept beside the binary and checked first.
+// Re-uploading an unchanged 5 MB binary on every deploy is what earns an
+// HTTP 429, which is easy to do while iterating on a service.
+func (c *Client) UploadBinary(spriteName, org, localGz, remotePath string) error {
+	sum, err := fileSHA256(localGz)
+	if err != nil {
+		return err
+	}
+	stampPath := remotePath + ".sha256"
+
+	if c.remoteStampMatches(spriteName, org, stampPath, sum) {
+		return nil
+	}
+
+	staged := "/tmp/" + filepath.Base(remotePath) + ".gz"
+	// Execs run as the unprivileged "sprite" user, while the usual install
+	// target (/usr/local/bin) is root-owned — a plain redirect there fails with
+	// "Permission denied". Writing through tee under sudo, and only when the
+	// directory isn't already writable, keeps this working in both cases
+	// without assuming sudo exists.
+	script := fmt.Sprintf(`set -e
+DIR=%[1]s
+DEST=%[2]s
+SRC=%[3]s
+STAMP=%[4]s
+SUM=%[5]s
+SUDO=
+[ -w "$DIR" ] || SUDO=sudo
+$SUDO mkdir -p "$DIR"
+gunzip -c "$SRC" | $SUDO tee "$DEST" > /dev/null
+$SUDO chmod +x "$DEST"
+printf '%%s' "$SUM" | $SUDO tee "$STAMP" > /dev/null
+# Best-effort cleanup: uploads land owned by another user in a sticky /tmp, so
+# an unprivileged rm fails with "Operation not permitted". The staged file is
+# overwritten by the next install either way, and failing to tidy it is not a
+# reason to fail an install that already succeeded.
+rm -f "$SRC" 2>/dev/null || $SUDO rm -f "$SRC" 2>/dev/null || true
+`, shellQuote(filepath.Dir(remotePath)), shellQuote(remotePath), shellQuote(staged),
+		shellQuote(stampPath), shellQuote(sum))
+
+	out, err := c.Exec(ExecOptions{
+		Sprite:  spriteName,
+		Org:     org,
+		Command: []string{"sh", "-c", script},
+		Files:   map[string]string{localGz: staged},
+	})
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		// Repeated multi-megabyte uploads get rate limited. Say so plainly:
+		// the raw "HTTP 429" from the uploader reads like a bug in sp.
+		if strings.Contains(detail, "HTTP 429") {
+			return fmt.Errorf("upload to %s was rate limited — wait a few minutes and run this again; "+
+				"an unchanged binary is skipped, so only a rebuilt one re-uploads", spriteName)
+		}
+		return fmt.Errorf("installing %s on %s: %w\n%s", remotePath, spriteName, err, detail)
+	}
+	return nil
+}
+
+// remoteStampMatches reports whether the sprite already has this exact binary,
+// by comparing the checksum recorded next to it. Any failure reads as "no",
+// so an unreadable stamp costs an upload rather than skipping a needed one.
+func (c *Client) remoteStampMatches(spriteName, org, stampPath, sum string) bool {
+	out, err := c.Exec(ExecOptions{
+		Sprite:  spriteName,
+		Org:     org,
+		Command: []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", shellQuote(stampPath))},
+	})
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == sum
+}
+
+// fileSHA256 returns the hex-encoded SHA-256 of a file.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hashing %s: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// shellQuote wraps a value in single quotes for safe use in a shell command.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

@@ -594,27 +594,16 @@ func setupWebServiceProxy(client *sprite.Client, spriteName string) error {
 	pp := defaultProxyPort
 
 	// Build the linux binary for the sprite
-	fmt.Println("  Building sp binary for sprite (linux/amd64)...")
-	srcDir, err := spSourceDir()
+	binary, cleanup, err := buildLinuxSp()
 	if err != nil {
 		return err
 	}
-	buildCmd := exec.Command("go", "build", "-o", "/tmp/sp-linux-amd64", ".")
-	buildCmd.Dir = srcDir
-	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("building sp binary: %w\n%s", err, string(out))
-	}
-	defer os.Remove("/tmp/sp-linux-amd64")
+	defer cleanup()
 
 	// Upload sp binary to the sprite
 	fmt.Println("  Uploading sp binary to sprite...")
-	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite:  spriteName,
-		Command: []string{"sh", "-c", "chmod +x /usr/local/bin/sp"},
-		Files:   map[string]string{"/tmp/sp-linux-amd64": "/usr/local/bin/sp"},
-	}); err != nil {
-		return fmt.Errorf("uploading sp binary: %w", err)
+	if err := client.UploadBinary(spriteName, "", binary, spRemotePath); err != nil {
+		return err
 	}
 
 	// Build the service args
