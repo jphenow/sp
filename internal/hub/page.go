@@ -203,6 +203,12 @@ function cardHTML(card) {
       (rep && rep.claude_ok ? "new claude" : "start claude") + "</button>");
     acts.push('<button data-act="remote" data-dir="' + esc(dir) + '">remote control</button>');
   }
+  // Offered on a cold sprite too: the action wakes before it rejoins, and a
+  // sprite that has paused is exactly when this is needed — T3 drops it from
+  // the phone and nothing on the phone can call it back.
+  const t3On = rep && rep.t3_ok;
+  acts.push('<button class="' + (t3On ? "on" : "primary") + '" data-act="t3">' +
+    (t3On ? "t3 joined" : "join t3") + "</button>");
   const held = rep && rep.hold_ok;
   acts.push('<button class="' + (held ? "on" : "") + '" data-act="hold" data-on="' +
     (held ? "false" : "true") + '">' + (held ? "holding" : "hold awake") + "</button>");

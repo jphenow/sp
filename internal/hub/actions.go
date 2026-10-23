@@ -26,6 +26,9 @@ const (
 	rcServiceName = "sp-rc"
 	// spRemotePath is where the sp binary is installed on a sprite.
 	spRemotePath = "/usr/local/bin/sp"
+	// t3ServiceName is the sprite-env service that keeps the sprite joined to
+	// the T3 relay.
+	t3ServiceName = "sp-t3"
 	// agentHome is the home directory the agent reads Claude's transcripts
 	// from. Services start with no HOME, so it is passed in.
 	agentHome = "/home/sprite"
@@ -183,6 +186,53 @@ func (a *Actions) StartRemote(spriteName, dir string) error {
 		return fmt.Errorf("creating Remote Control service on %s: %w\n%s", spriteName, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// StartT3 brings the sprite back onto the T3 relay and holds it Active.
+//
+// T3's mobile client reaches a machine over a relay the machine dials out to,
+// so a sprite that has paused simply disappears from the phone with no way to
+// call it back — the phone cannot wake a sprite and T3 has no hook to try.
+// This is that missing call: it wakes the sprite, re-registers the relay
+// service, and takes a hold.
+//
+// The hold is part of the action rather than a separate tap because without
+// it the sprite pauses again within seconds of this returning and the client
+// drops right back off, which makes the button look broken.
+//
+// Signing in to T3 is not done here. That is a one-time interactive flow whose
+// credentials then live on the sprite; this only restarts a sprite that has
+// already been signed in.
+func (a *Actions) StartT3(spriteName string, hold time.Duration) error {
+	if err := a.Wake(spriteName); err != nil {
+		return err
+	}
+
+	// Recreate idempotently, matching the other service actions: a repeat tap
+	// should refresh the service rather than fail on the name.
+	a.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Org:     a.org,
+		Command: []string{"sprite-env", "services", "delete", t3ServiceName},
+	})
+
+	// HOME matters more than usual here: T3's relay credentials live under the
+	// home directory, and a service that starts without one would come up
+	// unauthenticated and sit there failing to join.
+	env := fmt.Sprintf("HOME=%s,PATH=%s", agentHome, agentPath)
+	createCmd := fmt.Sprintf(
+		"sprite-env services create %s --restart always --env %s -- /bin/sh -lc %s",
+		t3ServiceName, shellQuote(env), shellQuote("npx -y t3 connect"),
+	)
+	if out, err := a.client.Exec(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Org:     a.org,
+		Command: []string{"sh", "-c", createCmd},
+	}); err != nil {
+		return fmt.Errorf("starting the T3 service on %s: %w\n%s", spriteName, err, strings.TrimSpace(string(out)))
+	}
+
+	return a.SetHold(spriteName, hold, true)
 }
 
 // PushCredentials re-installs Claude credentials on a sprite from the hub's

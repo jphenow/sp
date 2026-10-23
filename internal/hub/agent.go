@@ -111,10 +111,39 @@ func GatherReport(sprite string, maxSessions int) *Report {
 		ClaudeOK:   claudeRunning,
 		ClaudeDir:  claudeDir,
 		RemoteOK:   remoteRunning,
+		T3OK:       t3Alive(),
 		HoldOK:     holdActive(),
 		Sessions:   ClaudeSessions(maxSessions),
 		ReportedAt: time.Now().UTC(),
 	}
+}
+
+// t3Alive reports whether a T3 process is running and so the sprite is
+// reachable from the phone.
+//
+// The service's desired state is not a useful signal here: it says the service
+// should be running, not that the relay was actually joined, and the failure
+// this is meant to catch is exactly a service that came up and could not
+// connect. So it looks for the process.
+func t3Alive() bool {
+	found := false
+	forEachProcess(func(pid string, args []string) {
+		if found || len(args) < 2 {
+			return
+		}
+		if !containsArg(args, "connect") && !containsArg(args, "serve") {
+			return
+		}
+		// T3 runs through npx, so argv[0] is the node interpreter and the
+		// script path is what identifies it.
+		for _, a := range args {
+			if filepath.Base(a) == "t3" || strings.Contains(a, "/t3/") {
+				found = true
+				return
+			}
+		}
+	})
+	return found
 }
 
 // tmuxAlive reports whether any tmux session exists on this sprite.
@@ -138,29 +167,9 @@ func holdActive() bool {
 // it needs no parsing of column layouts, and the cwd symlink gives the working
 // directory, which ps does not report at all.
 func scanClaudeProcesses() (running bool, dir string, remote bool) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return false, "", false
-	}
-	self := os.Getpid()
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid := e.Name()
-		if pid == "" || pid[0] < '0' || pid[0] > '9' {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
-		if err != nil || len(raw) == 0 {
-			continue
-		}
-		args := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+	forEachProcess(func(pid string, args []string) {
 		if !isClaudeProcess(args) {
-			continue
-		}
-		if fmt.Sprint(self) == pid {
-			continue
+			return
 		}
 		running = true
 		if containsArg(args, "remote-control") {
@@ -171,8 +180,32 @@ func scanClaudeProcesses() (running bool, dir string, remote bool) {
 				dir = cwd
 			}
 		}
-	}
+	})
 	return running, dir, remote
+}
+
+// forEachProcess calls fn with the pid and argv of every process on this
+// sprite except the agent itself.
+func forEachProcess(fn func(pid string, args []string)) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	self := fmt.Sprint(os.Getpid())
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid := e.Name()
+		if pid == "" || pid[0] < '0' || pid[0] > '9' || pid == self {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		fn(pid, strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00"))
+	}
 }
 
 // isClaudeProcess reports whether a command line is the Claude CLI. It matches

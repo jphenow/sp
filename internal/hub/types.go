@@ -78,6 +78,7 @@ type Report struct {
 	ClaudeOK   bool      `json:"claude_ok"`
 	ClaudeDir  string    `json:"claude_dir"`
 	RemoteOK   bool      `json:"remote_ok"`
+	T3OK       bool      `json:"t3_ok"`
 	HoldOK     bool      `json:"hold_ok"`
 	Sessions   []Session `json:"sessions"`
 	ReportedAt time.Time `json:"reported_at"`
