@@ -131,7 +131,7 @@ func t3Alive() bool {
 		if found || len(args) < 2 {
 			return
 		}
-		if !containsArg(args, "connect") && !containsArg(args, "serve") {
+		if !containsArg(args, "serve") && !containsArg(args, "connect") {
 			return
 		}
 		// T3 runs through npx, so argv[0] is the node interpreter and the
