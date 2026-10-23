@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/jphenow/sp/internal/daemon"
+	"github.com/jphenow/sp/internal/keepalive"
 	"github.com/jphenow/sp/internal/progress"
 	"github.com/jphenow/sp/internal/setup"
 	"github.com/jphenow/sp/internal/sprite"
@@ -532,7 +533,12 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// usually means you stepped away), so the hold releases on session end
 		// instead — or at holdCap, so an abandoned session can't bill forever.
 		hold := func() error {
-			return launchKeepAlive(resolved.SpriteName, resolved.Org, holdCap, "", deriveTmuxSessionName())
+			return keepalive.Start(keepalive.Options{
+				Sprite:       resolved.SpriteName,
+				Org:          resolved.Org,
+				For:          holdCap,
+				WatchSession: deriveTmuxSessionName(),
+			})
 		}
 		if err := hold(); err != nil {
 			warnf("hold", "starting session hold: %v", err)
@@ -741,7 +747,7 @@ func setupWebServiceProxy(client *sprite.Client, spriteName string) error {
 }
 
 // startKeepWarmSentinel holds the sprite Active (via the Tasks API heartbeat in
-// launchKeepAlive) for up to dur, exiting early once the tmux session has been
+// keepalive.Start) for up to dur, exiting early once the tmux session has been
 // idle for ~60s. This replaces the older pane-hash-holds-a-connection hack: the
 // Tasks API keeps the sprite in the Active state directly, so the session's
 // connection doesn't drop and processes don't cold-die while you're working.
@@ -750,7 +756,12 @@ func startKeepWarmSentinel(spriteName, org string, dur time.Duration) error {
 	if dur <= 0 {
 		return nil
 	}
-	return launchKeepAlive(spriteName, org, dur, deriveTmuxSessionName(), "")
+	return keepalive.Start(keepalive.Options{
+		Sprite:      spriteName,
+		Org:         org,
+		For:         dur,
+		IdleSession: deriveTmuxSessionName(),
+	})
 }
 
 // waitForSpriteReady polls until the sprite responds to commands.
