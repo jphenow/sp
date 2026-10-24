@@ -212,8 +212,10 @@ func (a *Actions) StartRemote(spriteName, dir string) error {
 // drops right back off, which makes the button look broken.
 //
 // Signing in to T3 is not done here. That is a one-time interactive flow whose
-// credentials then live on the sprite; this only restarts a sprite that has
-// already been signed in.
+// credentials then live on the sprite — `sp t3 setup <sprite>` runs it — and
+// this only restarts a sprite that has already been signed in. Restarting is
+// also what applies an authorization: `t3 connect link` stages one for the
+// next start rather than taking effect immediately.
 func (a *Actions) StartT3(spriteName string, hold time.Duration) error {
 	if err := a.Wake(spriteName); err != nil {
 		return err
