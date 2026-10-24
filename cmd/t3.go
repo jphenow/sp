@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -87,6 +88,10 @@ func runT3Setup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("waking %s: %w", spriteName, err)
 	}
 
+	if err := ensureRestartableServices(client, spriteName); err != nil {
+		return err
+	}
+
 	if err := ensureT3Installed(client, spriteName); err != nil {
 		return err
 	}
@@ -126,6 +131,45 @@ func runT3Setup(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s\n", out)
 	fmt.Printf("%s should now be listed under T3 Connect in the app.\n", spriteName)
 	return nil
+}
+
+// ensureRestartableServices checks that the sprite's guest runtime can create
+// a service that restarts on its own.
+//
+// Older guests accept only --cmd/--args and have no --restart, and a service
+// created there would not come back after a cold wake — which is the one
+// property this whole arrangement depends on. Failing here beats creating a
+// service that looks fine and quietly stops rejoining, and beats surfacing the
+// guest's bare "unknown option: --restart".
+func ensureRestartableServices(client *sprite.Client, spriteName string) error {
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite: spriteName, Org: t3Org,
+		Command: []string{"sprite-env", "services", "--help"},
+	})
+	if err == nil && strings.Contains(string(out), "--restart") {
+		return nil
+	}
+	version, _ := client.Exec(sprite.ExecOptions{
+		Sprite: spriteName, Org: t3Org, Command: []string{"sprite-env", "--version"},
+	})
+	return fmt.Errorf(
+		"%s runs a guest runtime (%s) whose services cannot restart themselves.\n"+
+			"A T3 service created there would not rejoin after the sprite woke cold.\n"+
+			"Upgrade the sprite and run this again.",
+		spriteName, lastLine(string(version)))
+}
+
+// lastLine returns the final non-empty line of command output. The sprite CLI
+// writes advisories to stderr, which arrive interleaved with the output we
+// actually want, and the value is always last.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return "unknown"
 }
 
 // ensureT3Installed installs the T3 launcher on the sprite if it is missing.
