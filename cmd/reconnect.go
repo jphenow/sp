@@ -2,9 +2,7 @@ package cmd
 
 import (
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -122,19 +120,22 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 
 	for attempt := 1; ; attempt++ {
 		tail := &tailWriter{}
-		cmd := exec.Command(binary, target.args...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		// Tee stderr so the failure is both visible and classifiable. Only
-		// stderr is wrapped; stdin and stdout stay attached to the real
-		// terminal, which the client needs for raw mode and rendering.
-		cmd.Stderr = io.MultiWriter(os.Stderr, tail)
-
-		err := cmd.Run()
+		// The client runs on a pty sp owns rather than on the real terminal,
+		// so sp can see the stream and notice a connection that has stopped
+		// answering. tail gets a copy for classifying the failure.
+		stalled, err := runProxied(binary, target.args, tail)
 		resetTerminal()
 
-		if err == nil || !isTransportFailure(tail.String()) {
+		// A stall is a dropped connection that nothing reported, so it is
+		// retried like any other — the tmux session on the sprite is untouched
+		// and a fresh attach picks it up.
+		if !stalled && (err == nil || !isTransportFailure(tail.String())) {
 			return err
+		}
+		if stalled {
+			fmt.Fprintf(os.Stderr,
+				"\nConnection to %s stopped responding (no reply for %s).\n",
+				target.label, stallEchoGrace)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("connection to %s lost and not restored after %s: %w",
