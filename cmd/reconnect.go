@@ -118,6 +118,10 @@ type attachTarget struct {
 // means the session no longer exists, which ends the loop without an error —
 // the session is genuinely over, not unreachable.
 func runWithReconnect(binary string, first attachTarget, nextAttach func() *attachTarget) error {
+	// The full reset, including leaving the alternate screen, belongs to
+	// handing the terminal back — not to the gap between two attaches.
+	defer resetTerminal()
+
 	target := first
 	deadline := time.Now().Add(reconnectWindow)
 	backoff := time.Second
@@ -129,7 +133,7 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		// so sp can see the stream and notice a connection that has stopped
 		// answering. tail gets a copy for classifying the failure.
 		stalled, err := runProxied(binary, target.args, tail)
-		resetTerminal()
+		resetTerminalForRetry()
 
 		// A stall is a dropped connection that nothing reported, so it is
 		// retried like any other — the tmux session on the sprite is untouched
