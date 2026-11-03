@@ -142,3 +142,39 @@ func TestIsOneShotTmux(t *testing.T) {
 		}
 	}
 }
+
+// TestReconnectRefusalIsTransportFailure covers the message the sprite CLI
+// emits when it declines to reconnect an exec with stdin attached. It names no
+// socket error, so none of the other markers matched and sp ended the session
+// instead of reattaching.
+func TestReconnectRefusalIsTransportFailure(t *testing.T) {
+	stderr := "Error: connection to exec session tun-TtCSy4H9KaOQUj04 was lost " +
+		"while stdin was attached; refusing unsafe automatic reconnect because " +
+		"input delivery is uncertain: exit status 1"
+	if !isTransportFailure(stderr) {
+		t.Fatal("the reconnect refusal should count as a transport failure")
+	}
+}
+
+func TestLastVisibleLine(t *testing.T) {
+	t.Run("finds the last line under a full-screen session's escape codes", func(t *testing.T) {
+		output := "\x1b[?1049h\x1b[2J\x1b[H$ make build\r\n\x1b[32mok\x1b[m\r\n" +
+			"\x1b[?1049lError: session not found\r\n"
+		if got := lastVisibleLine(output); got != "Error: session not found" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("reports nothing when the client only moved the cursor", func(t *testing.T) {
+		if got := lastVisibleLine("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l"); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+
+	t.Run("bounds a long line", func(t *testing.T) {
+		got := lastVisibleLine(strings.Repeat("x", 500))
+		if len(got) != 203 || !strings.HasSuffix(got, "...") {
+			t.Fatalf("got %d chars: %q", len(got), got)
+		}
+	})
+}

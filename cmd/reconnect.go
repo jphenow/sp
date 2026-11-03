@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // Dropping the connection to a sprite used to end the whole session: the local
@@ -56,6 +58,14 @@ var transportErrorMarkers = []string{
 	"tls handshake",
 	"client.timeout exceeded",
 	"context deadline exceeded",
+	// The sprite CLI refuses to reconnect an exec by itself when stdin is
+	// attached, because it cannot prove keystrokes were delivered. For sp that
+	// refusal is still a dropped connection and still worth retrying: sp
+	// attaches to a tmux session, so the session state lives on the sprite and
+	// a fresh attach picks it up intact — the uncertain input the CLI is
+	// protecting is a keystroke in flight, not the work.
+	"was lost while stdin was attached",
+	"refusing unsafe automatic reconnect",
 }
 
 // isTransportFailure reports whether captured stderr indicates a dropped
@@ -110,9 +120,16 @@ type attachTarget struct {
 // means the session no longer exists, which ends the loop without an error —
 // the session is genuinely over, not unreachable.
 func runWithReconnect(binary string, first attachTarget, nextAttach func() *attachTarget) error {
-	// The full reset, including leaving the alternate screen, belongs to
-	// handing the terminal back — not to the gap between two attaches.
+	// Leaving the alternate screen belongs to handing the terminal back, not to
+	// the gap between two attaches. It also has to happen *before* the message
+	// explaining why sp is handing it back: anything printed on the alternate
+	// screen is erased on the way out, which is how a session could end with no
+	// visible reason at all. The deferred call is the catch-all; the handback
+	// paths below reset first and then print. Resetting twice is harmless.
 	defer resetTerminal()
+
+	// One reader for the terminal, shared by every attempt.
+	pump := newStdinPump()
 
 	target := first
 	deadline := time.Now().Add(reconnectWindow)
@@ -124,13 +141,15 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		// The client runs on a pty sp owns rather than on the real terminal,
 		// so sp can see the stream and notice a connection that has stopped
 		// answering. tail gets a copy for classifying the failure.
-		stalled, err := runProxied(binary, target.args, tail)
+		stalled, err := runProxied(binary, target.args, tail, pump)
 		resetTerminalForRetry()
 
 		// A stall is a dropped connection that nothing reported, so it is
 		// retried like any other — the tmux session on the sprite is untouched
 		// and a fresh attach picks it up.
 		if !stalled && (err == nil || !isTransportFailure(tail.String())) {
+			resetTerminal()
+			explainExit(target.label, err, tail.String())
 			return err
 		}
 		if stalled {
@@ -139,6 +158,7 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 				target.label, stallEchoGrace)
 		}
 		if time.Now().After(deadline) {
+			resetTerminal()
 			return fmt.Errorf("connection to %s lost and not restored after %s: %w",
 				target.label, reconnectWindow, err)
 		}
@@ -164,11 +184,63 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		} else if blind++; blind <= maxBlindReattach {
 			target = first
 		} else {
+			resetTerminal()
 			fmt.Fprintf(os.Stderr, "Session on %s is gone; not reconnecting.\n", target.label)
 			return nil
 		}
 		fmt.Fprintf(os.Stderr, "Reconnecting to %s (attempt %d)...\n", target.label, attempt+1)
 	}
+}
+
+// explainExit reports why the session ended when the client exited non-zero
+// and sp decided that was not a dropped connection.
+//
+// Without this the only thing left on screen is the exit status, which looks
+// identical whether the client said something sp did not recognize as a
+// connection failure or said nothing at all. Printing its last line makes the
+// difference visible — and an empty one is itself the useful answer.
+func explainExit(label string, err error, output string) {
+	if err == nil {
+		return
+	}
+	if line := lastVisibleLine(output); line != "" {
+		fmt.Fprintf(os.Stderr, "\nSession on %s ended (%v): %s\n", label, err, line)
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"\nSession on %s ended (%v) without printing a reason, so sp could not tell it from a deliberate exit.\n",
+		label, err)
+}
+
+// terminalEscape matches the CSI and OSC sequences a full-screen session leaves
+// all over the captured output.
+var terminalEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[=>]`)
+
+// lastVisibleLine returns the final line of real text in captured terminal
+// output, bounded for display. The capture is raw pty bytes, so escape
+// sequences and control characters are stripped first.
+func lastVisibleLine(output string) string {
+	cleaned := terminalEscape.ReplaceAllString(output, "")
+	cleaned = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return r
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, cleaned)
+
+	lines := strings.FieldsFunc(cleaned, func(r rune) bool { return r == '\n' || r == '\r' })
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			if len(line) > 200 {
+				line = line[:200] + "..."
+			}
+			return line
+		}
+	}
+	return ""
 }
 
 // sleepInterruptible waits for d, returning true if the user interrupted.

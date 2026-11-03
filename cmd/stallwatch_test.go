@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -71,5 +72,36 @@ func TestStallDetectorResumesAfterOutput(t *testing.T) {
 	}
 	if !d.stalled(start.Add(15 * time.Second)) {
 		t.Fatal("the second keystroke never reached its own deadline")
+	}
+}
+
+// TestStdinPumpDeliversToTheLiveAttempt pins the invariant that made a healthy
+// sprite look permanently stalled: input must reach the attempt that is
+// currently attached, and a finished attempt must never be written to again.
+func TestStdinPumpDeliversToTheLiveAttempt(t *testing.T) {
+	first, second := &bytes.Buffer{}, &bytes.Buffer{}
+	firstDet := &stallDetector{grace: time.Second}
+	secondDet := &stallDetector{grace: time.Second}
+	p := &stdinPump{}
+
+	p.attach(first, firstDet)
+	p.deliver([]byte("a"))
+	p.detach()
+
+	// The gap between two attaches: nothing is attached, so nothing is held
+	// waiting for an answer that cannot come.
+	p.deliver([]byte("b"))
+
+	p.attach(second, secondDet)
+	p.deliver([]byte("c"))
+
+	if got := first.String(); got != "a" {
+		t.Fatalf("the finished attempt got %q, want %q", got, "a")
+	}
+	if got := second.String(); got != "c" {
+		t.Fatalf("the live attempt got %q, want %q", got, "c")
+	}
+	if !secondDet.stalled(time.Now().Add(2 * time.Second)) {
+		t.Fatal("input to the live attempt should start its grace period")
 	}
 }
