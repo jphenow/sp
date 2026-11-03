@@ -1099,7 +1099,7 @@ func findExistingSpriteSession(spriteName, org string) string {
 		// should contain "tmux". This filters out stale setup exec
 		// sessions (chown, git config, etc.) that sprite-env keeps alive.
 		rest := strings.Join(fields[1:], " ")
-		if strings.Contains(rest, "tmux") {
+		if strings.Contains(rest, "tmux") && !isOneShotTmux(rest) {
 			return fields[0]
 		}
 	}
@@ -1208,6 +1208,30 @@ func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID str
 	return runWithReconnect(binary,
 		attachTarget{args: attachArgs(spriteName, org, sessionID), label: spriteName},
 		reattachTarget(spriteName, org))
+}
+
+// oneShotTmuxCommands are tmux subcommands that run and exit. A session
+// running one is listed exactly like an interactive one but has nothing left
+// to attach to.
+//
+// Attaching to a finished session is not an error — it connects and produces
+// no output, which on a terminal already switched to the alternate screen
+// looks like a cleared window with no cursor, indistinguishable from a hang.
+var oneShotTmuxCommands = []string{
+	"list-sessions", "has-session", "kill-session", "kill-server",
+	"list-panes", "list-windows", "capture-pane", "send-keys",
+	"setenv", "show-environment", "start-server",
+}
+
+// isOneShotTmux reports whether a listed command is a tmux invocation that
+// exits rather than an interactive session worth attaching to.
+func isOneShotTmux(command string) bool {
+	for _, c := range oneShotTmuxCommands {
+		if strings.Contains(command, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // attachArgs builds the argv for `sprite attach` against one session.
