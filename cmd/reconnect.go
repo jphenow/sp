@@ -32,6 +32,10 @@ const (
 	// stderrTailBytes is how much of the child's stderr is kept to classify a
 	// failure. The messages we match are short and come last.
 	stderrTailBytes = 4096
+	// maxBlindReattach is how many times to re-run the original attach when
+	// the session listing reports nothing. Bounded, so a session that really
+	// has ended stops the loop instead of being recreated forever.
+	maxBlindReattach = 2
 )
 
 // transportErrorMarkers are substrings that identify a lost or refused
@@ -109,6 +113,7 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 	target := first
 	deadline := time.Now().Add(reconnectWindow)
 	backoff := time.Second
+	blind := 0
 
 	for attempt := 1; ; attempt++ {
 		tail := &tailWriter{}
@@ -143,12 +148,21 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 			backoff = reconnectMaxBackoff
 		}
 
-		next := nextAttach()
-		if next == nil {
+		// An empty listing is not proof the session ended: it only matches a
+		// session whose command column still reads "tmux", and that column is
+		// truncated. So the original attach is retried a bounded number of
+		// times first. It ends in `tmux new-session -A`, which attaches to the
+		// session when it exists and creates it when it does not, so it is the
+		// right command either way. A deliberate exit never reaches here —
+		// that exits cleanly and returns above.
+		if next := nextAttach(); next != nil {
+			target, blind = *next, 0
+		} else if blind++; blind <= maxBlindReattach {
+			target = first
+		} else {
 			fmt.Fprintf(os.Stderr, "Session on %s is gone; not reconnecting.\n", target.label)
 			return nil
 		}
-		target = *next
 		fmt.Fprintf(os.Stderr, "Reconnecting to %s (attempt %d)...\n", target.label, attempt+1)
 	}
 }
