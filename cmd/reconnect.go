@@ -2,9 +2,7 @@ package cmd
 
 import (
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -34,6 +32,10 @@ const (
 	// stderrTailBytes is how much of the child's stderr is kept to classify a
 	// failure. The messages we match are short and come last.
 	stderrTailBytes = 4096
+	// maxBlindReattach is how many times to re-run the original attach when
+	// the session listing reports nothing. Bounded, so a session that really
+	// has ended stops the loop instead of being recreated forever.
+	maxBlindReattach = 2
 )
 
 // transportErrorMarkers are substrings that identify a lost or refused
@@ -108,25 +110,33 @@ type attachTarget struct {
 // means the session no longer exists, which ends the loop without an error —
 // the session is genuinely over, not unreachable.
 func runWithReconnect(binary string, first attachTarget, nextAttach func() *attachTarget) error {
+	// The full reset, including leaving the alternate screen, belongs to
+	// handing the terminal back — not to the gap between two attaches.
+	defer resetTerminal()
+
 	target := first
 	deadline := time.Now().Add(reconnectWindow)
 	backoff := time.Second
+	blind := 0
 
 	for attempt := 1; ; attempt++ {
 		tail := &tailWriter{}
-		cmd := exec.Command(binary, target.args...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		// Tee stderr so the failure is both visible and classifiable. Only
-		// stderr is wrapped; stdin and stdout stay attached to the real
-		// terminal, which the client needs for raw mode and rendering.
-		cmd.Stderr = io.MultiWriter(os.Stderr, tail)
+		// The client runs on a pty sp owns rather than on the real terminal,
+		// so sp can see the stream and notice a connection that has stopped
+		// answering. tail gets a copy for classifying the failure.
+		stalled, err := runProxied(binary, target.args, tail)
+		resetTerminalForRetry()
 
-		err := cmd.Run()
-		resetTerminal()
-
-		if err == nil || !isTransportFailure(tail.String()) {
+		// A stall is a dropped connection that nothing reported, so it is
+		// retried like any other — the tmux session on the sprite is untouched
+		// and a fresh attach picks it up.
+		if !stalled && (err == nil || !isTransportFailure(tail.String())) {
 			return err
+		}
+		if stalled {
+			fmt.Fprintf(os.Stderr,
+				"\nConnection to %s stopped responding (no reply for %s).\n",
+				target.label, stallEchoGrace)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("connection to %s lost and not restored after %s: %w",
@@ -142,12 +152,21 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 			backoff = reconnectMaxBackoff
 		}
 
-		next := nextAttach()
-		if next == nil {
+		// An empty listing is not proof the session ended: it only matches a
+		// session whose command column still reads "tmux", and that column is
+		// truncated. So the original attach is retried a bounded number of
+		// times first. It ends in `tmux new-session -A`, which attaches to the
+		// session when it exists and creates it when it does not, so it is the
+		// right command either way. A deliberate exit never reaches here —
+		// that exits cleanly and returns above.
+		if next := nextAttach(); next != nil {
+			target, blind = *next, 0
+		} else if blind++; blind <= maxBlindReattach {
+			target = first
+		} else {
 			fmt.Fprintf(os.Stderr, "Session on %s is gone; not reconnecting.\n", target.label)
 			return nil
 		}
-		target = *next
 		fmt.Fprintf(os.Stderr, "Reconnecting to %s (attempt %d)...\n", target.label, attempt+1)
 	}
 }

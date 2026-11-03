@@ -1088,15 +1088,18 @@ func findExistingSpriteSession(spriteName, org string) string {
 		if len(fields) < 2 {
 			continue
 		}
-		// First field must be a numeric session ID.
-		if _, err := fmt.Sscanf(fields[0], "%d", new(int)); err != nil {
+		// Skip the header and its underline. Session ids used to be small
+		// integers and are now opaque tokens ("tun-Xha-1Yo1PmsM2h8b"), so
+		// the id column cannot be validated by shape — anything that is not
+		// part of the table frame is treated as one.
+		if fields[0] == "ID" || strings.HasPrefix(fields[0], "─") {
 			continue
 		}
 		// Only match tmux sessions — the Command column (field 1+)
 		// should contain "tmux". This filters out stale setup exec
 		// sessions (chown, git config, etc.) that sprite-env keeps alive.
 		rest := strings.Join(fields[1:], " ")
-		if strings.Contains(rest, "tmux") {
+		if strings.Contains(rest, "tmux") && !isOneShotTmux(rest) {
 			return fields[0]
 		}
 	}
@@ -1205,6 +1208,30 @@ func attachToSpriteSession(client *sprite.Client, spriteName, org, sessionID str
 	return runWithReconnect(binary,
 		attachTarget{args: attachArgs(spriteName, org, sessionID), label: spriteName},
 		reattachTarget(spriteName, org))
+}
+
+// oneShotTmuxCommands are tmux subcommands that run and exit. A session
+// running one is listed exactly like an interactive one but has nothing left
+// to attach to.
+//
+// Attaching to a finished session is not an error — it connects and produces
+// no output, which on a terminal already switched to the alternate screen
+// looks like a cleared window with no cursor, indistinguishable from a hang.
+var oneShotTmuxCommands = []string{
+	"list-sessions", "has-session", "kill-session", "kill-server",
+	"list-panes", "list-windows", "capture-pane", "send-keys",
+	"setenv", "show-environment", "start-server",
+}
+
+// isOneShotTmux reports whether a listed command is a tmux invocation that
+// exits rather than an interactive session worth attaching to.
+func isOneShotTmux(command string) bool {
+	for _, c := range oneShotTmuxCommands {
+		if strings.Contains(command, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // attachArgs builds the argv for `sprite attach` against one session.
@@ -1401,14 +1428,27 @@ func resetTerminal() {
 	//
 	// Every sequence here is a no-op when that state isn't set, so this is safe
 	// to send after a clean exit too.
-	fmt.Fprintf(os.Stderr,
-		"\033[?1000l\033[?1003l\033[?1006l"+ // mouse reporting off
-			"\033[?1049l"+ // leave alternate screen (restores scrollback)
-			"\033[r"+ // reset scroll region to the full window
-			"\033[?2004l"+ // bracketed paste off
-			"\033[?1004l"+ // focus reporting off
-			"\033[<u"+ // pop kitty keyboard protocol state
-			"\033[?7h"+ // autowrap back on
-			"\033[?25h"+ // cursor visible
-			"\033[m") // reset colors and attributes
+	fmt.Fprint(os.Stderr, termResetModes+
+		"\033[?1049l") // leave alternate screen (restores scrollback)
+}
+
+// termResetModes undoes the terminal modes the sprite client sets, without
+// leaving the alternate screen.
+const termResetModes = "\033[?1000l\033[?1003l\033[?1006l" + // mouse reporting off
+	"\033[r" + // reset scroll region to the full window
+	"\033[?2004l" + // bracketed paste off
+	"\033[?1004l" + // focus reporting off
+	"\033[<u" + // pop kitty keyboard protocol state
+	"\033[?7h" + // autowrap back on
+	"\033[?25h" + // cursor visible
+	"\033[m" // reset colors and attributes
+
+// resetTerminalForRetry undoes the same modes between two attach attempts,
+// but stays in the alternate screen.
+//
+// Leaving it would uncover the local scrollback for as long as the reconnect
+// takes and then be hidden again by the next attach, so a recovery that works
+// looks like the window being lost and restored.
+func resetTerminalForRetry() {
+	fmt.Fprint(os.Stderr, termResetModes)
 }

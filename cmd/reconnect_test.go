@@ -97,15 +97,48 @@ func TestRunWithReconnect(t *testing.T) {
 		}
 	})
 
-	t.Run("stops when the session is gone", func(t *testing.T) {
+	t.Run("stops after retrying a session the listing cannot find", func(t *testing.T) {
 		bin, counter := fakeClient(t, "echo 'Error: connection closed' >&2; exit 1")
-		// nil means the session no longer exists: end quietly, don't error.
+		// nil means the listing found no session. That is not proof the
+		// session ended — the column it matches on is truncated — so the
+		// original attach is retried a bounded number of times, then the loop
+		// ends quietly rather than erroring.
 		err := runWithReconnect(bin, attachTarget{label: "test"}, func() *attachTarget { return nil })
 		if err != nil {
-			t.Fatalf("err = %v, want nil when the session is gone", err)
+			t.Fatalf("err = %v, want nil once the retries are spent", err)
 		}
-		if got := runs(t, counter); got != 1 {
-			t.Errorf("ran %d times, want 1", got)
+		if got, want := runs(t, counter), 1+maxBlindReattach; got != want {
+			t.Errorf("ran %d times, want %d", got, want)
 		}
 	})
+}
+
+// TestIsOneShotTmux covers the session rows that must never be attached to.
+// A finished `tmux list-sessions` exec is listed just like an interactive
+// session; attaching to it connects and paints nothing, which looks exactly
+// like the hang this code is supposed to recover from.
+func TestIsOneShotTmux(t *testing.T) {
+	oneShot := []string{
+		"tmux list-sessions",
+		"tmux has-session -t bash",
+		"sh -c for s in $(tmux list-sessions -F ...); do tmux setenv ...",
+		"tmux kill-session -t bash",
+		"tmux capture-pane -p",
+	}
+	for _, cmd := range oneShot {
+		if !isOneShotTmux(cmd) {
+			t.Errorf("isOneShotTmux(%q) = false, want true", cmd)
+		}
+	}
+
+	interactive := []string{
+		"tmux new-session -A -s bash",
+		"tmux attach -t bash",
+		"sh -c exec tmux new-session -A -s bash",
+	}
+	for _, cmd := range interactive {
+		if isOneShotTmux(cmd) {
+			t.Errorf("isOneShotTmux(%q) = true, want false", cmd)
+		}
+	}
 }
