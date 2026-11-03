@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsTransportFailure(t *testing.T) {
@@ -177,4 +178,26 @@ func TestLastVisibleLine(t *testing.T) {
 			t.Fatalf("got %d chars: %q", len(got), got)
 		}
 	})
+}
+
+// TestReconnectWindowRestartsAfterALiveSession covers the budget that used to
+// run from the moment sp started: a session that had been up for a day had
+// none of it left when the connection finally dropped, so the first failure
+// ended the session instead of being reconnected.
+func TestReconnectWindowRestartsAfterALiveSession(t *testing.T) {
+	defer func(window, live time.Duration) {
+		reconnectWindow, reconnectLiveFor = window, live
+	}(reconnectWindow, reconnectLiveFor)
+	reconnectWindow, reconnectLiveFor = 100*time.Millisecond, 100*time.Millisecond
+
+	// The first attempt lasts past reconnectLiveFor, so it counts as a
+	// connection that worked and the window starts over; the second fails at
+	// once and spends what is left of it.
+	bin, counter := fakeClient(t, `if [ "$n" = 1 ]; then sleep 0.3; fi; echo "Error: connection closed" >&2; exit 1`)
+	if err := runWithReconnect(bin, attachTarget{label: "test"}, func() *attachTarget { return nil }); err == nil {
+		t.Fatal("want an error once the window is spent")
+	}
+	if got := runs(t, counter); got != 2 {
+		t.Errorf("ran %d times, want 2 — the live attempt should have restored the window", got)
+	}
 }

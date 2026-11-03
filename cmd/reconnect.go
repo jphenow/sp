@@ -28,11 +28,11 @@ import (
 // that really ended is left alone, so this never fights a deliberate exit.
 
 const (
-	// reconnectWindow bounds total time spent reconnecting before giving up
-	// and handing the terminal back.
-	reconnectWindow = 15 * time.Minute
-	// reconnectMaxBackoff caps the wait between attempts.
-	reconnectMaxBackoff = 30 * time.Second
+	// reconnectMaxBackoff caps the wait between attempts. A reconnect is a
+	// dial and nothing more, so retrying every minute for hours is cheap,
+	// and it bounds how long a laptop that just came back online spends
+	// waiting for sp to notice.
+	reconnectMaxBackoff = time.Minute
 	// stderrTailBytes is how much of the child's stderr is kept to classify a
 	// failure. The messages we match are short and come last.
 	stderrTailBytes = 4096
@@ -40,6 +40,31 @@ const (
 	// the session listing reports nothing. Bounded, so a session that really
 	// has ended stops the loop instead of being recreated forever.
 	maxBlindReattach = 2
+)
+
+// Both of these are variables only so tests can shrink them.
+var (
+	// reconnectWindow bounds an *unbroken run* of failures before sp gives up
+	// and hands the terminal back. It is not a budget for the session: a
+	// session is meant to outlive the laptop it was opened from, so every
+	// attempt that lasted long enough to have been a working connection
+	// starts the window over.
+	//
+	// Long, because the thing on the other end is persistent. The sprite and
+	// its tmux session survive a night of being closed, a flight, a move
+	// between networks; the only reason to stop trying is that nobody is
+	// coming back. Reconnecting after hours away is the normal case, not an
+	// edge one, and the alternative to waiting is a session the user has to
+	// reattach by hand for no reason.
+	reconnectWindow = 12 * time.Hour
+	// reconnectLiveFor is how long an attempt has to last before it counts as
+	// having really connected, which is what resets the window.
+	//
+	// It cannot be short. A dial that fails while the network is away can
+	// itself take tens of seconds — the ssh client waits out its connect
+	// timeout — and counting one of those as a live session would make the
+	// window reset forever and the loop never end.
+	reconnectLiveFor = 5 * time.Minute
 )
 
 // transportErrorMarkers are substrings that identify a lost or refused
@@ -154,7 +179,7 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 	pump := newStdinPump()
 
 	target := first
-	deadline := time.Now().Add(reconnectWindow)
+	failingSince := time.Now()
 	backoff := time.Second
 	blind := 0
 
@@ -163,6 +188,7 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		// The client runs on a pty sp owns rather than on the real terminal,
 		// so sp can see the stream and notice a connection that has stopped
 		// answering. tail gets a copy for classifying the failure.
+		started := time.Now()
 		stalled, err := runProxied(binary, target.args, tail, pump)
 		resetTerminalForRetry()
 
@@ -179,10 +205,18 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 				"\nConnection to %s stopped responding (no reply for %s).\n",
 				target.label, stallEchoGrace)
 		}
-		if time.Now().After(deadline) {
+		// An attempt that stayed up this long was a working connection, so
+		// whatever went wrong afterwards is a new problem and gets the whole
+		// window to itself. Without this the window ran from the moment sp
+		// started, which meant a session that had been fine for a day had no
+		// budget left at all when it finally dropped.
+		if time.Since(started) >= reconnectLiveFor {
+			failingSince, backoff = time.Now(), time.Second
+		}
+		if time.Since(failingSince) >= reconnectWindow {
 			resetTerminal()
 			return fmt.Errorf("connection to %s lost and not restored after %s: %w",
-				target.label, reconnectWindow, err)
+				target.label, time.Since(failingSince).Round(time.Second), err)
 		}
 
 		fmt.Fprintf(os.Stderr, "\nConnection lost (%v). Reconnecting in %s — Ctrl-C to stop.\n",

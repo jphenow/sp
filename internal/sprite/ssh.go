@@ -51,10 +51,19 @@ func SSHUser(spriteName, org string) (string, error) {
 // ServerAliveInterval is the whole point: ssh notices a connection that has
 // stopped answering on its own, which is the watchdog the exec transport does
 // not have. BatchMode keeps a broken connection from stopping on a prompt.
+//
+// ConnectTimeout bounds a dial made while the network is away, which the
+// default leaves to the operating system's TCP timeout — well over a minute on
+// macOS. sp reconnects in a loop and treats an attempt that lasted long enough
+// as a connection that worked, so a dial that hangs for minutes is not just
+// slow, it is indistinguishable from a session. Still generous next to the
+// handshake itself: the gateway answers immediately, and waking the sprite
+// happens after the session is requested.
 func sshBaseArgs() []string {
 	return []string{
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
+		"-o", "ConnectTimeout=30",
 		"-o", "BatchMode=yes",
 	}
 }
