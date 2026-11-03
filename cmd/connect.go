@@ -1088,8 +1088,11 @@ func findExistingSpriteSession(spriteName, org string) string {
 		if len(fields) < 2 {
 			continue
 		}
-		// First field must be a numeric session ID.
-		if _, err := fmt.Sscanf(fields[0], "%d", new(int)); err != nil {
+		// Skip the header and its underline. Session ids used to be small
+		// integers and are now opaque tokens ("tun-Xha-1Yo1PmsM2h8b"), so
+		// the id column cannot be validated by shape — anything that is not
+		// part of the table frame is treated as one.
+		if fields[0] == "ID" || strings.HasPrefix(fields[0], "─") {
 			continue
 		}
 		// Only match tmux sessions — the Command column (field 1+)

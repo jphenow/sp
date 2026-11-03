@@ -97,15 +97,18 @@ func TestRunWithReconnect(t *testing.T) {
 		}
 	})
 
-	t.Run("stops when the session is gone", func(t *testing.T) {
+	t.Run("stops after retrying a session the listing cannot find", func(t *testing.T) {
 		bin, counter := fakeClient(t, "echo 'Error: connection closed' >&2; exit 1")
-		// nil means the session no longer exists: end quietly, don't error.
+		// nil means the listing found no session. That is not proof the
+		// session ended — the column it matches on is truncated — so the
+		// original attach is retried a bounded number of times, then the loop
+		// ends quietly rather than erroring.
 		err := runWithReconnect(bin, attachTarget{label: "test"}, func() *attachTarget { return nil })
 		if err != nil {
-			t.Fatalf("err = %v, want nil when the session is gone", err)
+			t.Fatalf("err = %v, want nil once the retries are spent", err)
 		}
-		if got := runs(t, counter); got != 1 {
-			t.Errorf("ran %d times, want 1", got)
+		if got, want := runs(t, counter), 1+maxBlindReattach; got != want {
+			t.Errorf("ran %d times, want %d", got, want)
 		}
 	})
 }
