@@ -181,8 +181,14 @@ func PushClaudeConfig(client *sprite.Client, spriteName string) error {
 	// extract. --strip is avoided because tar entries are already stored with
 	// paths relative to ~/.claude/ (see addToTarFollowingSymlinks). Idempotent,
 	// as UploadFilesRunning requires: re-extracting the same tar is a no-op.
+	//
+	// Removing the tarball is deliberately outside the success chain. The
+	// uploaded file belongs to whoever the upload ran as and /tmp is sticky, so
+	// the rm can come back "Operation not permitted" — which failed the whole
+	// command, reported a config that had in fact extracted as "not pushed",
+	// and made every retry re-upload the payload.
 	const remoteTar = "/tmp/sp-claude-config.tar.gz"
-	extract := "mkdir -p ~/.claude && cd ~/.claude && tar xzf " + remoteTar + " && rm -f " + remoteTar
+	extract := "mkdir -p ~/.claude && cd ~/.claude && tar xzf " + remoteTar + " && { rm -f " + remoteTar + " || true; }"
 	if err := UploadFilesRunning(client, spriteName, map[string]string{tmpFile.Name(): remoteTar}, extract); err != nil {
 		return fmt.Errorf("pushing claude config: %w", err)
 	}
