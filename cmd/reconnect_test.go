@@ -125,3 +125,33 @@ func TestSprites2ReconnectRefusalIsTransportFailure(t *testing.T) {
 		t.Fatal("the Sprites 2 reconnect refusal should count as a transport failure")
 	}
 }
+
+// TestIsOneShotTmux covers the session rows that must never be attached to.
+// A finished `tmux list-sessions` exec is listed just like an interactive
+// session; attaching to it connects and paints nothing, which looks exactly
+// like the hang this code is supposed to recover from.
+func TestIsOneShotTmux(t *testing.T) {
+	oneShot := []string{
+		"tmux list-sessions",
+		"tmux has-session -t bash",
+		"sh -c for s in $(tmux list-sessions -F ...); do tmux setenv ...",
+		"tmux kill-session -t bash",
+		"tmux capture-pane -p",
+	}
+	for _, cmd := range oneShot {
+		if !isOneShotTmux(cmd) {
+			t.Errorf("isOneShotTmux(%q) = false, want true", cmd)
+		}
+	}
+
+	interactive := []string{
+		"tmux new-session -A -s bash",
+		"tmux attach -t bash",
+		"sh -c exec tmux new-session -A -s bash",
+	}
+	for _, cmd := range interactive {
+		if isOneShotTmux(cmd) {
+			t.Errorf("isOneShotTmux(%q) = true, want false", cmd)
+		}
+	}
+}
