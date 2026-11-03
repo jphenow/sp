@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jphenow/sp/internal/sprite"
 )
 
 func TestIsTransportFailure(t *testing.T) {
@@ -199,5 +201,37 @@ func TestReconnectWindowRestartsAfterALiveSession(t *testing.T) {
 	}
 	if got := runs(t, counter); got != 2 {
 		t.Errorf("ran %d times, want 2 — the live attempt should have restored the window", got)
+	}
+}
+
+// TestSpriteStillThere covers the one distinction that matters on the ssh
+// path: a sprite that is really gone ends the loop, while a listing that could
+// not be fetched does not — being offline is the case the loop exists for, and
+// it fails the listing exactly like a destroyed sprite would.
+func TestSpriteStillThere(t *testing.T) {
+	target := &attachTarget{label: "live"}
+	cases := []struct {
+		name   string
+		script string
+		want   *attachTarget
+	}{
+		{"listed", `echo '{"sprites":[{"id":"1","name":"live"}]}'`, target},
+		{"not listed", `echo '{"sprites":[{"id":"2","name":"other"}]}'`, nil},
+		{"listing failed", `echo 'dial tcp: no route to host' >&2; exit 1`, target},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fake := filepath.Join(dir, "sprite")
+			if err := os.WriteFile(fake, []byte("#!/bin/sh\n"+tc.script+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			got := spriteStillThere(sprite.NewClient(""), "live", target)()
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

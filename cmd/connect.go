@@ -1465,7 +1465,35 @@ func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSessi
 		transportExit: 255,
 	}
 
-	return runWithReconnect(binary, target, func() *attachTarget { return &target })
+	return runWithReconnect(binary, target, spriteStillThere(client, resolved.SpriteName, &target))
+}
+
+// spriteStillThere decides, before each reconnect attempt, whether there is
+// still anything to reconnect to.
+//
+// Reconnecting is worth hours of patience because the session on the other end
+// is persistent — but only while it exists. A destroyed sprite answers every
+// dial with the same transport failure as a sleeping laptop does, so without
+// this the loop would keep dialing a sprite that is never coming back until
+// the whole window ran out.
+//
+// Only a listing that comes back and does not mention the sprite counts as
+// gone. A listing that fails says nothing: that is exactly what being offline
+// looks like, and it is the case the reconnect loop exists for. Returning nil
+// still does not end the loop immediately — it retries a bounded number of
+// times first — which covers a listing that is wrong rather than merely
+// unavailable.
+//
+// The ssh target itself never changes: it ends in `tmux new-session -A`, which
+// attaches to whatever is running and creates it if nothing is.
+func spriteStillThere(client *sprite.Client, spriteName string, target *attachTarget) func() *attachTarget {
+	return func() *attachTarget {
+		info, err := client.Get(spriteName)
+		if err == nil && info == nil {
+			return nil
+		}
+		return target
+	}
 }
 
 // localTerminalSize returns the local controlling terminal's size (rows,
