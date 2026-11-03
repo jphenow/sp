@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"regexp"
 	"strings"
@@ -80,6 +82,20 @@ func isTransportFailure(stderr string) bool {
 	return false
 }
 
+// isTransportExit reports whether the client exited with the status it uses to
+// mean the transport failed.
+func isTransportExit(err error, status int) bool {
+	if err == nil || status == 0 {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+
+	return exitErr.ExitCode() == status
+}
+
 // tailWriter keeps the last stderrTailBytes written to it while passing
 // everything through, so the child's stderr still reaches the terminal.
 type tailWriter struct {
@@ -111,6 +127,12 @@ func (t *tailWriter) String() string {
 type attachTarget struct {
 	args  []string
 	label string
+	// transportExit is an exit status this client uses to mean "the transport
+	// failed", or 0 when it has none. ssh reports 255, which is a far better
+	// signal than reading its stderr: it is the client telling us plainly that
+	// the connection never carried the session, rather than a message we have
+	// to recognize.
+	transportExit int
 }
 
 // runWithReconnect runs an interactive sprite client command, re-running it
@@ -147,7 +169,7 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		// A stall is a dropped connection that nothing reported, so it is
 		// retried like any other — the tmux session on the sprite is untouched
 		// and a fresh attach picks it up.
-		if !stalled && (err == nil || !isTransportFailure(tail.String())) {
+		if !stalled && (err == nil || !(isTransportFailure(tail.String()) || isTransportExit(err, target.transportExit))) {
 			resetTerminal()
 			explainExit(target.label, err, tail.String())
 			return err

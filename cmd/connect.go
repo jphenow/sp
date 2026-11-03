@@ -34,6 +34,7 @@ var (
 	remoteControl bool
 	rcAlias       bool
 	noHold        bool
+	useSSH        bool
 )
 
 // holdCap bounds the default session-tied hold: the sprite is held Active while
@@ -85,6 +86,7 @@ func init() {
 	connectCmd.Flags().DurationVar(&keepWarmDur, "keep-warm", 0, "hold the sprite Active (Tasks API) for up to this duration after disconnect, exiting early if claude is idle for 60s (e.g. 1h, 30m). Default off. See also 'sp keepalive'.")
 	connectCmd.Flags().BoolVar(&remoteControl, "remote-control", false, "launch Claude with Remote Control so the session can be joined from your phone/browser (claude.ai/code)")
 	connectCmd.Flags().BoolVar(&rcAlias, "rc", false, "alias for --remote-control")
+	connectCmd.Flags().BoolVar(&useSSH, "ssh", false, "attach over SSH instead of the sprite CLI's exec (correct window size, live resizing, ssh's own keepalive; not available for sprites whose name contains \"--\")")
 	connectCmd.Flags().BoolVar(&noHold, "no-hold", false, "don't hold the sprite Active for the life of the session (it may idle-pause while you're away)")
 
 	// Register connect as both a subcommand and the default action
@@ -1057,7 +1059,12 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 
 	// Check for an existing persistent session from a prior connect.
 	// If found, reattach directly — tmux + claude are still running.
-	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" {
+	//
+	// The ssh path skips this: its command is `tmux new-session -A`, which
+	// attaches to the session when it exists and creates it when it does not,
+	// so there is nothing to look up. That also leaves behind the part of this
+	// that was fragile — matching a session by a truncated command column.
+	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" && !useSSH {
 		fmt.Printf("Reattaching to session %s...\n", sessionID)
 		return attachToSpriteSession(client, resolved.SpriteName, resolved.Org, sessionID)
 	}
@@ -1338,8 +1345,12 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 	// Caveat: this fixes only the *initial* size — the CLI also doesn't
 	// forward live SIGWINCH, so resizing the local window mid-session won't
 	// reflow until tmux is detached and reattached.
+	// Not needed over ssh, which gets the initial size right and keeps it
+	// right. Worse than unnecessary there: the size is baked into the script
+	// when it is written, so a window resized before a reconnect would be
+	// forced back to the old size.
 	sttyPrefix := ""
-	if rows, cols, ok := localTerminalSize(); ok {
+	if rows, cols, ok := localTerminalSize(); ok && !useSSH {
 		sttyPrefix = fmt.Sprintf("stty rows %d cols %d 2>/dev/null || true\n", rows, cols)
 	}
 
@@ -1384,6 +1395,10 @@ done
 		Command: []string{"sh", "-c", shellCmd},
 	})
 
+	if useSSH {
+		return sshSession(resolved, tmuxSession, shellCmd)
+	}
+
 	binary, err := exec.LookPath("sprite")
 	if err != nil {
 		return fmt.Errorf("sprite binary not found: %w", err)
@@ -1395,6 +1410,39 @@ done
 	return runWithReconnect(binary,
 		attachTarget{args: args, label: resolved.SpriteName},
 		reattachTarget(resolved.SpriteName, resolved.Org))
+}
+
+// sshSession runs the interactive session over SSH.
+//
+// The same script the exec path runs is put on the sprite first and then run
+// from there, which keeps the tokens it embeds out of every argv. Reconnecting
+// re-runs the identical command, because it ends in `tmux new-session -A`:
+// whatever is still running on the sprite is picked up, and nothing is
+// duplicated if it is not.
+func sshSession(resolved *setup.ResolvedTarget, tmuxSession, shellCmd string) error {
+	user, err := sprite.SSHUser(resolved.SpriteName, resolved.Org)
+	if err != nil {
+		return fmt.Errorf("--ssh: %w", err)
+	}
+
+	binary, err := exec.LookPath("ssh")
+	if err != nil {
+		return fmt.Errorf("ssh not found: %w", err)
+	}
+
+	remoteScript := sprite.SSHRemoteScriptPath(tmuxSession)
+	if err := sprite.WriteRemoteScript(user, remoteScript, shellCmd); err != nil {
+		return err
+	}
+
+	target := attachTarget{
+		args:  sprite.SSHInteractiveArgs(user, remoteScript),
+		label: resolved.SpriteName,
+		// ssh exits 255 when the connection itself failed.
+		transportExit: 255,
+	}
+
+	return runWithReconnect(binary, target, func() *attachTarget { return &target })
 }
 
 // localTerminalSize returns the local controlling terminal's size (rows,
