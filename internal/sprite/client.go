@@ -259,6 +259,15 @@ func (c *Client) BuildExecArgs(opts ExecOptions) []string {
 	}
 	if opts.TTY {
 		args = append(args, "--tty")
+	} else {
+		// sp never pipes anything into a sprite exec: these calls capture
+		// output and leave the child's stdin on /dev/null. The CLI cannot see
+		// the difference — a stdin that is not a terminal looks like piped
+		// input — so it forwards it implicitly and, because it cannot prove
+		// keystrokes were delivered, turns off its own reconnection. Every
+		// setup command was therefore one dropped packet away from failing.
+		// Saying so explicitly keeps them reconnectable.
+		args = append(args, "--no-stdin")
 	}
 	if opts.Dir != "" {
 		args = append(args, "--dir", opts.Dir)
