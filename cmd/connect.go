@@ -1428,14 +1428,27 @@ func resetTerminal() {
 	//
 	// Every sequence here is a no-op when that state isn't set, so this is safe
 	// to send after a clean exit too.
-	fmt.Fprintf(os.Stderr,
-		"\033[?1000l\033[?1003l\033[?1006l"+ // mouse reporting off
-			"\033[?1049l"+ // leave alternate screen (restores scrollback)
-			"\033[r"+ // reset scroll region to the full window
-			"\033[?2004l"+ // bracketed paste off
-			"\033[?1004l"+ // focus reporting off
-			"\033[<u"+ // pop kitty keyboard protocol state
-			"\033[?7h"+ // autowrap back on
-			"\033[?25h"+ // cursor visible
-			"\033[m") // reset colors and attributes
+	fmt.Fprint(os.Stderr, termResetModes+
+		"\033[?1049l") // leave alternate screen (restores scrollback)
+}
+
+// termResetModes undoes the terminal modes the sprite client sets, without
+// leaving the alternate screen.
+const termResetModes = "\033[?1000l\033[?1003l\033[?1006l" + // mouse reporting off
+	"\033[r" + // reset scroll region to the full window
+	"\033[?2004l" + // bracketed paste off
+	"\033[?1004l" + // focus reporting off
+	"\033[<u" + // pop kitty keyboard protocol state
+	"\033[?7h" + // autowrap back on
+	"\033[?25h" + // cursor visible
+	"\033[m" // reset colors and attributes
+
+// resetTerminalForRetry undoes the same modes between two attach attempts,
+// but stays in the alternate screen.
+//
+// Leaving it would uncover the local scrollback for as long as the reconnect
+// takes and then be hidden again by the next attach, so a recovery that works
+// looks like the window being lost and restored.
+func resetTerminalForRetry() {
+	fmt.Fprint(os.Stderr, termResetModes)
 }
