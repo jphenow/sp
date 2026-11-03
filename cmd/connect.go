@@ -208,6 +208,15 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		startStatus = info.Status
 	}
 
+	// Most targets resolve without an organization — only a .sprite file
+	// carries one — and the sprite CLI falls back to its configured default,
+	// so nothing on the exec path ever needed it. The listing we just read
+	// names the org, which is where ssh gets it from: the gateway username is
+	// "<sprite>--<cluster>--<org>" and there is no default to fall back to.
+	if resolved.Org == "" && info != nil {
+		resolved.Org = info.Organization
+	}
+
 	// Sequential prologue: create + wait + perms must happen in order before
 	// any parallel setup (earlier bug: a parallel perms-fix raced with the
 	// ready-check and waited 55s instead of piggybacking). These used to be
@@ -1396,7 +1405,7 @@ done
 	})
 
 	if useSSH {
-		return sshSession(resolved, tmuxSession, shellCmd)
+		return sshSession(client, resolved, tmuxSession, shellCmd)
 	}
 
 	binary, err := exec.LookPath("sprite")
@@ -1419,8 +1428,22 @@ done
 // re-runs the identical command, because it ends in `tmux new-session -A`:
 // whatever is still running on the sprite is picked up, and nothing is
 // duplicated if it is not.
-func sshSession(resolved *setup.ResolvedTarget, tmuxSession, shellCmd string) error {
-	user, err := sprite.SSHUser(resolved.SpriteName, resolved.Org)
+func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSession, shellCmd string) error {
+	org := resolved.Org
+	if org == "" {
+		// A sprite created during this run was never listed, so nothing has
+		// said which org it is in yet. Worth one lookup: without it the
+		// session cannot be addressed at all.
+		info, err := client.Get(resolved.SpriteName)
+		if err != nil {
+			return fmt.Errorf("--ssh: finding the sprite's organization: %w", err)
+		}
+		if info != nil {
+			org = info.Organization
+		}
+	}
+
+	user, err := sprite.SSHUser(resolved.SpriteName, org)
 	if err != nil {
 		return fmt.Errorf("--ssh: %w", err)
 	}
