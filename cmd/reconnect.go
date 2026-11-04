@@ -3,15 +3,19 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unicode"
+
+	"github.com/jphenow/sp/internal/store"
 )
 
 // Dropping the connection to a sprite used to end the whole session: the local
@@ -189,18 +193,29 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		// so sp can see the stream and notice a connection that has stopped
 		// answering. tail gets a copy for classifying the failure.
 		started := time.Now()
-		stalled, err := runProxied(binary, target.args, tail, pump)
+		outcome, err := runProxied(binary, target.args, tail, pump)
 		resetTerminalForRetry()
+		uptime := time.Since(started)
+		dropped := outcome.stalled || (err != nil && (isTransportFailure(tail.String()) || isTransportExit(err, target.transportExit)))
+		recordAttempt(store.Attempt{
+			Sprite:      target.label,
+			Transport:   filepath.Base(binary),
+			Outcome:     attemptName(err, outcome.stalled, dropped),
+			Uptime:      uptime,
+			FirstOutput: outcome.firstOutput,
+			Attempt:     attempt,
+			Detail:      lastVisibleLine(tail.String()),
+		})
 
 		// A stall is a dropped connection that nothing reported, so it is
 		// retried like any other — the tmux session on the sprite is untouched
 		// and a fresh attach picks it up.
-		if !stalled && (err == nil || !(isTransportFailure(tail.String()) || isTransportExit(err, target.transportExit))) {
+		if !dropped {
 			resetTerminal()
 			explainExit(target.label, err, tail.String())
 			return err
 		}
-		if stalled {
+		if outcome.stalled {
 			fmt.Fprintf(os.Stderr,
 				"\nConnection to %s stopped responding (no reply for %s).\n",
 				target.label, stallEchoGrace)
@@ -210,7 +225,7 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		// window to itself. Without this the window ran from the moment sp
 		// started, which meant a session that had been fine for a day had no
 		// budget left at all when it finally dropped.
-		if time.Since(started) >= reconnectLiveFor {
+		if uptime >= reconnectLiveFor {
 			failingSince, backoff = time.Now(), time.Second
 		}
 		if time.Since(failingSince) >= reconnectWindow {
@@ -245,6 +260,39 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 			return nil
 		}
 		fmt.Fprintf(os.Stderr, "Reconnecting to %s (attempt %d)...\n", target.label, attempt+1)
+	}
+}
+
+// attemptName labels how an attempt ended, for the recorded log.
+func attemptName(err error, stalled, dropped bool) string {
+	switch {
+	case err == nil:
+		return "clean"
+	case stalled:
+		return "stall"
+	case dropped:
+		return "dropped"
+	default:
+		return "ended"
+	}
+}
+
+// recordAttempt appends one ended attempt to sp's local log.
+//
+// Best-effort and silent: this exists to answer "is this sprite really worse,
+// or does it only feel worse", and a question about reliability is not worth
+// interrupting a reconnect over. The database is opened per attempt rather
+// than held, because an attempt can last days and the daemon writes to the
+// same file.
+func recordAttempt(a store.Attempt) {
+	db, err := store.Open()
+	if err != nil {
+		slog.Debug("recording session attempt", "err", err)
+		return
+	}
+	defer db.Close()
+	if err := db.RecordAttempt(a); err != nil {
+		slog.Debug("recording session attempt", "err", err)
 	}
 }
 

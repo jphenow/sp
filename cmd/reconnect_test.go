@@ -55,6 +55,13 @@ func fakeClient(t *testing.T, script string) (path, counter string) {
 	return path, counter
 }
 
+// isolateStore points the attempt log at a throwaway home, so running the
+// tests does not append test sessions to the real one.
+func isolateStore(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+}
+
 func runs(t *testing.T, counter string) int {
 	t.Helper()
 	data, err := os.ReadFile(counter)
@@ -66,6 +73,7 @@ func runs(t *testing.T, counter string) int {
 }
 
 func TestRunWithReconnect(t *testing.T) {
+	isolateStore(t)
 	sameTarget := func(args []string) func() *attachTarget {
 		return func() *attachTarget { return &attachTarget{args: args, label: "test"} }
 	}
@@ -187,6 +195,7 @@ func TestLastVisibleLine(t *testing.T) {
 // none of it left when the connection finally dropped, so the first failure
 // ended the session instead of being reconnected.
 func TestReconnectWindowRestartsAfterALiveSession(t *testing.T) {
+	isolateStore(t)
 	defer func(window, live time.Duration) {
 		reconnectWindow, reconnectLiveFor = window, live
 	}(reconnectWindow, reconnectLiveFor)

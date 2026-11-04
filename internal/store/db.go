@@ -135,6 +135,22 @@ func (d *DB) migrate() error {
 			tag TEXT,
 			PRIMARY KEY (sprite_name, tag)
 		)`,
+		// No foreign key to sprites: a session attempt is a fact about a
+		// sprite sp may never have tracked (a bare `sp connect <name>` does
+		// not create a row), and losing the evidence because of that would
+		// defeat the point of keeping it.
+		`CREATE TABLE IF NOT EXISTS session_attempts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			at DATETIME NOT NULL,
+			sprite TEXT NOT NULL,
+			transport TEXT DEFAULT '',
+			outcome TEXT DEFAULT '',
+			uptime_ms INTEGER DEFAULT 0,
+			first_output_ms INTEGER DEFAULT 0,
+			attempt INTEGER DEFAULT 0,
+			detail TEXT DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS session_attempts_at ON session_attempts(at)`,
 		`CREATE TABLE IF NOT EXISTS sync_sessions (
 			sprite_name TEXT REFERENCES sprites(name) ON DELETE CASCADE UNIQUE,
 			mutagen_id TEXT,

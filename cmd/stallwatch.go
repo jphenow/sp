@@ -157,6 +157,19 @@ func (p *stdinPump) deliver(b []byte) {
 	dest.Write(b)
 }
 
+// attemptOutcome is what one run of the client is worth knowing afterwards,
+// beyond the error it exited with.
+type attemptOutcome struct {
+	// stalled is true when the client was killed for not answering input.
+	stalled bool
+	// firstOutput is how long the client took to print anything, or 0 when it
+	// never did. A reattach to a sprite that is awake paints the session
+	// immediately; one that has to wake the sprite first does not, so this is
+	// the only local measurement of a cost that otherwise just looks like a
+	// bad connection.
+	firstOutput time.Duration
+}
+
 // runProxied runs the sprite client on a pty that sp owns, copying between it
 // and the real terminal, and kills it if the connection stops answering input.
 //
@@ -168,11 +181,12 @@ func (p *stdinPump) deliver(b []byte) {
 // stderr to capture (both land in the one stream), so failure classification
 // reads the combined output; the markers it looks for are distinctive enough
 // not to collide with ordinary session text.
-func runProxied(binary string, args []string, tap io.Writer, pump *stdinPump) (bool, error) {
+func runProxied(binary string, args []string, tap io.Writer, pump *stdinPump) (attemptOutcome, error) {
+	started := time.Now()
 	cmd := exec.Command(binary, args...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return false, err
+		return attemptOutcome{}, err
 	}
 	defer ptmx.Close()
 
@@ -205,11 +219,13 @@ func runProxied(binary string, args []string, tap io.Writer, pump *stdinPump) (b
 	pump.attach(ptmx, det)
 	defer pump.detach()
 
+	var firstOutput atomic.Int64
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := ptmx.Read(buf)
 			if n > 0 {
+				firstOutput.CompareAndSwap(0, int64(time.Since(started)))
 				det.sawOutput()
 				os.Stdout.Write(buf[:n])
 				tap.Write(buf[:n])
@@ -241,5 +257,8 @@ func runProxied(binary string, args []string, tap io.Writer, pump *stdinPump) (b
 	}()
 
 	err = cmd.Wait()
-	return stalled.Load(), err
+	return attemptOutcome{
+		stalled:     stalled.Load(),
+		firstOutput: time.Duration(firstOutput.Load()),
+	}, err
 }
