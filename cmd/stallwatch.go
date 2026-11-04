@@ -33,10 +33,20 @@ import (
 
 const (
 	// stallEchoGrace is how long an unanswered keystroke is tolerated before
-	// the connection is called dead. Generous next to the milliseconds an echo
-	// actually takes: the cost of being wrong is a needless reattach, but it
-	// still has to be short enough to beat reaching for another terminal.
-	stallEchoGrace = 12 * time.Second
+	// the connection is called dead. Enormous next to the milliseconds an echo
+	// actually takes, and it has to be: a keystroke sent to a sprite that has
+	// idle-paused is answered only once the sprite wakes, which was measured
+	// at 11.7s. At the 12s this used to be, sp was deciding on a coin flip
+	// whether a waking sprite was a dead connection — and killing it meant
+	// another wake, which could be killed the same way.
+	//
+	// It is also deliberately past the point where ssh gives up on its own
+	// (ServerAliveInterval 15 x 3), so on that transport the client's own
+	// verdict comes first and this stays the backstop for the case ssh has no
+	// answer for. The cost is that a genuinely dead connection now takes a
+	// minute to notice, which is still the difference between waiting and
+	// opening another terminal to kill sp by hand.
+	stallEchoGrace = time.Minute
 	// stallPollEvery is how often the grace period is checked.
 	stallPollEvery = time.Second
 )
