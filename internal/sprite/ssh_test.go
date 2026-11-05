@@ -37,7 +37,7 @@ func TestSSHUser(t *testing.T) {
 }
 
 func TestSSHInteractiveArgs(t *testing.T) {
-	args := SSHInteractiveArgs("blue--default--org", "/tmp/.sp-connect-x.sh")
+	args := SSHInteractiveArgs("blue--default--org", "/tmp/.sp-connect-x.sh", "/tmp/ssh-blue.log")
 	if !slices.Contains(args, "-t") {
 		t.Errorf("a TTY is required for an interactive session: %v", args)
 	}
@@ -49,6 +49,18 @@ func TestSSHInteractiveArgs(t *testing.T) {
 	}
 	if !strings.HasSuffix(args[slices.Index(args, "--")-1], "@"+SSHHost) {
 		t.Errorf("the destination should precede the separator: %v", args)
+	}
+	// The log is the only account of a drop on this transport, so it has to be
+	// asked for explicitly and sent to a file rather than to the terminal.
+	if !slices.Contains(args, "-v") || !slices.Contains(args, "/tmp/ssh-blue.log") {
+		t.Errorf("the connection log should be requested: %v", args)
+	}
+
+	// Without a path, nothing is logged and nothing is made verbose: a verbose
+	// client with no log file writes its debugging into the session.
+	plain := SSHInteractiveArgs("blue--default--org", "/tmp/.sp-connect-x.sh", "")
+	if slices.Contains(plain, "-v") || slices.Contains(plain, "-E") {
+		t.Errorf("verbose logging should be opt-in: %v", plain)
 	}
 }
 

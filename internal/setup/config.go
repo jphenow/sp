@@ -159,14 +159,14 @@ func RunSetupConf(client *sprite.Client, spriteName string, conf *SetupConf) err
 	// Process files
 	for _, f := range conf.Files {
 		if err := copySetupFile(client, spriteName, f); err != nil {
-			progress.Warnf("Warning: failed to copy %s: %v", f.Source, err)
+			progress.WarnfFrom("setup-files", "Warning: failed to copy %s: %v", f.Source, err)
 		}
 	}
 
 	// Process commands
 	for _, c := range conf.Commands {
 		if err := runSetupCommand(client, spriteName, c); err != nil {
-			progress.Warnf("Warning: failed to run command: %v", err)
+			progress.WarnfFrom("setup-files", "Warning: failed to run command: %v", err)
 		}
 	}
 

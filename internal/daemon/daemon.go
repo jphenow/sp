@@ -208,6 +208,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	go d.healthPoller(ctx)
 	go d.idleWatcher(ctx)
 	go d.binaryWatcher(ctx)
+	go d.pruner(ctx)
 
 	// Start the sync/proxy health monitor
 	monitor := NewHealthMonitor(d.db, d, d.broadcast)
@@ -362,6 +363,43 @@ func (d *Daemon) healthPoller(ctx context.Context) {
 			return
 		case <-ticker.C:
 			d.pollSpriteHealth()
+		}
+	}
+}
+
+// DiagnosticRetention is how long the daemon keeps recorded warnings and
+// session attempts. It belongs to the daemon because the daemon is the only
+// part of sp that is always running: pruning from a command would mean either
+// doing it on every invocation or never doing it at all.
+const DiagnosticRetention = 30 * 24 * time.Hour
+
+// pruner drops diagnostics past the retention window, so the tables that
+// record every warning and every connection attempt cannot grow without end.
+//
+// Daily is often enough for a window measured in weeks, and the sweep runs on
+// startup as well, since a laptop's daemon is restarted more often than it
+// stays up for a day.
+func (d *Daemon) pruner(ctx context.Context) {
+	prune := func() {
+		n, err := d.db.Prune(time.Now().Add(-DiagnosticRetention))
+		if err != nil {
+			slog.Warn("pruning diagnostics", "err", err)
+			return
+		}
+		if n > 0 {
+			slog.Info("pruned diagnostics", "rows", n, "older_than", DiagnosticRetention)
+		}
+	}
+	prune()
+
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			prune()
 		}
 	}
 }

@@ -2,7 +2,9 @@ package sprite
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -81,8 +83,40 @@ func SSHRemoteScriptPath(tmuxSession string) string {
 
 // SSHInteractiveArgs builds the argv for the interactive session: a real TTY
 // running a script that is already on the sprite.
-func SSHInteractiveArgs(user, remoteScript string) []string {
-	return append(sshBaseArgs(), "-t", user+"@"+SSHHost, "--", "bash", remoteScript)
+//
+// logPath, when given, is where ssh keeps its own account of the connection.
+// sp sees a drop only as an exit status and whatever reached the terminal,
+// which for ssh is usually nothing at all — the client is quiet by design, so
+// a session that ends has no stated cause. One -v is enough to say which end
+// gave up and why (a keepalive that went unanswered reads differently from a
+// channel the server closed), and it goes to a file rather than to the
+// terminal, where it would be mixed into the session's own output.
+func SSHInteractiveArgs(user, remoteScript, logPath string) []string {
+	args := sshBaseArgs()
+	if logPath != "" {
+		args = append(args, "-v", "-E", logPath)
+	}
+
+	return append(args, "-t", user+"@"+SSHHost, "--", "bash", remoteScript)
+}
+
+// SSHSessionLogPath names the file ssh writes its connection log to, one per
+// sprite.
+//
+// ssh appends, so the caller truncates it when a session starts: one file then
+// holds the whole of the current run, every reconnect attempt included, which
+// is the unit anyone investigating a drop actually wants.
+func SSHSessionLogPath(spriteName string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	name := sshRemoteScriptName.ReplaceAllString(spriteName, "-")
+	if name == "" {
+		name = "session"
+	}
+
+	return filepath.Join(home, ".config", "sp", "ssh-"+name+".log"), nil
 }
 
 // WriteRemoteScript puts the session script on the sprite, passing it over

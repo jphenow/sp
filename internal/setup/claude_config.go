@@ -156,7 +156,7 @@ func PushClaudeConfig(client *sprite.Client, spriteName string) error {
 			// Non-fatal: warn and skip. We want PushClaudeConfig to be
 			// best-effort so a single broken entry (unreadable file,
 			// stale symlink) doesn't block the whole connect flow.
-			progress.Warnf("Warning: packing %s: %v", name, err)
+			progress.WarnfFrom("claude-config", "Warning: packing %s: %v", name, err)
 		}
 	}
 

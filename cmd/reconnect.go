@@ -138,19 +138,80 @@ func isTransportExit(err error, status int) bool {
 // Interrupts are excluded. SIGINT and SIGQUIT are how a person says stop, and
 // retrying after one would leave no way to end a session by hand.
 func isSignalDeath(err error) bool {
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
+	sig, ok := deathSignal(err)
+	if !ok {
 		return false
 	}
-	status, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok || !status.Signaled() {
-		return false
-	}
-	switch status.Signal() {
+	switch sig {
 	case syscall.SIGINT, syscall.SIGQUIT:
 		return false
 	}
 	return true
+}
+
+// deathSignal returns the signal the client died on.
+func deathSignal(err error) (syscall.Signal, bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return 0, false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return 0, false
+	}
+	return status.Signal(), true
+}
+
+// signalName describes the signal a client died on, or "" if it exited on its
+// own.
+//
+// Worth recording rather than folding into "killed", because the signal is
+// most of the diagnosis and the three common ones mean entirely different
+// things: a hangup says the terminal or parent went away, a termination says
+// something asked politely and can be traced to whatever asks, and a kill says
+// the kernel or a -9 — out of memory, or deliberate. Both the number and the
+// name go in, since the name alone ("killed") is the same word sp uses for the
+// outcome and says nothing extra.
+func signalName(err error) string {
+	sig, ok := deathSignal(err)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("signal %d (%v)", int(sig), sig)
+}
+
+// tailLines returns the last n non-empty lines of a file, or "" if it cannot
+// be read. Bounded: a verbose transport log of a long session is large, and
+// only its end describes how the session finished.
+func tailLines(path string, n int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	const window = 8192
+	start := info.Size() - window
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, info.Size()-start)
+	if _, err := f.ReadAt(buf, start); err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(buf), "\n")
+	var kept []string
+	for i := len(lines) - 1; i >= 0 && len(kept) < n; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			kept = append([]string{l}, kept...)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 // tailWriter keeps the last stderrTailBytes written to it while passing
@@ -190,6 +251,11 @@ type attachTarget struct {
 	// the connection never carried the session, rather than a message we have
 	// to recognize.
 	transportExit int
+	// transportLog is a file the client writes its own account of the
+	// connection to, or "" when it has none. On a drop this is the only
+	// explanation that exists: what reached the terminal is the session's own
+	// output, not the transport's reasoning.
+	transportLog string
 }
 
 // renewSessionHold refreshes the keepalive hold on the sprite, or is nil when
@@ -247,6 +313,10 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 			(err != nil && (isTransportFailure(tail.String()) ||
 				isTransportExit(err, target.transportExit) ||
 				isSignalDeath(err)))
+		detail := lastVisibleLine(tail.String())
+		if sig := signalName(err); sig != "" {
+			detail = strings.TrimSpace(sig + " " + detail)
+		}
 		recordAttempt(store.Attempt{
 			Sprite:      target.label,
 			Transport:   filepath.Base(binary),
@@ -254,8 +324,19 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 			Uptime:      uptime,
 			FirstOutput: outcome.firstOutput,
 			Attempt:     attempt,
-			Detail:      lastVisibleLine(tail.String()),
+			Detail:      detail,
 		})
+		// The transport's own log, kept only for a drop: a session that ended
+		// cleanly needs no explanation, and keeping the tail of every clean
+		// exit would bury the ones that do.
+		if dropped {
+			if tailed := tailLines(target.transportLog, 8); tailed != "" {
+				recordEvent(store.Event{Level: "warn", Source: "transport",
+					Sprite:  target.label,
+					Message: fmt.Sprintf("connection dropped after %s (%v)", uptime.Round(time.Second), err),
+					Detail:  tailed})
+			}
+		}
 
 		// A stall is a dropped connection that nothing reported, so it is
 		// retried like any other — the tmux session on the sprite is untouched

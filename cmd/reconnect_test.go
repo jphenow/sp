@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -236,6 +238,39 @@ func TestReconnectWindowRestartsAfterALiveSession(t *testing.T) {
 	}
 	if got := runs(t, counter); got != 2 {
 		t.Errorf("ran %d times, want 2 — the live attempt should have restored the window", got)
+	}
+}
+
+// TestSignalName covers the field that turns "killed" into a diagnosis. The
+// three common signals mean entirely different things, and the record used to
+// throw the distinction away.
+func TestSignalName(t *testing.T) {
+	for _, tc := range []struct {
+		signal syscall.Signal
+		want   string
+	}{
+		{syscall.SIGKILL, "signal 9 (killed)"},
+		{syscall.SIGTERM, "signal 15 (terminated)"},
+		{syscall.SIGHUP, "signal 1 (hangup)"},
+	} {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Process.Signal(tc.signal); err != nil {
+			t.Fatal(err)
+		}
+		if got := signalName(cmd.Wait()); got != tc.want {
+			t.Errorf("got %q, want %q", got, tc.want)
+		}
+	}
+
+	// A client that exited on its own has no signal to report.
+	if got := signalName(exec.Command("false").Run()); got != "" {
+		t.Errorf("got %q, want empty for a plain non-zero exit", got)
+	}
+	if got := signalName(nil); got != "" {
+		t.Errorf("got %q, want empty for a clean exit", got)
 	}
 }
 
