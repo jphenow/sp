@@ -125,6 +125,34 @@ func isTransportExit(err error, status int) bool {
 	return exitErr.ExitCode() == status
 }
 
+// isSignalDeath reports whether the client was killed by a signal instead of
+// exiting on its own.
+//
+// A signal is not the client's verdict on the session — the process never got
+// to form one. sp used to read one as a deliberate exit and hand the terminal
+// back, which is how an ssh client killed by something outside sp ended a
+// session that was still perfectly alive on the sprite. With nothing attached
+// to hold it awake the sprite then idle-paused, stopped half an hour later,
+// and took the tmux server and every pane in it along.
+//
+// Interrupts are excluded. SIGINT and SIGQUIT are how a person says stop, and
+// retrying after one would leave no way to end a session by hand.
+func isSignalDeath(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return false
+	}
+	switch status.Signal() {
+	case syscall.SIGINT, syscall.SIGQUIT:
+		return false
+	}
+	return true
+}
+
 // tailWriter keeps the last stderrTailBytes written to it while passing
 // everything through, so the child's stderr still reaches the terminal.
 type tailWriter struct {
@@ -196,7 +224,10 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		outcome, err := runProxied(binary, target.args, tail, pump)
 		resetTerminalForRetry()
 		uptime := time.Since(started)
-		dropped := outcome.stalled || (err != nil && (isTransportFailure(tail.String()) || isTransportExit(err, target.transportExit)))
+		dropped := outcome.stalled ||
+			(err != nil && (isTransportFailure(tail.String()) ||
+				isTransportExit(err, target.transportExit) ||
+				isSignalDeath(err)))
 		recordAttempt(store.Attempt{
 			Sprite:      target.label,
 			Transport:   filepath.Base(binary),
@@ -270,6 +301,8 @@ func attemptName(err error, stalled, dropped bool) string {
 		return "clean"
 	case stalled:
 		return "stall"
+	case isSignalDeath(err):
+		return "killed"
 	case dropped:
 		return "dropped"
 	default:
@@ -279,21 +312,37 @@ func attemptName(err error, stalled, dropped bool) string {
 
 // recordAttempt appends one ended attempt to sp's local log.
 //
-// Best-effort and silent: this exists to answer "is this sprite really worse,
-// or does it only feel worse", and a question about reliability is not worth
-// interrupting a reconnect over. The database is opened per attempt rather
-// than held, because an attempt can last days and the daemon writes to the
-// same file.
+// This exists to answer "is this sprite really worse, or does it only feel
+// worse". The database is opened per attempt rather than held, because an
+// attempt can last days and the daemon writes to the same file.
 func recordAttempt(a store.Attempt) {
 	db, err := store.Open()
 	if err != nil {
-		slog.Debug("recording session attempt", "err", err)
+		warnAttemptLog(err)
 		return
 	}
 	defer db.Close()
 	if err := db.RecordAttempt(a); err != nil {
-		slog.Debug("recording session attempt", "err", err)
+		warnAttemptLog(err)
 	}
+}
+
+// attemptLogWarned keeps a broken attempt log to one warning per run, so a
+// database that cannot be written does not print on every reconnect.
+var attemptLogWarned sync.Once
+
+// warnAttemptLog reports that an attempt went unrecorded.
+//
+// This was a debug line, on the grounds that a question about reliability is
+// not worth interrupting a reconnect over. That was the wrong trade: the log is
+// the only answer to "does this sprite really drop more often", and failing
+// quietly means the answer comes back missing rather than known to be absent.
+func warnAttemptLog(err error) {
+	slog.Debug("recording session attempt", "err", err)
+	attemptLogWarned.Do(func() {
+		fmt.Fprintf(os.Stderr,
+			"Note: sp could not record this session attempt (%v); `sp disconnects` will be incomplete.\n", err)
+	})
 }
 
 // explainExit reports why the session ended when the client exited non-zero

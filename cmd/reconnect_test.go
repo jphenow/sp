@@ -108,6 +108,32 @@ func TestRunWithReconnect(t *testing.T) {
 		}
 	})
 
+	t.Run("client killed by a signal reconnects", func(t *testing.T) {
+		// Nothing on stderr and no transport exit status: the only evidence is
+		// that the process died on a signal. sp used to read this as the
+		// session ending and hand the terminal back, while the tmux session it
+		// was attached to was still running on the sprite.
+		bin, counter := fakeClient(t, `if [ "$n" -lt 2 ]; then kill -9 $$; fi; exit 0`)
+		if err := runWithReconnect(bin, attachTarget{label: "test"}, sameTarget(nil)); err != nil {
+			t.Fatalf("err = %v, want nil after reconnect", err)
+		}
+		if got := runs(t, counter); got != 2 {
+			t.Errorf("ran %d times, want 2", got)
+		}
+	})
+
+	t.Run("interrupt is not retried", func(t *testing.T) {
+		// Ctrl-C has to be able to end a session, so an interrupt is the one
+		// signal that still counts as the client being told to stop.
+		bin, counter := fakeClient(t, `kill -INT $$`)
+		if err := runWithReconnect(bin, attachTarget{label: "test"}, sameTarget(nil)); err == nil {
+			t.Fatal("want the interrupt to propagate")
+		}
+		if got := runs(t, counter); got != 1 {
+			t.Errorf("ran %d times, want 1", got)
+		}
+	})
+
 	t.Run("stops after retrying a session the listing cannot find", func(t *testing.T) {
 		bin, counter := fakeClient(t, "echo 'Error: connection closed' >&2; exit 1")
 		// nil means the listing found no session. That is not proof the
