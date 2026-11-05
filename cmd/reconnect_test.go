@@ -239,6 +239,32 @@ func TestReconnectWindowRestartsAfterALiveSession(t *testing.T) {
 	}
 }
 
+// TestReconnectRenewsTheSessionHold covers the hold being restored on each
+// reattach. Without it the hold's cap expired while a session was still in
+// use, and the sprite was then free to pause and stop between two attempts.
+func TestReconnectRenewsTheSessionHold(t *testing.T) {
+	isolateStore(t)
+	defer func(f func()) { renewSessionHold = f }(renewSessionHold)
+	renewals := 0
+	renewSessionHold = func() { renewals++ }
+
+	bin, counter := fakeClient(t, `if [ "$n" = 1 ]; then echo "Error: connection closed" >&2; exit 1; fi; exit 0`)
+	err := runWithReconnect(bin, attachTarget{label: "test"}, func() *attachTarget {
+		return &attachTarget{label: "test"}
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want nil after reconnect", err)
+	}
+	if got := runs(t, counter); got != 2 {
+		t.Fatalf("ran %d times, want 2", got)
+	}
+	// Once, for the reattach. Not for the first attempt: its caller had just
+	// started a fresh hold.
+	if renewals != 1 {
+		t.Errorf("renewed the hold %d times, want 1", renewals)
+	}
+}
+
 // TestSpriteStillThere covers the one distinction that matters on the ssh
 // path: a sprite that is really gone ends the loop, while a listing that could
 // not be fetched does not — being offline is the case the loop exists for, and

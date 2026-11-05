@@ -43,6 +43,48 @@ var (
 // older idle-exit behavior; --no-hold disables it entirely.
 const holdCap = 8 * time.Hour
 
+// sessionIdleTimeout is how long a sprite sp connects to keeps running once
+// nothing is using it.
+//
+// The server default is 30 seconds, counted from the moment the last exec,
+// shell, connection or keep-awake lease goes away. For a sprite driven by an
+// API that is sensible; for one holding a tmux session it is not, because the
+// usual reason nothing is using the sprite is a dropped connection that is
+// about to come back. Thirty seconds after it drops the sprite pauses, and
+// half an hour later it stops for good — which ends the tmux server and
+// everything running in it, while the session itself was never ended by
+// anyone.
+//
+// Fifteen minutes covers a drop, a reconnect that has to wait out its backoff,
+// and sp being killed while nobody is watching, while still letting a sprite
+// nobody is using stop on its own. It applies at the next cold start, so
+// setting it does nothing for the session running now.
+const sessionIdleTimeout = 15 * time.Minute
+
+// ensureIdleTimeout raises the sprite's idle timeout when it is still set
+// shorter than sp wants, using the listing connect has already fetched.
+//
+// The listing omits the field when it has never been set, which is the case
+// that matters: it means the sprite is on the 30-second default. One update is
+// enough — it is part of the sprite's configuration, so later connects see the
+// new value and leave it alone.
+func ensureIdleTimeout(client *sprite.Client, name string, info *sprite.Info) {
+	if info != nil && info.Config != nil && info.Config.IdleTimeoutMS != nil &&
+		*info.Config.IdleTimeoutMS >= int(sessionIdleTimeout.Milliseconds()) {
+		return
+	}
+	if err := client.SetIdleTimeout(name, sessionIdleTimeout); err != nil {
+		// Worth saying out loud: without it the sprite can stop while sp is
+		// away, and that costs the tmux session rather than just a reconnect.
+		fmt.Fprintf(os.Stderr, "Warning: could not raise the sprite's idle timeout to %s: %v\n",
+			sessionIdleTimeout, err)
+		return
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "Idle timeout set to %s (applies at the next cold start)\n", sessionIdleTimeout)
+	}
+}
+
 // connectCmd handles `sp .` and `sp owner/repo` — the core connect flow.
 var connectCmd = &cobra.Command{
 	Use:   "connect [target] [variant]",
@@ -472,12 +514,29 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// Idle-exit is wrong here (it assumes idle == done, but an idle prompt
 		// usually means you stepped away), so the hold releases on session end
 		// instead — or at holdCap, so an abandoned session can't bill forever.
-		if err := launchKeepAlive(resolved.SpriteName, resolved.Org, holdCap, "", deriveTmuxSessionName()); err != nil {
+		hold := func() error {
+			return launchKeepAlive(resolved.SpriteName, resolved.Org, holdCap, "", deriveTmuxSessionName())
+		}
+		if err := hold(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: starting session hold: %v\n", err)
 		} else if verbose {
 			fmt.Fprintf(os.Stderr, "Holding sprite Active until this session ends (cap %s)\n", holdCap)
 		}
+		// Reconnecting restores the hold, so the cap bounds how long sp can be
+		// gone rather than how long the session has been open. See
+		// renewSessionHold.
+		renewSessionHold = func() {
+			if err := hold(); err != nil && verbose {
+				fmt.Fprintf(os.Stderr, "Warning: renewing session hold: %v\n", err)
+			}
+		}
 	}
+
+	// The hold only covers the time sp is running. A sprite whose session sp
+	// is no longer watching — because sp was killed, or the laptop went away —
+	// falls back on its own idle timeout, and the default is far too short for
+	// a tmux session to survive.
+	ensureIdleTimeout(client, resolved.SpriteName, info)
 
 	reportConnectTimings(resolved.SpriteName, startStatus, time.Since(connectStart))
 

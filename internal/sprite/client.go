@@ -338,6 +338,39 @@ func ProxyStderr(cmd *exec.Cmd) string {
 	return ""
 }
 
+// SetIdleTimeout raises how long the sprite keeps running once nothing is
+// using it, by updating its configuration.
+//
+// The server's own default is 30 seconds, measured from the moment the last
+// exec, shell, connection or keep-awake lease goes away. That suits a sprite
+// driven by an API; it is far too short for one holding a tmux session, where
+// the thing that stops using the sprite is usually a dropped connection that
+// is about to be re-established.
+//
+// The update answers with an NDJSON stream, so a refusal arrives as an event
+// inside a successful response rather than as a non-zero exit.
+func (c *Client) SetIdleTimeout(name string, d time.Duration) error {
+	args := []string{"api"}
+	if c.org != "" {
+		args = append(args, "-o", c.org)
+	}
+	args = append(args, "/sprites/"+name, "--",
+		"-X", "PUT",
+		"-H", "Content-Type: application/json",
+		"-d", fmt.Sprintf(`{"config":{"idle_timeout_ms":%d}}`, d.Milliseconds()))
+
+	start := time.Now()
+	out, err := runCapture(args...)
+	record("api", "config-update", start, err)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(out, []byte(`"error"`)) {
+		return fmt.Errorf("the API refused the change: %s", lastMeaningfulLine(string(out)))
+	}
+	return nil
+}
+
 // Exists checks if a sprite with the given name exists by attempting to get it.
 // Returns true only when the API returns a sprite with a non-empty ID.
 func (c *Client) Exists(name string) (bool, error) {

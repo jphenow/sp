@@ -192,6 +192,19 @@ type attachTarget struct {
 	transportExit int
 }
 
+// renewSessionHold refreshes the keepalive hold on the sprite, or is nil when
+// this session holds nothing (--no-hold, --keep-warm, or a command with no
+// session to hold).
+//
+// The hold is capped so a session left open forever cannot keep a sprite
+// Active forever, but nothing ever renewed it, so the cap expired underneath
+// sessions that were still in use. After it did, a connection that dropped
+// left the sprite with no reason to stay awake: it idle-paused, stopped soon
+// after, and took the tmux server and every pane in it along. Renewing on each
+// reattach measures the cap from the last time sp was actually there, which is
+// what it was always meant to mean.
+var renewSessionHold func()
+
 // runWithReconnect runs an interactive sprite client command, re-running it
 // when the connection drops.
 //
@@ -216,6 +229,12 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 	blind := 0
 
 	for attempt := 1; ; attempt++ {
+		// The first attempt was launched with a fresh hold; every one after it
+		// is a reattach, and restores the hold the drop may have outlived.
+		if attempt > 1 && renewSessionHold != nil {
+			renewSessionHold()
+		}
+
 		tail := &tailWriter{}
 		// The client runs on a pty sp owns rather than on the real terminal,
 		// so sp can see the stream and notice a connection that has stopped
