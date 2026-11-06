@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -26,6 +27,11 @@ import (
 // prompt. Bind it to a key in tmux and pasting a screenshot works the way it
 // does locally.
 //
+// A file copied in Finder is the same problem with the same answer, so it takes
+// the same route: the files are uploaded and their remote paths typed. Only
+// real file references count — a path that is merely text on the clipboard is
+// still pasted as text, because text is what was copied.
+//
 // Two design points worth keeping:
 //
 //   - Keystrokes go to the LOCAL tmux pane, not the sprite's tmux. They flow
@@ -45,8 +51,9 @@ var pasteCmd = &cobra.Command{
 	Short: "Paste the clipboard into a sprite session, uploading images to the sprite",
 	Long: `Paste the system clipboard into a running sp session.
 
-An image is uploaded to the sprite and its remote path typed into the prompt,
-so Claude can read it. Anything else pastes as ordinary text.
+An image, or a file copied in Finder, is uploaded to the sprite and its remote
+path typed into the prompt, so Claude can read it. Anything else pastes as
+ordinary text.
 
 Meant to be bound to a key in your local tmux, which is what makes Cmd-V work:
 
@@ -67,6 +74,17 @@ func init() {
 // spriteImageDir is where uploaded clipboard images land on the sprite.
 const spriteImageDir = "/home/sprite/.sp-images"
 
+// spriteFileDir is where files pasted from Finder land on the sprite. Each
+// paste gets a timestamped directory of its own, which keeps the names the
+// files were copied under without two pastes of the same name clobbering each
+// other.
+const spriteFileDir = "/home/sprite/.sp-files"
+
+// pasteMaxBytes caps what one paste will upload. A screenshot is tiny and a
+// copied file is whatever you happened to select, so this is the difference
+// between a paste that failed and a terminal wedged on a video.
+const pasteMaxBytes = 100 << 20
+
 // pasteImageRetention is how long uploaded images are kept on the sprite. They
 // are pruned by the same call that uploads, so this costs nothing extra.
 const pasteImageRetentionDays = 7
@@ -83,32 +101,147 @@ func runPaste(cmd *cobra.Command, args []string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	img, err := clipboardImage(tmpDir)
-	if err != nil {
-		// No image on the clipboard is the common case: paste text instead, so
-		// this can sit on the normal paste key without breaking it.
-		return pasteText(pane)
+	if img, err := clipboardImage(tmpDir); err == nil {
+		remote := fmt.Sprintf("%s/%s.png", spriteImageDir, time.Now().Format("20060102-150405"))
+		// Prune old images in the same call that uploads the new one; a call is
+		// almost entirely connection setup, so the cleanup rides along for free.
+		prune := fmt.Sprintf("find %s -type f -mtime +%d -delete 2>/dev/null || true",
+			spriteImageDir, pasteImageRetentionDays)
+		return uploadAndType(pane, map[string]string{img: remote}, prune, []string{remote})
 	}
 
+	if files, err := clipboardFiles(); err == nil && len(files) > 0 {
+		return pasteUploads(pane, files)
+	}
+
+	// Nothing on the clipboard that sp can upload, which is the common case:
+	// paste text instead, so this can sit on the normal paste key without
+	// breaking it.
+	return pasteText(pane)
+}
+
+// pasteUploads uploads files copied from Finder and types their remote paths.
+//
+// Directories are left out rather than refused: copying a folder alongside
+// files is easy to do by accident, and uploading a tree is a different job
+// from pasting a file into a prompt.
+func pasteUploads(pane string, paths []string) error {
+	dir := fmt.Sprintf("%s/%s", spriteFileDir, time.Now().Format("20060102-150405"))
+	files := map[string]string{}
+	var typed []string
+	var total int64
+	var skippedDirs int
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		switch {
+		case err != nil:
+			continue
+		case info.IsDir():
+			skippedDirs++
+			continue
+		}
+		total += info.Size()
+		if total > pasteMaxBytes {
+			notifyPane(pane, fmt.Sprintf("sp paste: more than %dMB, not uploading", pasteMaxBytes>>20))
+			return fmt.Errorf("clipboard files exceed %d bytes", int64(pasteMaxBytes))
+		}
+		remote := dir + "/" + pasteRemoteName(filepath.Base(p))
+		files[p] = remote
+		typed = append(typed, remote)
+	}
+	if len(files) == 0 {
+		if skippedDirs > 0 {
+			notifyPane(pane, "sp paste: folders aren't uploaded; copy the files inside")
+		}
+		return nil
+	}
+
+	// Prune old pastes in the same call, then the directories they leave behind.
+	prune := fmt.Sprintf(
+		"find %[1]s -type f -mtime +%[2]d -delete 2>/dev/null; find %[1]s -mindepth 1 -type d -empty -delete 2>/dev/null; true",
+		spriteFileDir, pasteImageRetentionDays)
+	if err := uploadAndType(pane, files, prune, typed); err != nil {
+		return err
+	}
+	if skippedDirs > 0 {
+		notifyPane(pane, "sp paste: folders aren't uploaded; copy the files inside")
+	}
+	return nil
+}
+
+// uploadAndType puts files on the sprite the pane is attached to and types
+// their remote paths into the prompt.
+func uploadAndType(pane string, files map[string]string, prune string, typed []string) error {
 	spriteName, org, err := pasteTarget(pane)
 	if err != nil {
 		notifyPane(pane, "sp paste: "+err.Error())
 		return err
 	}
-
-	remote := fmt.Sprintf("%s/%s.png", spriteImageDir, time.Now().Format("20060102-150405"))
-	client := sprite.NewClient(org)
-	// Prune old images in the same call that uploads the new one; a call is
-	// almost entirely connection setup, so the cleanup rides along for free.
-	prune := fmt.Sprintf("find %s -type f -mtime +%d -delete 2>/dev/null || true",
-		spriteImageDir, pasteImageRetentionDays)
-	if err := setup.UploadFilesRunning(client, spriteName, map[string]string{img: remote}, prune); err != nil {
+	if err := setup.UploadFilesRunning(sprite.NewClient(org), spriteName, files, prune); err != nil {
 		notifyPane(pane, "sp paste: upload failed, see sp log")
-		return fmt.Errorf("uploading image to %s: %w", spriteName, err)
+		return fmt.Errorf("uploading to %s: %w", spriteName, err)
 	}
-
 	// Trailing space so the next thing typed doesn't run into the path.
-	return sendKeys(pane, remote+" ")
+	return sendKeys(pane, strings.Join(typed, " ")+" ")
+}
+
+// pasteUnsafeName matches what a remote name may not contain.
+var pasteUnsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// pasteRemoteName makes a local basename safe to carry to the sprite. The
+// name is worth keeping — an extension is how Claude knows what the file is —
+// but it travels as one half of a "local:remote" pair and ends up in a shell
+// word, so a colon or a space in it would arrive as something else entirely.
+func pasteRemoteName(name string) string {
+	name = pasteUnsafeName.ReplaceAllString(name, "-")
+	// A name of nothing but dots is not a name: "." and ".." would point the
+	// upload somewhere other than the directory it was meant for. A leading
+	// dot is kept, because ".env" is not "env".
+	if strings.Trim(name, ".-") == "" {
+		return "file"
+	}
+	return name
+}
+
+// clipboardPasteboard names the pasteboard to read, for tests. Empty means the
+// system clipboard.
+var clipboardPasteboard = ""
+
+// clipboardFiles returns the local paths of files on the clipboard, which is
+// what Finder's Copy leaves there. Empty when the clipboard holds no file
+// references.
+//
+// It reads NSURLs rather than asking AppleScript for the clipboard as a file
+// reference, because that coercion only ever yields one file and copying
+// several at once is normal. Text is unaffected: a pasteboard holding a string
+// yields no NSURL at all, even when the string is itself a file:// URL, so
+// pasting the text of a path still pastes text.
+func clipboardFiles() ([]string, error) {
+	script := fmt.Sprintf(`ObjC.import("AppKit");
+(function () {
+  var name = %q;
+  var pb = name ? $.NSPasteboard.pasteboardWithName(name) : $.NSPasteboard.generalPasteboard;
+  var objs = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), $());
+  if (!objs || objs.count === 0) { return ""; }
+  var out = [];
+  for (var i = 0; i < objs.count; i++) {
+    var u = objs.objectAtIndex(i);
+    if (u.isFileURL) { out.push(ObjC.unwrap(u.path)); }
+  }
+  return out.join("\n");
+})()`, clipboardPasteboard)
+
+	out, err := exec.Command("osascript", "-l", "JavaScript", "-e", script).Output()
+	if err != nil {
+		return nil, fmt.Errorf("reading clipboard files: %w", err)
+	}
+	var paths []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			paths = append(paths, line)
+		}
+	}
+	return paths, nil
 }
 
 // resolvePane returns the tmux pane to paste into: the -t flag, else the pane

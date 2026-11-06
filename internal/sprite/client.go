@@ -259,6 +259,15 @@ func (c *Client) BuildExecArgs(opts ExecOptions) []string {
 	}
 	if opts.TTY {
 		args = append(args, "--tty")
+	} else {
+		// sp never pipes anything into a sprite exec: these calls capture
+		// output and leave the child's stdin on /dev/null. The CLI cannot see
+		// the difference — a stdin that is not a terminal looks like piped
+		// input — so it forwards it implicitly and, because it cannot prove
+		// keystrokes were delivered, turns off its own reconnection. Every
+		// setup command was therefore one dropped packet away from failing.
+		// Saying so explicitly keeps them reconnectable.
+		args = append(args, "--no-stdin")
 	}
 	if opts.Dir != "" {
 		args = append(args, "--dir", opts.Dir)
@@ -327,6 +336,39 @@ func ProxyStderr(cmd *exec.Cmd) string {
 		return buf.String()
 	}
 	return ""
+}
+
+// SetIdleTimeout raises how long the sprite keeps running once nothing is
+// using it, by updating its configuration.
+//
+// The server's own default is 30 seconds, measured from the moment the last
+// exec, shell, connection or keep-awake lease goes away. That suits a sprite
+// driven by an API; it is far too short for one holding a tmux session, where
+// the thing that stops using the sprite is usually a dropped connection that
+// is about to be re-established.
+//
+// The update answers with an NDJSON stream, so a refusal arrives as an event
+// inside a successful response rather than as a non-zero exit.
+func (c *Client) SetIdleTimeout(name string, d time.Duration) error {
+	args := []string{"api"}
+	if c.org != "" {
+		args = append(args, "-o", c.org)
+	}
+	args = append(args, "/sprites/"+name, "--",
+		"-X", "PUT",
+		"-H", "Content-Type: application/json",
+		"-d", fmt.Sprintf(`{"config":{"idle_timeout_ms":%d}}`, d.Milliseconds()))
+
+	start := time.Now()
+	out, err := runCapture(args...)
+	record("api", "config-update", start, err)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(out, []byte(`"error"`)) {
+		return fmt.Errorf("the API refused the change: %s", lastMeaningfulLine(string(out)))
+	}
+	return nil
 }
 
 // Exists checks if a sprite with the given name exists by attempting to get it.

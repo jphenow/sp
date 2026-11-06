@@ -34,6 +34,7 @@ var (
 	remoteControl bool
 	rcAlias       bool
 	noHold        bool
+	useSSH        bool
 )
 
 // holdCap bounds the default session-tied hold: the sprite is held Active while
@@ -41,6 +42,48 @@ var (
 // overnight can't bill indefinitely. --keep-warm replaces the hold with the
 // older idle-exit behavior; --no-hold disables it entirely.
 const holdCap = 8 * time.Hour
+
+// sessionIdleTimeout is how long a sprite sp connects to keeps running once
+// nothing is using it.
+//
+// The server default is 30 seconds, counted from the moment the last exec,
+// shell, connection or keep-awake lease goes away. For a sprite driven by an
+// API that is sensible; for one holding a tmux session it is not, because the
+// usual reason nothing is using the sprite is a dropped connection that is
+// about to come back. Thirty seconds after it drops the sprite pauses, and
+// half an hour later it stops for good — which ends the tmux server and
+// everything running in it, while the session itself was never ended by
+// anyone.
+//
+// Fifteen minutes covers a drop, a reconnect that has to wait out its backoff,
+// and sp being killed while nobody is watching, while still letting a sprite
+// nobody is using stop on its own. It applies at the next cold start, so
+// setting it does nothing for the session running now.
+const sessionIdleTimeout = 15 * time.Minute
+
+// ensureIdleTimeout raises the sprite's idle timeout when it is still set
+// shorter than sp wants, using the listing connect has already fetched.
+//
+// The listing omits the field when it has never been set, which is the case
+// that matters: it means the sprite is on the 30-second default. One update is
+// enough — it is part of the sprite's configuration, so later connects see the
+// new value and leave it alone.
+func ensureIdleTimeout(client *sprite.Client, name string, info *sprite.Info) {
+	if info != nil && info.Config != nil && info.Config.IdleTimeoutMS != nil &&
+		*info.Config.IdleTimeoutMS >= int(sessionIdleTimeout.Milliseconds()) {
+		return
+	}
+	if err := client.SetIdleTimeout(name, sessionIdleTimeout); err != nil {
+		// Worth saying out loud: without it the sprite can stop while sp is
+		// away, and that costs the tmux session rather than just a reconnect.
+		warnf("idle-timeout", "could not raise the sprite's idle timeout to %s: %v",
+			sessionIdleTimeout, err)
+		return
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "Idle timeout set to %s (applies at the next cold start)\n", sessionIdleTimeout)
+	}
+}
 
 // connectCmd handles `sp .` and `sp owner/repo` — the core connect flow.
 var connectCmd = &cobra.Command{
@@ -85,6 +128,7 @@ func init() {
 	connectCmd.Flags().DurationVar(&keepWarmDur, "keep-warm", 0, "hold the sprite Active (Tasks API) for up to this duration after disconnect, exiting early if claude is idle for 60s (e.g. 1h, 30m). Default off. See also 'sp keepalive'.")
 	connectCmd.Flags().BoolVar(&remoteControl, "remote-control", false, "launch Claude with Remote Control so the session can be joined from your phone/browser (claude.ai/code)")
 	connectCmd.Flags().BoolVar(&rcAlias, "rc", false, "alias for --remote-control")
+	connectCmd.Flags().BoolVar(&useSSH, "ssh", false, "attach over SSH instead of the sprite CLI's exec (correct window size, live resizing, ssh's own keepalive; not available for sprites whose name contains \"--\")")
 	connectCmd.Flags().BoolVar(&noHold, "no-hold", false, "don't hold the sprite Active for the life of the session (it may idle-pause while you're away)")
 
 	// Register connect as both a subcommand and the default action
@@ -163,6 +207,10 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Connecting to sprite: %s\n", resolved.SpriteName)
 
+	// Everything recorded from here on is about this sprite, including the
+	// warnings that do not know they are.
+	eventSprite = resolved.SpriteName
+
 	// Claude auth inputs. BOTH are gathered every time, because they serve
 	// different goals and neither alone covers both:
 	//
@@ -204,6 +252,15 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	startStatus := "new"
 	if exists && info != nil && info.Status != "" {
 		startStatus = info.Status
+	}
+
+	// Most targets resolve without an organization — only a .sprite file
+	// carries one — and the sprite CLI falls back to its configured default,
+	// so nothing on the exec path ever needed it. The listing we just read
+	// names the org, which is where ssh gets it from: the gateway username is
+	// "<sprite>--<cluster>--<org>" and there is no default to fall back to.
+	if resolved.Org == "" && info != nil {
+		resolved.Org = info.Organization
 	}
 
 	// Sequential prologue: create + wait + perms must happen in order before
@@ -295,7 +352,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			authTokenForEnv = token
 			progress.Warnf("Note: the sprite has no working claude.ai login (auth method: %q), so falling back to the inference-only setup-token. Inference will work; Remote Control will not until you run /login on the sprite.", authMethod)
 		default:
-			progress.Warnf("Warning: no working Claude credential on the sprite and no ~/.claude-token to fall back on. Run 'claude' then /login on the sprite.")
+			progress.WarnfFrom("claude-auth", "Warning: no working Claude credential on the sprite and no ~/.claude-token to fall back on. Run 'claude' then /login on the sprite.")
 		}
 
 		if err := setup.SetupGhAuth(client, resolved.SpriteName); err != nil {
@@ -325,7 +382,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// the connect — warn and carry on to the settings merge, which is
 		// what actually makes claude usable (bypass-permissions defaults).
 		if err := setup.PushClaudeConfig(client, resolved.SpriteName); err != nil {
-			progress.Warnf("Warning: Claude config not pushed (your skills/commands may be missing on the sprite): %v", err)
+			progress.WarnfFrom("claude-config", "Warning: Claude config not pushed (your skills/commands may be missing on the sprite): %v", err)
 		}
 		return setup.EnsureSpriteClaudeSettings(client, resolved.SpriteName)
 	})
@@ -377,6 +434,9 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// the terminal, so this is where the full text has to come out.
 		for _, t := range parallel.Failures() {
 			fmt.Fprintf(os.Stderr, "\nWarning: setup task %q failed: %v\n", t.Name, t.Err)
+			recordEvent(store.Event{Level: "warn", Source: "setup-task",
+				Message: fmt.Sprintf("setup task %q failed", t.Name),
+				Detail:  fmt.Sprint(t.Err)})
 		}
 	}
 
@@ -402,7 +462,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		if webMode {
 			return fmt.Errorf("daemon required for --web: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "Warning: daemon registration failed, sync will not persist: %v\n", err)
+		warnf("daemon", "daemon registration failed, sync will not persist: %v", err)
 
 		// Fallback: inline sync for console mode when daemon is unavailable.
 		// The proxy dies with this process, so it only works while sp is running.
@@ -410,7 +470,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 			fmt.Println("Starting inline file sync (no daemon)...")
 			go func() {
 				if err := startSyncInline(client, resolved); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: sync setup failed: %v\n", err)
+					warnf("sync", "sync setup failed: %v", err)
 				}
 			}()
 		}
@@ -446,7 +506,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	// already be running so it covers the disconnect window.
 	if keepWarmDur > 0 {
 		if err := startKeepWarmSentinel(resolved.SpriteName, resolved.Org, keepWarmDur); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: starting keep-warm sentinel: %v\n", err)
+			warnf("hold", "starting keep-warm sentinel: %v", err)
 		} else if verbose {
 			fmt.Fprintf(os.Stderr, "Keep-warm sentinel started (max %s, exits early when claude is idle for 60s)\n", keepWarmDur)
 		}
@@ -461,12 +521,36 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		// Idle-exit is wrong here (it assumes idle == done, but an idle prompt
 		// usually means you stepped away), so the hold releases on session end
 		// instead — or at holdCap, so an abandoned session can't bill forever.
-		if err := launchKeepAlive(resolved.SpriteName, resolved.Org, holdCap, "", deriveTmuxSessionName()); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: starting session hold: %v\n", err)
+		hold := func() error {
+			return launchKeepAlive(resolved.SpriteName, resolved.Org, holdCap, "", deriveTmuxSessionName())
+		}
+		if err := hold(); err != nil {
+			warnf("hold", "starting session hold: %v", err)
 		} else if verbose {
 			fmt.Fprintf(os.Stderr, "Holding sprite Active until this session ends (cap %s)\n", holdCap)
 		}
+		// Reconnecting restores the hold, so the cap bounds how long sp can be
+		// gone rather than how long the session has been open. See
+		// renewSessionHold.
+		renewSessionHold = func() {
+			if err := hold(); err != nil {
+				// Recorded either way: a hold that quietly stopped renewing
+				// is exactly the thing that is hard to notice and then
+				// explains a sprite that stopped.
+				recordEvent(store.Event{Level: "warn", Source: "hold",
+					Message: fmt.Sprintf("renewing session hold: %v", err)})
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Warning: renewing session hold: %v\n", err)
+				}
+			}
+		}
 	}
+
+	// The hold only covers the time sp is running. A sprite whose session sp
+	// is no longer watching — because sp was killed, or the laptop went away —
+	// falls back on its own idle timeout, and the default is far too short for
+	// a tmux session to survive.
+	ensureIdleTimeout(client, resolved.SpriteName, info)
 
 	reportConnectTimings(resolved.SpriteName, startStatus, time.Since(connectStart))
 
@@ -507,7 +591,7 @@ func setupWebService(client *sprite.Client, spriteName string) error {
 		Command: []string{"sh", "-c", fmt.Sprintf("test -x %s || (curl -fsSL https://opencode.ai/install | bash)", opencodeBin)},
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: opencode install check failed: %v\n", err)
+		warnf("opencode", "opencode install check failed: %v", err)
 	}
 
 	// Delete any existing opencode/sp-web service to avoid conflicts
@@ -1057,7 +1141,12 @@ func execInSprite(client *sprite.Client, resolved *setup.ResolvedTarget, token s
 
 	// Check for an existing persistent session from a prior connect.
 	// If found, reattach directly — tmux + claude are still running.
-	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" {
+	//
+	// The ssh path skips this: its command is `tmux new-session -A`, which
+	// attaches to the session when it exists and creates it when it does not,
+	// so there is nothing to look up. That also leaves behind the part of this
+	// that was fragile — matching a session by a truncated command column.
+	if sessionID := findExistingSpriteSession(resolved.SpriteName, resolved.Org); sessionID != "" && !useSSH {
 		fmt.Printf("Reattaching to session %s...\n", sessionID)
 		return attachToSpriteSession(client, resolved.SpriteName, resolved.Org, sessionID)
 	}
@@ -1297,7 +1386,7 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 		Sprite:  resolved.SpriteName,
 		Command: []string{"mkdir", "-p", resolved.RemotePath},
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: mkdir -p %s failed: %v\n", resolved.RemotePath, err)
+		warnf("remote-path", "mkdir -p %s failed: %v", resolved.RemotePath, err)
 	}
 
 	// Build the per-tool tmux setenv lines. Uses the shared helper so
@@ -1338,8 +1427,12 @@ func createSpriteSession(client *sprite.Client, resolved *setup.ResolvedTarget, 
 	// Caveat: this fixes only the *initial* size — the CLI also doesn't
 	// forward live SIGWINCH, so resizing the local window mid-session won't
 	// reflow until tmux is detached and reattached.
+	// Not needed over ssh, which gets the initial size right and keeps it
+	// right. Worse than unnecessary there: the size is baked into the script
+	// when it is written, so a window resized before a reconnect would be
+	// forced back to the old size.
 	sttyPrefix := ""
-	if rows, cols, ok := localTerminalSize(); ok {
+	if rows, cols, ok := localTerminalSize(); ok && !useSSH {
 		sttyPrefix = fmt.Sprintf("stty rows %d cols %d 2>/dev/null || true\n", rows, cols)
 	}
 
@@ -1384,6 +1477,10 @@ done
 		Command: []string{"sh", "-c", shellCmd},
 	})
 
+	if useSSH {
+		return sshSession(client, resolved, tmuxSession, shellCmd)
+	}
+
 	binary, err := exec.LookPath("sprite")
 	if err != nil {
 		return fmt.Errorf("sprite binary not found: %w", err)
@@ -1395,6 +1492,101 @@ done
 	return runWithReconnect(binary,
 		attachTarget{args: args, label: resolved.SpriteName},
 		reattachTarget(resolved.SpriteName, resolved.Org))
+}
+
+// sshSession runs the interactive session over SSH.
+//
+// The same script the exec path runs is put on the sprite first and then run
+// from there, which keeps the tokens it embeds out of every argv. Reconnecting
+// re-runs the identical command, because it ends in `tmux new-session -A`:
+// whatever is still running on the sprite is picked up, and nothing is
+// duplicated if it is not.
+func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSession, shellCmd string) error {
+	org := resolved.Org
+	if org == "" {
+		// A sprite created during this run was never listed, so nothing has
+		// said which org it is in yet. Worth one lookup: without it the
+		// session cannot be addressed at all.
+		info, err := client.Get(resolved.SpriteName)
+		if err != nil {
+			return fmt.Errorf("--ssh: finding the sprite's organization: %w", err)
+		}
+		if info != nil {
+			org = info.Organization
+		}
+	}
+
+	user, err := sprite.SSHUser(resolved.SpriteName, org)
+	if err != nil {
+		return fmt.Errorf("--ssh: %w", err)
+	}
+
+	binary, err := exec.LookPath("ssh")
+	if err != nil {
+		return fmt.Errorf("ssh not found: %w", err)
+	}
+
+	remoteScript := sprite.SSHRemoteScriptPath(tmuxSession)
+	if err := sprite.WriteRemoteScript(user, remoteScript, shellCmd); err != nil {
+		return err
+	}
+
+	// ssh keeps its own account of the connection, which is the only place a
+	// drop on this transport is explained: the client itself prints nothing.
+	// Truncated here so the file covers this run and no other.
+	logPath, err := sprite.SSHSessionLogPath(resolved.SpriteName)
+	if err == nil {
+		// The previous run's log is kept aside rather than overwritten. A
+		// session that died in a way sp failed to understand is investigated
+		// afterwards, by which time starting a new session is the first thing
+		// anyone does -- and that used to be what destroyed the evidence.
+		os.Rename(logPath, logPath+".1")
+		if f, err := os.Create(logPath); err == nil {
+			f.Close()
+		} else {
+			logPath = ""
+		}
+	} else {
+		logPath = ""
+	}
+
+	target := attachTarget{
+		args:  sprite.SSHInteractiveArgs(user, remoteScript, logPath),
+		label: resolved.SpriteName,
+		// ssh exits 255 when the connection itself failed.
+		transportExit: 255,
+		transportLog:  logPath,
+	}
+
+	return runWithReconnect(binary, target, spriteStillThere(client, resolved.SpriteName, &target))
+}
+
+// spriteStillThere decides, before each reconnect attempt, whether there is
+// still anything to reconnect to.
+//
+// Reconnecting is worth hours of patience because the session on the other end
+// is persistent — but only while it exists. A destroyed sprite answers every
+// dial with the same transport failure as a sleeping laptop does, so without
+// this the loop would keep dialing a sprite that is never coming back until
+// the whole window ran out.
+//
+// Only a listing that comes back and does not mention the sprite counts as
+// gone. A listing that fails says nothing: that is exactly what being offline
+// looks like, and it is the case the reconnect loop exists for. Returning nil
+// still does not end the loop immediately — it retries a bounded number of
+// times first — which covers a listing that is wrong rather than merely
+// unavailable.
+//
+// The ssh target itself never changes: it ends in `tmux new-session -A`, which
+// attaches to whatever is running and creates it if nothing is.
+func spriteStillThere(client *sprite.Client, spriteName string, target *attachTarget) func() *attachTarget {
+	return func() *attachTarget {
+		info, err := client.Get(spriteName)
+		if err == nil && info == nil {
+			return nil
+		}
+		return target
+	}
 }
 
 // localTerminalSize returns the local controlling terminal's size (rows,
