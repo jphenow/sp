@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jphenow/sp/internal/sprite"
+	"github.com/jphenow/sp/internal/store"
 )
 
 func TestIsTransportFailure(t *testing.T) {
@@ -341,5 +342,44 @@ func TestSpriteStillThere(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestTransportLogIsKeptForAnUnclassifiedEnd covers the hole that cost three
+// sessions' worth of evidence: the transport's log was recorded only when sp
+// had already decided the attempt was a drop, so an attempt it could not
+// classify -- the only kind anyone needs to investigate -- left nothing behind.
+func TestTransportLogIsKeptForAnUnclassifiedEnd(t *testing.T) {
+	isolateStore(t)
+
+	logPath := filepath.Join(t.TempDir(), "ssh.log")
+	if err := os.WriteFile(logPath, []byte("debug1: the transport's account\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Exits non-zero saying nothing sp recognizes, which is the case that used
+	// to be classified "ended" and recorded no explanation.
+	bin, _ := fakeClient(t, "echo 'something unfamiliar' >&2\nexit 3")
+	target := attachTarget{label: "test", transportLog: logPath}
+	if err := runWithReconnect(bin, target, func() *attachTarget { return nil }); err == nil {
+		t.Fatal("expected the non-zero exit to be returned")
+	}
+
+	db, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events, err := db.Events(time.Now().Add(-time.Minute), store.EventFilter{Source: "transport"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d transport events, want 1", len(events))
+	}
+	if !strings.Contains(events[0].Detail, "the transport's account") {
+		t.Errorf("detail does not hold the transport log: %q", events[0].Detail)
+	}
+	if !strings.Contains(events[0].Message, `"ended"`) {
+		t.Errorf("message does not say how the attempt was classified: %q", events[0].Message)
 	}
 }

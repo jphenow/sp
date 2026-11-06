@@ -1536,6 +1536,11 @@ func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSessi
 	// Truncated here so the file covers this run and no other.
 	logPath, err := sprite.SSHSessionLogPath(resolved.SpriteName)
 	if err == nil {
+		// The previous run's log is kept aside rather than overwritten. A
+		// session that died in a way sp failed to understand is investigated
+		// afterwards, by which time starting a new session is the first thing
+		// anyone does -- and that used to be what destroyed the evidence.
+		os.Rename(logPath, logPath+".1")
 		if f, err := os.Create(logPath); err == nil {
 			f.Close()
 		} else {

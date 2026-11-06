@@ -343,15 +343,22 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 			Attempt:     attempt,
 			Detail:      detail,
 		})
-		// The transport's own log, kept only for a drop: a session that ended
-		// cleanly needs no explanation, and keeping the tail of every clean
-		// exit would bury the ones that do.
-		if dropped {
+		// The transport's own log, kept for anything that was not a clean
+		// exit. This used to be kept only for a classified drop, which had it
+		// backwards: an attempt sp could not classify is the one most in need
+		// of an explanation, and it was the only one that recorded none. Three
+		// sessions died that way with nothing left behind but the exit status,
+		// because the next session truncated the log before anyone read it.
+		// A clean exit still records nothing -- there is nothing to explain,
+		// and keeping every one of those would bury the rest.
+		if err != nil {
 			if tailed := tailLines(target.transportLog, 8); tailed != "" {
 				recordEvent(store.Event{Level: "warn", Source: "transport",
-					Sprite:  target.label,
-					Message: fmt.Sprintf("connection dropped after %s (%v)", uptime.Round(time.Second), err),
-					Detail:  tailed})
+					Sprite: target.label,
+					Message: fmt.Sprintf("session on %s ended after %s as %q (%v)",
+						target.label, uptime.Round(time.Second),
+						attemptName(err, outcome.stalled, dropped), err),
+					Detail: tailed})
 			}
 		}
 
