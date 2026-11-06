@@ -106,15 +106,22 @@ var transportErrorMarkers = []string{
 	"timeout, server",
 }
 
-// sshConnectionClosed matches ssh's parting message, which names the host in
-// the middle and so matches no fixed substring: "Connection to <host> closed."
+// "Connection to <host> closed." is deliberately NOT treated as a dropped
+// connection, though it is the line that appears after most of them.
 //
-// On its own the message is ambiguous — ssh prints it when the remote command
-// ends for any reason, a deliberate logout included. What disambiguates it is
-// the exit status, and the caller has already applied that: this is only
-// consulted for a client that exited non-zero. A session the user ended walks
-// out with status 0 and never reaches here.
-var sshConnectionClosed = regexp.MustCompile(`connection to \S+ closed`)
+// It was, briefly, and that was a mistake worth leaving a note about. ssh
+// prints it whenever the remote command ends, for any reason, and the thing
+// that says which reason is the exit status: 255 is ssh's own verdict that the
+// transport failed, and anything else is the remote command's own status,
+// forwarded. The logs are explicit about the difference --
+//
+//	client_input_channel_req: channel 0 rtype exit-status reply 0
+//	Exit status 1          <- the remote command exited; the connection was fine
+//	Exit status -1         <- no status arrived; ssh gave up on the transport
+//
+// -- so matching the message overrode the one signal that discriminates, and
+// turned a remote command that exits immediately into an unbounded retry loop.
+// isTransportExit against 255 is the correct test and was already there.
 
 // isTransportFailure reports whether captured stderr indicates a dropped
 // connection rather than the session ending on its own.
@@ -125,7 +132,7 @@ func isTransportFailure(stderr string) bool {
 			return true
 		}
 	}
-	return sshConnectionClosed.MatchString(lower)
+	return false
 }
 
 // isTransportExit reports whether the client exited with the status it uses to
@@ -352,13 +359,24 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		// A clean exit still records nothing -- there is nothing to explain,
 		// and keeping every one of those would bury the rest.
 		if err != nil {
+			// What the session printed as it went comes first: a remote
+			// command that exited on its own usually said why, and that
+			// sentence is the whole answer. The transport's log follows, for
+			// the case where nothing was said because nothing got through.
+			var parts []string
+			if said := lastVisibleLines(tail.String(), 5); said != "" {
+				parts = append(parts, "session output:\n"+said)
+			}
 			if tailed := tailLines(target.transportLog, 8); tailed != "" {
+				parts = append(parts, "transport log:\n"+tailed)
+			}
+			if len(parts) > 0 {
 				recordEvent(store.Event{Level: "warn", Source: "transport",
 					Sprite: target.label,
 					Message: fmt.Sprintf("session on %s ended after %s as %q (%v)",
 						target.label, uptime.Round(time.Second),
 						attemptName(err, outcome.stalled, dropped), err),
-					Detail: tailed})
+					Detail: strings.Join(parts, "\n\n")})
 			}
 		}
 
@@ -518,6 +536,37 @@ func lastVisibleLine(output string) string {
 		}
 	}
 	return ""
+}
+
+// lastVisibleLines is lastVisibleLine's neighbours as well, oldest first.
+//
+// One line is the right size for telling the user why their session ended, but
+// the wrong size for working out why afterwards: ssh's parting message lands
+// last and buries whatever the session itself said on the way out. tmux
+// explaining that it lost its server is two lines above the line sp kept.
+func lastVisibleLines(output string, n int) string {
+	cleaned := terminalEscape.ReplaceAllString(output, "")
+	cleaned = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return r
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, cleaned)
+
+	var kept []string
+	lines := strings.FieldsFunc(cleaned, func(r rune) bool { return r == '\n' || r == '\r' })
+	for i := len(lines) - 1; i >= 0 && len(kept) < n; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			if len(line) > 200 {
+				line = line[:200] + "..."
+			}
+			kept = append([]string{line}, kept...)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 // sleepInterruptible waits for d, returning true if the user interrupted.
