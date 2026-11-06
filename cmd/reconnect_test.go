@@ -23,6 +23,14 @@ func TestIsTransportFailure(t *testing.T) {
 		"websocket: close 1006 (abnormal closure)",
 		"dial tcp: lookup api.sprites.dev: no such host",
 		"Put \"https://api.sprites.dev/...\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+		// The ssh transport's own messages. The first two cost a 5h session
+		// that sp called a deliberate exit and refused to reattach; the third
+		// is ssh's ServerAliveInterval verdict, which sp configures and so has
+		// no excuse for not recognizing.
+		"Connection to sprites.dev closed.",
+		"Connection to sprites.dev closed by remote host.",
+		"Timeout, server sprites.dev not responding.",
+		"client_loop: send disconnect: Broken pipe",
 	}
 	notTransport := []string{
 		"",
@@ -30,6 +38,10 @@ func TestIsTransportFailure(t *testing.T) {
 		"Error: session 42 not found",
 		"bash: command not found",
 		"Error: unknown shorthand flag: 'c'",
+		// Close to ssh's parting message without being it. A host name is
+		// required, so ordinary session text that happens to talk about a
+		// connection closing is not mistaken for the transport giving up.
+		"the connection to the database was closed",
 	}
 	for _, s := range transport {
 		if !isTransportFailure(s) {

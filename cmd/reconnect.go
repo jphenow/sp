@@ -97,7 +97,24 @@ var transportErrorMarkers = []string{
 	// protecting is a keystroke in flight, not the work.
 	"was lost while stdin was attached",
 	"refusing unsafe automatic reconnect",
+	// The ssh transport has a vocabulary of its own, and none of the above is
+	// in it. "Timeout, server ... not responding" is ssh's own verdict from
+	// ServerAliveInterval, which sp configures precisely so the client decides
+	// before the stall detector has to guess — a verdict it was then throwing
+	// away.
+	"closed by remote host",
+	"timeout, server",
 }
+
+// sshConnectionClosed matches ssh's parting message, which names the host in
+// the middle and so matches no fixed substring: "Connection to <host> closed."
+//
+// On its own the message is ambiguous — ssh prints it when the remote command
+// ends for any reason, a deliberate logout included. What disambiguates it is
+// the exit status, and the caller has already applied that: this is only
+// consulted for a client that exited non-zero. A session the user ended walks
+// out with status 0 and never reaches here.
+var sshConnectionClosed = regexp.MustCompile(`connection to \S+ closed`)
 
 // isTransportFailure reports whether captured stderr indicates a dropped
 // connection rather than the session ending on its own.
@@ -108,7 +125,7 @@ func isTransportFailure(stderr string) bool {
 			return true
 		}
 	}
-	return false
+	return sshConnectionClosed.MatchString(lower)
 }
 
 // isTransportExit reports whether the client exited with the status it uses to
