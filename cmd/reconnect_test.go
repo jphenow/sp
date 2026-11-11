@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -386,5 +387,45 @@ func TestTransportLogIsKeptForAnUnclassifiedEnd(t *testing.T) {
 	}
 	if !strings.Contains(events[0].Message, `"ended"`) {
 		t.Errorf("message does not say how the attempt was classified: %q", events[0].Message)
+	}
+}
+
+// TestRemoteSignalDeath covers a kill on the sprite rather than locally. The
+// local client exits normally and forwards 128+N, so the death arrives as an
+// ordinary exit code -- "exit status 137" -- which sp read as the session
+// choosing to end. It is the most recoverable failure there is: a killed tmux
+// client leaves the server and its panes alone.
+func TestRemoteSignalDeath(t *testing.T) {
+	for _, tc := range []struct {
+		code    int
+		killed  bool
+		name    string
+		wantSig string
+	}{
+		{code: 137, killed: true, name: "killed", wantSig: "signal 9 (killed)"},
+		{code: 143, killed: true, name: "killed", wantSig: "signal 15 (terminated)"},
+		{code: 129, killed: true, name: "killed", wantSig: "signal 1 (hangup)"},
+		// A person saying stop, forwarded. Retrying would leave no way to end
+		// a session by hand, exactly as for a local interrupt.
+		{code: 130, killed: false, name: "ended", wantSig: "signal 2 (interrupt)"},
+		// Ordinary non-zero exits must stay ordinary. 128 itself is not a
+		// signal, and 1 is what a command that simply failed returns.
+		{code: 1, killed: false, name: "ended", wantSig: ""},
+		{code: 128, killed: false, name: "ended", wantSig: ""},
+		{code: 160, killed: false, name: "ended", wantSig: ""},
+	} {
+		err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", tc.code)).Run()
+		if err == nil {
+			t.Fatalf("exit %d produced no error", tc.code)
+		}
+		if got := isSignalDeath(err); got != tc.killed {
+			t.Errorf("exit %d: isSignalDeath = %v, want %v", tc.code, got, tc.killed)
+		}
+		if got := attemptName(err, false, tc.killed); got != tc.name {
+			t.Errorf("exit %d: attemptName = %q, want %q", tc.code, got, tc.name)
+		}
+		if got := signalName(err); got != tc.wantSig {
+			t.Errorf("exit %d: signalName = %q, want %q", tc.code, got, tc.wantSig)
+		}
 	}
 }

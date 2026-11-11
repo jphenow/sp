@@ -179,11 +179,20 @@ func deathSignal(err error) (syscall.Signal, bool) {
 	if !errors.As(err, &exitErr) {
 		return 0, false
 	}
-	status, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok || !status.Signaled() {
-		return 0, false
+	if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return status.Signal(), true
 	}
-	return status.Signal(), true
+	// A signal one hop away. When the thing killed is the command on the
+	// sprite rather than the local client, the client exits perfectly normally
+	// and forwards the shell's 128+N convention, so the death arrives as an
+	// ordinary exit code: "exit status 137" is SIGKILL, and sp read it as the
+	// session deciding to end. It is the same event as a local kill, and the
+	// recoverable one -- a killed tmux client leaves the server and every pane
+	// untouched, so reattaching restores the session whole.
+	if code := exitErr.ExitCode(); code > 128 && code <= 128+31 {
+		return syscall.Signal(code - 128), true
+	}
+	return 0, false
 }
 
 // signalName describes the signal a client died on, or "" if it exited on its

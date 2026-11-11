@@ -3,6 +3,7 @@ package cmd
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -74,6 +75,15 @@ func ensureIdleTimeout(client *sprite.Client, name string, info *sprite.Info) {
 		return
 	}
 	if err := client.SetIdleTimeout(name, sessionIdleTimeout); err != nil {
+		// Some sprites have no such setting at all, which is not worth telling
+		// anyone about: nothing makes the call succeed, so warning on every
+		// connect to that sprite reports only that sp keeps asking.
+		if errors.Is(err, sprite.ErrIdleTimeoutUnsupported) {
+			if verbose {
+				fmt.Fprintln(os.Stderr, "Idle timeout is not configurable on this sprite; leaving it alone")
+			}
+			return
+		}
 		// Worth saying out loud: without it the sprite can stop while sp is
 		// away, and that costs the tmux session rather than just a reconnect.
 		warnf("idle-timeout", "could not raise the sprite's idle timeout to %s: %v",

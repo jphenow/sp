@@ -3,6 +3,7 @@ package sprite
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -349,6 +350,12 @@ func ProxyStderr(cmd *exec.Cmd) string {
 //
 // The update answers with an NDJSON stream, so a refusal arrives as an event
 // inside a successful response rather than as a non-zero exit.
+// ErrIdleTimeoutUnsupported is returned when the sprite is not of a kind that
+// has a configurable idle timeout at all. It is a property of the sprite, not
+// a failure: nothing the caller does will make the same call succeed, so there
+// is nothing to report and nothing to retry.
+var ErrIdleTimeoutUnsupported = errors.New("this sprite has no configurable idle timeout")
+
 func (c *Client) SetIdleTimeout(name string, d time.Duration) error {
 	args := []string{"api"}
 	if c.org != "" {
@@ -366,6 +373,9 @@ func (c *Client) SetIdleTimeout(name string, d time.Duration) error {
 		return err
 	}
 	if bytes.Contains(out, []byte(`"error"`)) {
+		if bytes.Contains(out, []byte("not_provider_sprite")) {
+			return ErrIdleTimeoutUnsupported
+		}
 		return fmt.Errorf("the API refused the change: %s", lastMeaningfulLine(string(out)))
 	}
 	return nil
