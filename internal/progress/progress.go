@@ -449,11 +449,32 @@ var (
 	warnBuf    []string
 )
 
+// WarnSink, when set, receives every warning as well as the terminal.
+//
+// A warning printed here is printed into a terminal that an interactive
+// session is about to take over, so the user frequently never reads it: the
+// one thing every warning has in common is that it arrives at the busiest
+// moment of a connect. sp keeps them instead, and this is where they are
+// handed over — a function rather than a direct write, so this package stays
+// free of the database.
+var WarnSink func(source, msg string)
+
 // Warnf reports a non-fatal problem. Safe to call from inside a task: while a
 // Group is rendering the message is held and printed after the final frame,
 // and outside a run it goes straight to stderr.
 func Warnf(format string, args ...any) {
+	WarnfFrom("", format, args...)
+}
+
+// WarnfFrom is Warnf with the part of sp that is reporting named. The name
+// only reaches WarnSink: on screen one warning looks like any other, but in
+// the record it is what lets a problem that keeps coming back be counted by
+// area rather than read line by line.
+func WarnfFrom(source, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
+	if WarnSink != nil {
+		WarnSink(source, msg)
+	}
 	warnMu.Lock()
 	if warnActive {
 		warnBuf = append(warnBuf, msg)

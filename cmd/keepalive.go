@@ -177,11 +177,17 @@ func launchKeepAlive(spriteName, org string, dur time.Duration, idleSession, wat
 	}
 	script := heartbeatScript(deadline, idleSession, watchSession)
 
-	args := []string{"exec"}
-	if org != "" {
-		args = append(args, "-o", org)
-	}
-	args = append(args, "-s", spriteName, "--", "sh", "-c", script)
+	// Built through BuildExecArgs rather than by hand, for --no-stdin. This
+	// exec has no stdin and never did, but the CLI reads a stdin that is not a
+	// terminal as piped input and switches its own reconnection off — which it
+	// did here, to the one exec that has to survive the longest. A few seconds
+	// of packet loss ended the hold, nothing printed (the process is detached
+	// with no streams), and the sprite was free to idle-pause for the rest of
+	// the session.
+	args := sprite.NewClient(org).BuildExecArgs(sprite.ExecOptions{
+		Sprite:  spriteName,
+		Command: []string{"sh", "-c", script},
+	})
 
 	c := exec.Command("sprite", args...)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

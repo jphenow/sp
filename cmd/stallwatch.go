@@ -33,10 +33,20 @@ import (
 
 const (
 	// stallEchoGrace is how long an unanswered keystroke is tolerated before
-	// the connection is called dead. Generous next to the milliseconds an echo
-	// actually takes: the cost of being wrong is a needless reattach, but it
-	// still has to be short enough to beat reaching for another terminal.
-	stallEchoGrace = 12 * time.Second
+	// the connection is called dead. Enormous next to the milliseconds an echo
+	// actually takes, and it has to be: a keystroke sent to a sprite that has
+	// idle-paused is answered only once the sprite wakes, which was measured
+	// at 11.7s. At the 12s this used to be, sp was deciding on a coin flip
+	// whether a waking sprite was a dead connection — and killing it meant
+	// another wake, which could be killed the same way.
+	//
+	// It is also deliberately past the point where ssh gives up on its own
+	// (ServerAliveInterval 15 x 3), so on that transport the client's own
+	// verdict comes first and this stays the backstop for the case ssh has no
+	// answer for. The cost is that a genuinely dead connection now takes a
+	// minute to notice, which is still the difference between waiting and
+	// opening another terminal to kill sp by hand.
+	stallEchoGrace = time.Minute
 	// stallPollEvery is how often the grace period is checked.
 	stallPollEvery = time.Second
 )
@@ -83,6 +93,83 @@ func (d *stallDetector) stalled(now time.Time) bool {
 	return now.Sub(d.waitingSince) >= d.grace
 }
 
+// stdinPump owns the terminal's input for as long as the reconnect loop runs,
+// handing whatever it reads to the attempt that is currently live.
+//
+// Exactly one goroutine may read the terminal. A blocking read on a tty cannot
+// be cancelled, so a reader started per attempt outlives its attempt and keeps
+// consuming keystrokes afterwards — they are handed to a pty that is already
+// closed and are simply gone. After a few reconnects most of what the user
+// types disappears, the live connection sees no input, and the stall detector
+// reads that silence as another dead connection: the loop then reconnects
+// until the window expires even though the sprite is perfectly healthy.
+type stdinPump struct {
+	mu   sync.Mutex
+	dest io.Writer
+	det  *stallDetector
+}
+
+// newStdinPump starts reading the terminal. Input arriving while no attempt is
+// attached is dropped, which is what happened before as well — between two
+// attaches there is nothing to deliver it to.
+func newStdinPump() *stdinPump {
+	p := &stdinPump{}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				p.deliver(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	return p
+}
+
+// attach points the pump at a new attempt's pty and stall detector.
+func (p *stdinPump) attach(dest io.Writer, det *stallDetector) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dest, p.det = dest, det
+}
+
+// detach stops delivery, so a finished attempt's pty is never written to again.
+func (p *stdinPump) detach() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dest, p.det = nil, nil
+}
+
+// deliver forwards input to the live attempt and records that it is awaiting an
+// answer.
+func (p *stdinPump) deliver(b []byte) {
+	p.mu.Lock()
+	dest, det := p.dest, p.det
+	p.mu.Unlock()
+	if dest == nil {
+		return
+	}
+	det.sentInput(time.Now())
+	dest.Write(b)
+}
+
+// attemptOutcome is what one run of the client is worth knowing afterwards,
+// beyond the error it exited with.
+type attemptOutcome struct {
+	// stalled is true when the client was killed for not answering input.
+	stalled bool
+	// firstOutput is how long the client took to print anything, or 0 when it
+	// never did. A reattach to a sprite that is awake paints the session
+	// immediately; one that has to wake the sprite first does not, so this is
+	// the only local measurement of a cost that otherwise just looks like a
+	// bad connection.
+	firstOutput time.Duration
+}
+
 // runProxied runs the sprite client on a pty that sp owns, copying between it
 // and the real terminal, and kills it if the connection stops answering input.
 //
@@ -94,11 +181,12 @@ func (d *stallDetector) stalled(now time.Time) bool {
 // stderr to capture (both land in the one stream), so failure classification
 // reads the combined output; the markers it looks for are distinctive enough
 // not to collide with ordinary session text.
-func runProxied(binary string, args []string, tap io.Writer) (bool, error) {
+func runProxied(binary string, args []string, tap io.Writer, pump *stdinPump) (attemptOutcome, error) {
+	started := time.Now()
 	cmd := exec.Command(binary, args...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return false, err
+		return attemptOutcome{}, err
 	}
 	defer ptmx.Close()
 
@@ -125,31 +213,19 @@ func runProxied(binary string, args []string, tap io.Writer) (bool, error) {
 
 	det := &stallDetector{grace: stallEchoGrace}
 
-	// Input is copied by hand rather than with io.Copy so each read can be
-	// recorded. The goroutine is left running at exit: a read on the terminal
-	// cannot be cancelled, and the process is either exiting or about to
-	// reattach with a fresh pty.
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				det.sentInput(time.Now())
-				if _, err := ptmx.Write(buf[:n]); err != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	// Input arrives from the caller's pump rather than from a reader of this
+	// attempt's own, so the keystrokes always land on the connection that is
+	// actually live. See stdinPump.
+	pump.attach(ptmx, det)
+	defer pump.detach()
 
+	var firstOutput atomic.Int64
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := ptmx.Read(buf)
 			if n > 0 {
+				firstOutput.CompareAndSwap(0, int64(time.Since(started)))
 				det.sawOutput()
 				os.Stdout.Write(buf[:n])
 				tap.Write(buf[:n])
@@ -181,5 +257,8 @@ func runProxied(binary string, args []string, tap io.Writer) (bool, error) {
 	}()
 
 	err = cmd.Wait()
-	return stalled.Load(), err
+	return attemptOutcome{
+		stalled:     stalled.Load(),
+		firstOutput: time.Duration(firstOutput.Load()),
+	}, err
 }

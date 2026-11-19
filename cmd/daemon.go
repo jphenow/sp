@@ -44,7 +44,7 @@ var daemonStartCmd = &cobra.Command{
 		// stderr is already redirected to the log file, so also logging to
 		// stderr would double every line. Use file-only logging unconditionally.
 		if err := logging.Setup(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: log setup failed: %v\n", err)
+			warnf("logging", "log setup failed: %v", err)
 		}
 		defer logging.Close()
 

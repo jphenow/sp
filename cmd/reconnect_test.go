@@ -1,11 +1,18 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/jphenow/sp/internal/sprite"
+	"github.com/jphenow/sp/internal/store"
 )
 
 func TestIsTransportFailure(t *testing.T) {
@@ -18,6 +25,12 @@ func TestIsTransportFailure(t *testing.T) {
 		"websocket: close 1006 (abnormal closure)",
 		"dial tcp: lookup api.sprites.dev: no such host",
 		"Put \"https://api.sprites.dev/...\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+		// The ssh transport's own messages. "Timeout, server ... not
+		// responding" is its ServerAliveInterval verdict, which sp configures
+		// the interval to produce and so has no excuse for not recognizing.
+		"Connection to sprites.dev closed by remote host.",
+		"Timeout, server sprites.dev not responding.",
+		"client_loop: send disconnect: Broken pipe",
 	}
 	notTransport := []string{
 		"",
@@ -25,6 +38,12 @@ func TestIsTransportFailure(t *testing.T) {
 		"Error: session 42 not found",
 		"bash: command not found",
 		"Error: unknown shorthand flag: 'c'",
+		"the connection to the database was closed",
+		// ssh's parting line, which follows a remote command that exited on
+		// its own just as it follows a drop. Treating it as a drop cost 14
+		// pointless reconnects and an empty tmux session; the exit status is
+		// what tells the two apart, and isTransportExit already reads it.
+		"Connection to sprites.dev closed.",
 	}
 	for _, s := range transport {
 		if !isTransportFailure(s) {
@@ -52,6 +71,13 @@ func fakeClient(t *testing.T, script string) (path, counter string) {
 	return path, counter
 }
 
+// isolateStore points the attempt log at a throwaway home, so running the
+// tests does not append test sessions to the real one.
+func isolateStore(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+}
+
 func runs(t *testing.T, counter string) int {
 	t.Helper()
 	data, err := os.ReadFile(counter)
@@ -63,6 +89,7 @@ func runs(t *testing.T, counter string) int {
 }
 
 func TestRunWithReconnect(t *testing.T) {
+	isolateStore(t)
 	sameTarget := func(args []string) func() *attachTarget {
 		return func() *attachTarget { return &attachTarget{args: args, label: "test"} }
 	}
@@ -94,6 +121,32 @@ func TestRunWithReconnect(t *testing.T) {
 		}
 		if got := runs(t, counter); got != 3 {
 			t.Errorf("ran %d times, want 3", got)
+		}
+	})
+
+	t.Run("client killed by a signal reconnects", func(t *testing.T) {
+		// Nothing on stderr and no transport exit status: the only evidence is
+		// that the process died on a signal. sp used to read this as the
+		// session ending and hand the terminal back, while the tmux session it
+		// was attached to was still running on the sprite.
+		bin, counter := fakeClient(t, `if [ "$n" -lt 2 ]; then kill -9 $$; fi; exit 0`)
+		if err := runWithReconnect(bin, attachTarget{label: "test"}, sameTarget(nil)); err != nil {
+			t.Fatalf("err = %v, want nil after reconnect", err)
+		}
+		if got := runs(t, counter); got != 2 {
+			t.Errorf("ran %d times, want 2", got)
+		}
+	})
+
+	t.Run("interrupt is not retried", func(t *testing.T) {
+		// Ctrl-C has to be able to end a session, so an interrupt is the one
+		// signal that still counts as the client being told to stop.
+		bin, counter := fakeClient(t, `kill -INT $$`)
+		if err := runWithReconnect(bin, attachTarget{label: "test"}, sameTarget(nil)); err == nil {
+			t.Fatal("want the interrupt to propagate")
+		}
+		if got := runs(t, counter); got != 1 {
+			t.Errorf("ran %d times, want 1", got)
 		}
 	})
 
@@ -139,6 +192,240 @@ func TestIsOneShotTmux(t *testing.T) {
 	for _, cmd := range interactive {
 		if isOneShotTmux(cmd) {
 			t.Errorf("isOneShotTmux(%q) = true, want false", cmd)
+		}
+	}
+}
+
+// TestReconnectRefusalIsTransportFailure covers the message the sprite CLI
+// emits when it declines to reconnect an exec with stdin attached. It names no
+// socket error, so none of the other markers matched and sp ended the session
+// instead of reattaching.
+func TestReconnectRefusalIsTransportFailure(t *testing.T) {
+	stderr := "Error: connection to exec session tun-TtCSy4H9KaOQUj04 was lost " +
+		"while stdin was attached; refusing unsafe automatic reconnect because " +
+		"input delivery is uncertain: exit status 1"
+	if !isTransportFailure(stderr) {
+		t.Fatal("the reconnect refusal should count as a transport failure")
+	}
+}
+
+func TestLastVisibleLine(t *testing.T) {
+	t.Run("finds the last line under a full-screen session's escape codes", func(t *testing.T) {
+		output := "\x1b[?1049h\x1b[2J\x1b[H$ make build\r\n\x1b[32mok\x1b[m\r\n" +
+			"\x1b[?1049lError: session not found\r\n"
+		if got := lastVisibleLine(output); got != "Error: session not found" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("reports nothing when the client only moved the cursor", func(t *testing.T) {
+		if got := lastVisibleLine("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l"); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
+
+	t.Run("bounds a long line", func(t *testing.T) {
+		got := lastVisibleLine(strings.Repeat("x", 500))
+		if len(got) != 203 || !strings.HasSuffix(got, "...") {
+			t.Fatalf("got %d chars: %q", len(got), got)
+		}
+	})
+}
+
+// TestReconnectWindowRestartsAfterALiveSession covers the budget that used to
+// run from the moment sp started: a session that had been up for a day had
+// none of it left when the connection finally dropped, so the first failure
+// ended the session instead of being reconnected.
+func TestReconnectWindowRestartsAfterALiveSession(t *testing.T) {
+	isolateStore(t)
+	defer func(window, live time.Duration) {
+		reconnectWindow, reconnectLiveFor = window, live
+	}(reconnectWindow, reconnectLiveFor)
+	reconnectWindow, reconnectLiveFor = 100*time.Millisecond, 100*time.Millisecond
+
+	// The first attempt lasts past reconnectLiveFor, so it counts as a
+	// connection that worked and the window starts over; the second fails at
+	// once and spends what is left of it.
+	bin, counter := fakeClient(t, `if [ "$n" = 1 ]; then sleep 0.3; fi; echo "Error: connection closed" >&2; exit 1`)
+	if err := runWithReconnect(bin, attachTarget{label: "test"}, func() *attachTarget { return nil }); err == nil {
+		t.Fatal("want an error once the window is spent")
+	}
+	if got := runs(t, counter); got != 2 {
+		t.Errorf("ran %d times, want 2 — the live attempt should have restored the window", got)
+	}
+}
+
+// TestSignalName covers the field that turns "killed" into a diagnosis. The
+// three common signals mean entirely different things, and the record used to
+// throw the distinction away.
+func TestSignalName(t *testing.T) {
+	for _, tc := range []struct {
+		signal syscall.Signal
+		want   string
+	}{
+		{syscall.SIGKILL, "signal 9 (killed)"},
+		{syscall.SIGTERM, "signal 15 (terminated)"},
+		{syscall.SIGHUP, "signal 1 (hangup)"},
+	} {
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Process.Signal(tc.signal); err != nil {
+			t.Fatal(err)
+		}
+		if got := signalName(cmd.Wait()); got != tc.want {
+			t.Errorf("got %q, want %q", got, tc.want)
+		}
+	}
+
+	// A client that exited on its own has no signal to report.
+	if got := signalName(exec.Command("false").Run()); got != "" {
+		t.Errorf("got %q, want empty for a plain non-zero exit", got)
+	}
+	if got := signalName(nil); got != "" {
+		t.Errorf("got %q, want empty for a clean exit", got)
+	}
+}
+
+// TestReconnectRenewsTheSessionHold covers the hold being restored on each
+// reattach. Without it the hold's cap expired while a session was still in
+// use, and the sprite was then free to pause and stop between two attempts.
+func TestReconnectRenewsTheSessionHold(t *testing.T) {
+	isolateStore(t)
+	defer func(f func()) { renewSessionHold = f }(renewSessionHold)
+	renewals := 0
+	renewSessionHold = func() { renewals++ }
+
+	bin, counter := fakeClient(t, `if [ "$n" = 1 ]; then echo "Error: connection closed" >&2; exit 1; fi; exit 0`)
+	err := runWithReconnect(bin, attachTarget{label: "test"}, func() *attachTarget {
+		return &attachTarget{label: "test"}
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want nil after reconnect", err)
+	}
+	if got := runs(t, counter); got != 2 {
+		t.Fatalf("ran %d times, want 2", got)
+	}
+	// Once, for the reattach. Not for the first attempt: its caller had just
+	// started a fresh hold.
+	if renewals != 1 {
+		t.Errorf("renewed the hold %d times, want 1", renewals)
+	}
+}
+
+// TestSpriteStillThere covers the one distinction that matters on the ssh
+// path: a sprite that is really gone ends the loop, while a listing that could
+// not be fetched does not — being offline is the case the loop exists for, and
+// it fails the listing exactly like a destroyed sprite would.
+func TestSpriteStillThere(t *testing.T) {
+	target := &attachTarget{label: "live"}
+	cases := []struct {
+		name   string
+		script string
+		want   *attachTarget
+	}{
+		{"listed", `echo '{"sprites":[{"id":"1","name":"live"}]}'`, target},
+		{"not listed", `echo '{"sprites":[{"id":"2","name":"other"}]}'`, nil},
+		{"listing failed", `echo 'dial tcp: no route to host' >&2; exit 1`, target},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fake := filepath.Join(dir, "sprite")
+			if err := os.WriteFile(fake, []byte("#!/bin/sh\n"+tc.script+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			got := spriteStillThere(sprite.NewClient(""), "live", target)()
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTransportLogIsKeptForAnUnclassifiedEnd covers the hole that cost three
+// sessions' worth of evidence: the transport's log was recorded only when sp
+// had already decided the attempt was a drop, so an attempt it could not
+// classify -- the only kind anyone needs to investigate -- left nothing behind.
+func TestTransportLogIsKeptForAnUnclassifiedEnd(t *testing.T) {
+	isolateStore(t)
+
+	logPath := filepath.Join(t.TempDir(), "ssh.log")
+	if err := os.WriteFile(logPath, []byte("debug1: the transport's account\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Exits non-zero saying nothing sp recognizes, which is the case that used
+	// to be classified "ended" and recorded no explanation.
+	bin, _ := fakeClient(t, "echo 'something unfamiliar' >&2\nexit 3")
+	target := attachTarget{label: "test", transportLog: logPath}
+	if err := runWithReconnect(bin, target, func() *attachTarget { return nil }); err == nil {
+		t.Fatal("expected the non-zero exit to be returned")
+	}
+
+	db, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events, err := db.Events(time.Now().Add(-time.Minute), store.EventFilter{Source: "transport"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d transport events, want 1", len(events))
+	}
+	if !strings.Contains(events[0].Detail, "the transport's account") {
+		t.Errorf("detail does not hold the transport log: %q", events[0].Detail)
+	}
+	// What the session printed matters more than the transport's log when the
+	// remote command exited on its own, which is the case here.
+	if !strings.Contains(events[0].Detail, "something unfamiliar") {
+		t.Errorf("detail does not hold what the session said: %q", events[0].Detail)
+	}
+	if !strings.Contains(events[0].Message, `"ended"`) {
+		t.Errorf("message does not say how the attempt was classified: %q", events[0].Message)
+	}
+}
+
+// TestRemoteSignalDeath covers a kill on the sprite rather than locally. The
+// local client exits normally and forwards 128+N, so the death arrives as an
+// ordinary exit code -- "exit status 137" -- which sp read as the session
+// choosing to end. It is the most recoverable failure there is: a killed tmux
+// client leaves the server and its panes alone.
+func TestRemoteSignalDeath(t *testing.T) {
+	for _, tc := range []struct {
+		code    int
+		killed  bool
+		name    string
+		wantSig string
+	}{
+		{code: 137, killed: true, name: "killed", wantSig: "signal 9 (killed)"},
+		{code: 143, killed: true, name: "killed", wantSig: "signal 15 (terminated)"},
+		{code: 129, killed: true, name: "killed", wantSig: "signal 1 (hangup)"},
+		// A person saying stop, forwarded. Retrying would leave no way to end
+		// a session by hand, exactly as for a local interrupt.
+		{code: 130, killed: false, name: "ended", wantSig: "signal 2 (interrupt)"},
+		// Ordinary non-zero exits must stay ordinary. 128 itself is not a
+		// signal, and 1 is what a command that simply failed returns.
+		{code: 1, killed: false, name: "ended", wantSig: ""},
+		{code: 128, killed: false, name: "ended", wantSig: ""},
+		{code: 160, killed: false, name: "ended", wantSig: ""},
+	} {
+		err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", tc.code)).Run()
+		if err == nil {
+			t.Fatalf("exit %d produced no error", tc.code)
+		}
+		if got := isSignalDeath(err); got != tc.killed {
+			t.Errorf("exit %d: isSignalDeath = %v, want %v", tc.code, got, tc.killed)
+		}
+		if got := attemptName(err, false, tc.killed); got != tc.name {
+			t.Errorf("exit %d: attemptName = %q, want %q", tc.code, got, tc.name)
+		}
+		if got := signalName(err); got != tc.wantSig {
+			t.Errorf("exit %d: signalName = %q, want %q", tc.code, got, tc.wantSig)
 		}
 	}
 }

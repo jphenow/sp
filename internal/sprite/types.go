@@ -16,6 +16,14 @@ type Info struct {
 	LastStartedAt      *time.Time  `json:"last_started_at"`
 	LastActiveAt       *time.Time  `json:"last_active_at"`
 	EnvironmentVersion *string     `json:"environment_version"`
+	Config             *Config     `json:"config"`
+}
+
+// Config is the part of a sprite's configuration sp reads. Unset fields come
+// back absent, which means the server default applies.
+type Config struct {
+	AutoIdle      *bool `json:"auto_idle"`
+	IdleTimeoutMS *int  `json:"idle_timeout_ms"`
 }
 
 // URLSetting holds the authentication setting for a sprite's public URL.

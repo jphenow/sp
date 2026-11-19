@@ -1,6 +1,12 @@
 package cmd
 
-import "testing"
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"testing"
+)
 
 // Command lines taken from a real machine running sp sessions.
 func TestSpriteFlagsFrom(t *testing.T) {
@@ -64,5 +70,84 @@ func TestSpriteUnderPID(t *testing.T) {
 	// An unrelated sprite process elsewhere in the tree must not be picked up.
 	if name, _ := spriteUnderPID(procs, 200); name != "gh-jphenow--gameservers--green" {
 		t.Errorf("name = %q, want the descendant of the given root", name)
+	}
+}
+
+func TestPasteRemoteName(t *testing.T) {
+	cases := map[string]string{
+		"report.pdf":       "report.pdf",
+		"My Report v2.pdf": "My-Report-v2.pdf",
+		"notes:draft.md":   "notes-draft.md",
+		"a'b\"c.txt":       "a-b-c.txt",
+		"...":              "file",
+		"..":               "file",
+		".env":             ".env",
+		"Screenshot 1.png": "Screenshot-1.png",
+	}
+	for in, want := range cases {
+		if got := pasteRemoteName(in); got != want {
+			t.Errorf("pasteRemoteName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// writePasteboard puts values on a private pasteboard so a test never touches
+// the clipboard the person is using.
+func writePasteboard(t *testing.T, name string, script string) {
+	t.Helper()
+	full := `ObjC.import("AppKit");
+(function () {
+  var pb = $.NSPasteboard.pasteboardWithName("` + name + `");
+  pb.clearContents;
+  ` + script + `
+  return "ok";
+})()`
+	if out, err := exec.Command("osascript", "-l", "JavaScript", "-e", full).CombinedOutput(); err != nil {
+		t.Fatalf("seeding pasteboard: %v: %s", err, out)
+	}
+}
+
+// TestClipboardFiles reads real file references off a real pasteboard, because
+// the behaviour worth being sure of is AppKit's, not sp's: that several files
+// come back from one copy, and that a pasteboard holding text yields no files
+// at all — including text that is itself a file:// URL, which is what keeps
+// pasting the text of a path from uploading anything.
+func TestClipboardFiles(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("reads the macOS pasteboard")
+	}
+	dir := t.TempDir()
+	one := filepath.Join(dir, "one.txt")
+	two := filepath.Join(dir, "two with spaces.txt")
+	for _, p := range []string{one, two} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	board := "sp-paste-test"
+	clipboardPasteboard = board
+	defer func() { clipboardPasteboard = "" }()
+
+	writePasteboard(t, board, `var urls = $.NSMutableArray.alloc.init;
+  urls.addObject($.NSURL.fileURLWithPath($("`+one+`")));
+  urls.addObject($.NSURL.fileURLWithPath($("`+two+`")));
+  pb.writeObjects(urls);`)
+
+	got, err := clipboardFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != one || got[1] != two {
+		t.Fatalf("got %q, want %q", got, []string{one, two})
+	}
+
+	writePasteboard(t, board, `pb.setStringForType($("file://`+one+`"), $.NSPasteboardTypeString);`)
+	got, err = clipboardFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %q from a text pasteboard, want none", got)
 	}
 }
