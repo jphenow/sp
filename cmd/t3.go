@@ -48,7 +48,8 @@ you to approve in a browser. Everything after that is a service, so a sprite
 that goes cold rejoins on its own when it is woken — and the hub's "join t3"
 button re-runs just the service half, with no browser needed.
 
-  sp t3 setup gameservers
+  sp t3 setup .
+  sp t3 setup jphenow/sp
   sp t3 setup gameservers --for 3h
 
 T3 Connect reaches a sprite over a relay the sprite dials out to, so this needs
@@ -78,12 +79,16 @@ var t3PairCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := sprite.NewClient(t3Org)
-		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite: args[0], Org: t3Org, Command: []string{"true"},
-		}); err != nil {
-			return fmt.Errorf("waking %s: %w", args[0], err)
+		spriteName, err := resolveSpriteTarget(client, args[0])
+		if err != nil {
+			return err
 		}
-		return pairT3(client, args[0])
+		if _, err := client.Exec(sprite.ExecOptions{
+			Sprite: spriteName, Org: t3Org, Command: []string{"true"},
+		}); err != nil {
+			return fmt.Errorf("waking %s: %w", spriteName, err)
+		}
+		return pairT3(client, spriteName)
 	},
 }
 
@@ -111,8 +116,11 @@ func init() {
 //     and re-creating it is what makes the sprite show up. On a fresh sprite
 //     the unlink is a no-op.
 func runT3Setup(cmd *cobra.Command, args []string) error {
-	spriteName := args[0]
 	client := sprite.NewClient(t3Org)
+	spriteName, err := resolveSpriteTarget(client, args[0])
+	if err != nil {
+		return err
+	}
 
 	fmt.Printf("Waking %s...\n", spriteName)
 	if _, err := client.Exec(sprite.ExecOptions{
