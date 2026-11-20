@@ -33,7 +33,8 @@ It needs a reusable auth key, read from TS_AUTHKEY or from
 the same key, and pre-approved if your tailnet requires device approval --
 nothing here can answer an approval prompt.
 
-  sp tailscale setup gameservers
+  sp tailscale setup .
+  sp tailscale setup jphenow/sp
   sp tailscale setup gameservers --tags tag:dev
   sp tailscale setup gameservers --tags none
 
@@ -81,10 +82,40 @@ func resolvedTailnetTags(cmd *cobra.Command) string {
 	return setup.TailscaleTags()
 }
 
+// resolveSpriteTarget turns whatever the user typed into the name of a sprite
+// that exists, accepting the same targets sp itself does: ".", "owner/repo" or
+// a bare sprite name.
+//
+// Resolving through the connect path rather than taking the argument at face
+// value is what makes "owner/repo" work, and it is also the only thing that
+// finds a sprite created under the older "--" naming: ResolveRepo reports
+// today's name and yesterday's, and adoptExistingSprite prefers whichever one
+// is really there. Taking the argument literally instead produces a 404 whose
+// text ("sprite not found") says nothing about the name being the problem.
+func resolveSpriteTarget(client *sprite.Client, arg string) (string, error) {
+	resolved, err := resolveTarget([]string{arg})
+	if err != nil {
+		return "", err
+	}
+	_, exists, err := adoptExistingSprite(client, resolved)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf(
+			"no sprite found for %q (looked for %q).\nRun 'sp status' to list your sprites, or 'sp %s' to create one",
+			arg, resolved.SpriteName, arg)
+	}
+	return resolved.SpriteName, nil
+}
+
 // runTailscaleSetup joins a sprite to the tailnet and prints its address.
 func runTailscaleSetup(cmd *cobra.Command, args []string) error {
-	spriteName := args[0]
 	client := sprite.NewClient(tailscaleOrg)
+	spriteName, err := resolveSpriteTarget(client, args[0])
+	if err != nil {
+		return err
+	}
 
 	key := setup.TailscaleAuthKey()
 	if key == "" {
