@@ -222,6 +222,144 @@ self-release at the deadline (`--hold-for`, default 1h).
 
 ---
 
+## T3 Code on a sprite
+
+[T3 Code](https://github.com/pingdotgg/t3code) drives coding agents from a phone,
+web or desktop app. `sp t3 setup` joins a sprite to it and leaves a service
+behind, so a sprite that goes cold rejoins on its own when it is woken.
+
+```bash
+sp t3 setup jphenow/sp                  # over T3 Connect, T3's hosted relay
+sp t3 setup jphenow/sp --tailscale      # over your own tailnet instead
+sp t3 setup jphenow/sp --for 4h         # hold the sprite Active longer
+sp t3 pair jphenow/sp                   # another pairing code (tailnet mode)
+```
+
+Targets are the same ones `sp` itself takes: `.`, `owner/repo`, or a sprite name.
+
+Both paths reach the sprite over a connection the sprite dials *out*, so neither
+needs port forwarding and neither exposes anything on the sprite's own URL.
+Neither can wake a sleeping sprite either — see [What this does not
+solve](#what-this-does-not-solve).
+
+**T3 Connect** is the default. Setup is interactive once per sprite: T3's device
+flow prints a URL and a code to approve in a browser. In exchange you get push
+notifications and Live Activities on the phone, which are a function of the
+relay. Note that the relay serves an unauthenticated descriptor naming the
+environment and its OS; the API behind it requires authorization.
+
+**`--tailscale`** uses your tailnet instead. Nothing is registered with a T3
+account and no third party sits in the middle. T3 is served over Tailscale Serve
+on an HTTPS name only your own devices can resolve, and you pair by scanning a
+QR code. You give up the push notifications.
+
+### Putting sprites on your tailnet
+
+```bash
+sp tailscale setup jphenow/sp                   # join one sprite
+sp tailscale setup jphenow/sp --tags tag:dev    # use a tag you already own
+sp tailscale setup jphenow/sp --tags none       # don't advertise any tag
+```
+
+This needs a reusable auth key. Create one at **Settings → Keys → Generate auth
+key** in the [Tailscale admin console](https://login.tailscale.com/admin/settings/keys):
+
+- **Reusable: on** — every sprite joins with the same key.
+- **Ephemeral: off** — ephemeral nodes are *deleted* when they go offline, and a
+  sprite that sleeps would vanish from the tailnet.
+- **Pre-approved: on**, if the option appears. It only does when your tailnet
+  requires device approval, and nothing on a sprite can answer an approval
+  prompt.
+- **Tags: leave empty** for now; see below.
+
+Then:
+
+```bash
+mkdir -p ~/.config/sprite
+printf '%s' 'tskey-auth-…' > ~/.config/sprite/tailscale.authkey
+chmod 600 ~/.config/sprite/tailscale.authkey
+printf 'none' > ~/.config/sprite/tailscale.tags
+```
+
+Once that key exists, **every connect joins its sprite to the tailnet** as one
+more setup task. It is idempotent and short-circuits on a single call for a
+sprite that is already on, and it is non-fatal: a sprite that could not reach the
+tailnet is still a sprite you can work in. No key, no task, no round trips —
+which is how you opt out.
+
+The key is read from `TS_AUTHKEY` or `~/.config/sprite/tailscale.authkey`; the
+tags from `TS_TAGS` or `~/.config/sprite/tailscale.tags`, defaulting to
+`tag:sprite`, with `none` meaning untagged.
+
+### Owning a tag
+
+Tags default to `tag:sprite`, which your tailnet's policy file has to own —
+and the key-creation page will not offer you a tag that does not exist there
+yet. That is why the quickstart above says `none`.
+
+It is worth doing eventually: an untagged node's key expires (180 days by
+default) and the node then drops off the tailnet until someone logs in again,
+which is the one thing a sprite with no browser cannot do. Tagged nodes do not
+expire.
+
+In [Access controls](https://login.tailscale.com/admin/acls/file), add
+`tag:sprite` to `tagOwners` — a line inside the existing block if there is one,
+or the whole block at the top level if not:
+
+```jsonc
+"tagOwners": {
+  "tag:sprite": ["autogroup:admin"],
+},
+```
+
+If your `acls` is still the default allow-all, that is enough. If you have
+locked it down, also let your own devices reach the tag:
+
+```jsonc
+{"action": "accept", "src": ["autogroup:member"], "dst": ["tag:sprite:*"]}
+```
+
+Save, regenerate the auth key with `tag:sprite` selected, update
+`~/.config/sprite/tailscale.authkey`, and `rm ~/.config/sprite/tailscale.tags`
+to go back to the default. New sprites pick it up. To move an existing sprite
+onto the tag, delete that machine in the admin console and re-run `sp tailscale
+setup` — its tailscaled reports `NeedsLogin` and rejoins, tagged.
+
+### How it runs on the sprite
+
+`tailscaled` is a `--restart always` sprite service, so it comes back after a
+cold wake, and its state lives on the sprite's own volume, so the node keeps its
+address instead of appearing as a new machine every time.
+
+Three details are load-bearing:
+
+- **`--tun=userspace-networking`.** A sprite is a container. The guest's device
+  allowlist does know `/dev/net/tun`, but only grants it to a sprite whose
+  privileges policy asks for it. Userspace mode needs no device and no
+  `CAP_NET_ADMIN`, and still terminates inbound connections — all this needs.
+  The cost is that other processes on the sprite cannot route *out* over the
+  tailnet.
+- **`--accept-dns=false`.** The guest runtime manages `/etc/resolv.conf`.
+  Letting tailscaled take DNS over would fight it, and the loser would be every
+  name the sprite already resolves.
+- **The auth key reaches the sprite as a `chmod 600` file** and `tailscale up`
+  is given the path, so the key is never readable in the sprite's process list.
+
+One trap: the guest's default egress allowlist contains **no** Tailscale or DERP
+domains. Filtering is off unless a network policy exists, so ordinary sprites are
+fine — but applying a network policy to a sprite will silently cut its tailnet
+connection.
+
+### What this does not solve
+
+Tailscale is outbound-only, exactly like T3's relay and like Remote Control. A
+paused sprite answers on your tailnet no more than it answered on the relay, so
+**waking still needs an inbound request to the sprite's own URL**, and a hold is
+still what keeps the connection up once you are on it (`--for`, default 1h).
+What the tailnet buys you is removing the third party, not sleep and wake.
+
+---
+
 ## File sync
 
 Directory targets (except variants) are synced by the daemon with Mutagen in `two-way-safe` mode: a file changed on both sides becomes a conflict instead of being overwritten. Mutagen connects over `sprite proxy` to an `sshd` that `sp` installs on the sprite, using a `sprite-mutagen-<name>` entry it adds to `~/.ssh/config`. The Mutagen session is named `sprite-<name>`.
@@ -357,6 +495,9 @@ Only sprites `sp` knows about appear: ones you've connected to, or added with `s
 | `sp hub install <sprite>` | Install the reporting agent (`--hub-url`, `--token`) |
 | `sp hub serve` | The hub web app; runs on the hub sprite |
 | `sp hub agent` | The reporting agent; runs on a watched sprite |
+| `sp t3 setup <target>` | Join a sprite to T3 Code (`--tailscale`, `--for`) |
+| `sp t3 pair <target>` | Print a new pairing QR code (tailnet mode) |
+| `sp tailscale setup <target>` | Install tailscale and join the sprite to your tailnet (`--tags`) |
 | `sp completion <shell>` | Shell completion script |
 
 `<sprite-or-variant>` is a sprite name or `owner/repo:variant`.
@@ -423,6 +564,26 @@ printf '\e[?1000l\e[?1003l\e[?1006l'
 ```
 
 The initial window size is set when the session starts, but resizing the local window mid-session doesn't propagate. Detach and reconnect to reflow.
+
+### A sprite isn't reachable on the tailnet
+
+Connect only warns when the join fails, because losing the session to it would be
+worse. Run the join on its own to see the actual error:
+
+```bash
+sp tailscale setup <target>
+sprite exec <sprite> -- /usr/local/bin/tailscale status
+```
+
+- **`sudo: a password is required`** — installing the binaries and running the
+  daemon need passwordless sudo on the sprite.
+- **`requested tags [tag:…] are invalid or not permitted`** — your tailnet's
+  policy file does not own that tag, or you do not. See
+  [Owning a tag](#owning-a-tag), or pass `--tags none`.
+- **The name does not resolve on your phone** — the phone has to be on the
+  tailnet itself, with the Tailscale app connected and MagicDNS on.
+- **It worked and then stopped** — check whether the sprite paused. A hold is
+  what keeps it up; the tailnet cannot wake it.
 
 ### A command exits with an error
 
