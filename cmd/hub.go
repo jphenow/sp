@@ -44,7 +44,6 @@ const (
 
 var (
 	hubAddr       string
-	hubOrg        string
 	hubToken      string
 	hubHoldFor    time.Duration
 	hubUseVault   bool
@@ -108,7 +107,6 @@ var hubInstallCmd = &cobra.Command{
 
 func init() {
 	hubServeCmd.Flags().StringVar(&hubAddr, "addr", fmt.Sprintf(":%d", hubPort), "listen address")
-	hubServeCmd.Flags().StringVar(&hubOrg, "org", "", "Sprites organization (default: the CLI default)")
 	hubServeCmd.Flags().DurationVar(&hubHoldFor, "hold-for", time.Hour, "how long a hold lasts when toggled on from the page")
 	hubServeCmd.Flags().StringVar(&hubDBPath, "db", "", "hub database path (default: ~/.config/sp/hub.db)")
 	hubServeCmd.Flags().BoolVar(&hubUseVault, "vault", false, "allow pushing stored Claude credentials to a sprite whose login expired")
@@ -117,11 +115,9 @@ func init() {
 	hubAgentCmd.Flags().StringVar(&hubAgentName, "sprite", "", "this sprite's name")
 	hubAgentCmd.Flags().DurationVar(&hubAgentEvery, "interval", time.Minute, "how often to report")
 
-	hubDeployCmd.Flags().StringVar(&hubOrg, "org", "", "Sprites organization (default: the CLI default)")
 	hubDeployCmd.Flags().StringVar(&hubToken, "token", "", "sprite CLI token for the hub (default: $SPRITE_API_TOKEN)")
 	hubDeployCmd.Flags().BoolVar(&hubUseVault, "vault", false, "also upload this machine's Claude credentials so the hub can repair expired logins")
 
-	hubInstallCmd.Flags().StringVar(&hubOrg, "org", "", "Sprites organization (default: the CLI default)")
 	hubInstallCmd.Flags().StringVar(&hubAgentURL, "hub-url", "", "hub base URL (default: looked up from the hub sprite)")
 	hubInstallCmd.Flags().StringVar(&hubToken, "token", "", "Sprites org token for the agent (default: $SPRITE_API_TOKEN)")
 
@@ -147,7 +143,7 @@ func runHubServe(cmd *cobra.Command, args []string) error {
 
 	srv := hub.NewServer(hub.Config{
 		Addr:    hubAddr,
-		Org:     hubOrg,
+		Org:     globalOrg,
 		Token:   os.Getenv("SP_HUB_TOKEN"),
 		HoldFor: hubHoldFor,
 		Vault:   vault,
@@ -179,7 +175,7 @@ func runHubAgent(cmd *cobra.Command, args []string) error {
 // registers the web app as a sprite-env service so it survives cold wakes.
 func runHubDeploy(cmd *cobra.Command, args []string) error {
 	spriteName := args[0]
-	client := sprite.NewClient(hubOrg)
+	client := sprite.NewClient(globalOrg)
 
 	exists, err := client.Exists(spriteName)
 	if err != nil {
@@ -196,12 +192,12 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 	defer cleanup()
 
 	fmt.Println("Uploading sp binary...")
-	if err := client.UploadBinary(spriteName, hubOrg, binary, spRemotePath); err != nil {
+	if err := client.UploadBinary(spriteName, globalOrg, binary, spRemotePath); err != nil {
 		return err
 	}
 	serveArgs := fmt.Sprintf("hub,serve,--addr,:%d", hubPort)
-	if hubOrg != "" {
-		serveArgs += ",--org," + hubOrg
+	if globalOrg != "" {
+		serveArgs += ",--org," + globalOrg
 	}
 
 	if hubUseVault {
@@ -218,7 +214,7 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 		fmt.Println("Uploading Claude credentials to the hub vault...")
 		if _, err := client.Exec(sprite.ExecOptions{
 			Sprite:  spriteName,
-			Org:     hubOrg,
+			Org:     globalOrg,
 			Command: []string{"sh", "-c", "mkdir -p /home/sprite/.config/sp"},
 			Files:   map[string]string{local: hubVaultPath},
 		}); err != nil {
@@ -232,7 +228,7 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 
 	client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Org:     hubOrg,
+		Org:     globalOrg,
 		Command: []string{"sprite-env", "services", "delete", hubServiceName},
 	})
 
@@ -245,7 +241,7 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 	)
 	if out, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Org:     hubOrg,
+		Org:     globalOrg,
 		Command: []string{"sh", "-c", createCmd},
 	}); err != nil {
 		return fmt.Errorf("creating hub service: %w\n%s", err, string(out))
@@ -271,7 +267,7 @@ func runHubDeploy(cmd *cobra.Command, args []string) error {
 func hubServiceURL(client *sprite.Client, spriteName string) (string, error) {
 	out, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Org:     hubOrg,
+		Org:     globalOrg,
 		Command: []string{"sprite-env", "services", "get", hubServiceName},
 	})
 	if err != nil {
@@ -314,7 +310,7 @@ func hubServiceURL(client *sprite.Client, spriteName string) (string, error) {
 func installSpriteCLI(client *sprite.Client, spriteName string) error {
 	probe, _ := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Org:     hubOrg,
+		Org:     globalOrg,
 		Command: []string{"sh", "-lc", spriteCLIDir + "/sprite list >/dev/null 2>&1 && echo READY || echo MISSING"},
 	})
 	if strings.Contains(string(probe), "READY") {
@@ -343,7 +339,7 @@ fi
 
 	if out, err := client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
-		Org:     hubOrg,
+		Org:     globalOrg,
 		Command: []string{"sh", "-c", script},
 	}); err != nil {
 		return fmt.Errorf("installing the sprite CLI on %s: %w\n%s", spriteName, err, strings.TrimSpace(string(out)))
@@ -377,7 +373,7 @@ func runHubInstall(cmd *cobra.Command, args []string) error {
 	defer cleanup()
 
 	fmt.Printf("Installing the reporting agent on %s...\n", spriteName)
-	actions := hub.NewActions(hubOrg)
+	actions := hub.NewActions(globalOrg)
 	if err := actions.InstallAgent(hub.InstallAgentOptions{
 		Sprite:     spriteName,
 		HubURL:     hubAgentURL,

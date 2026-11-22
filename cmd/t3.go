@@ -25,7 +25,6 @@ const (
 )
 
 var (
-	t3Org       string
 	t3For       time.Duration
 	t3Tailscale bool
 )
@@ -78,13 +77,13 @@ var t3PairCmd = &cobra.Command{
 	Short: "Print a new pairing QR code for a sprite serving T3 over the tailnet",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		client := sprite.NewClient(t3Org)
-		spriteName, err := resolveSpriteTarget(client, args[0])
+		spriteName, err := resolveSpriteTarget(args[0])
 		if err != nil {
 			return err
 		}
+		client := sprite.NewClient(globalOrg)
 		if _, err := client.Exec(sprite.ExecOptions{
-			Sprite: spriteName, Org: t3Org, Command: []string{"true"},
+			Sprite: spriteName, Org: globalOrg, Command: []string{"true"},
 		}); err != nil {
 			return fmt.Errorf("waking %s: %w", spriteName, err)
 		}
@@ -93,8 +92,6 @@ var t3PairCmd = &cobra.Command{
 }
 
 func init() {
-	t3SetupCmd.Flags().StringVar(&t3Org, "org", "", "Sprites organization (default: the CLI default)")
-	t3PairCmd.Flags().StringVar(&t3Org, "org", "", "Sprites organization (default: the CLI default)")
 	t3SetupCmd.Flags().DurationVar(&t3For, "for", time.Hour, "how long to hold the sprite Active once it has joined")
 	t3SetupCmd.Flags().BoolVar(&t3Tailscale, "tailscale", false, "reach the sprite over your tailnet instead of T3 Connect")
 	t3Cmd.AddCommand(t3SetupCmd)
@@ -116,20 +113,20 @@ func init() {
 //     and re-creating it is what makes the sprite show up. On a fresh sprite
 //     the unlink is a no-op.
 func runT3Setup(cmd *cobra.Command, args []string) error {
-	client := sprite.NewClient(t3Org)
-	spriteName, err := resolveSpriteTarget(client, args[0])
+	spriteName, err := resolveSpriteTarget(args[0])
 	if err != nil {
 		return err
 	}
+	client := sprite.NewClient(globalOrg)
 
 	fmt.Printf("Waking %s...\n", spriteName)
 	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org, Command: []string{"true"},
+		Sprite: spriteName, Org: globalOrg, Command: []string{"true"},
 	}); err != nil {
 		return fmt.Errorf("waking %s: %w", spriteName, err)
 	}
 
-	if err := ensureRestartableServices(client, spriteName, t3Org); err != nil {
+	if err := ensureRestartableServices(client, spriteName, globalOrg); err != nil {
 		return err
 	}
 
@@ -141,11 +138,11 @@ func runT3Setup(cmd *cobra.Command, args []string) error {
 	// any server started by hand over SSH, which the service does not know
 	// about and which would otherwise hold the lock.
 	client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org,
+		Sprite: spriteName, Org: globalOrg,
 		Command: []string{"sprite-env", "services", "delete", t3Service},
 	})
 	client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org, Command: []string{"pkill", "-f", "t3 serve"},
+		Sprite: spriteName, Org: globalOrg, Command: []string{"pkill", "-f", "t3 serve"},
 	})
 
 	if t3Tailscale {
@@ -160,17 +157,17 @@ func runT3Setup(cmd *cobra.Command, args []string) error {
 	// and Live Activities. It is cleared by the unlink above, so it is set
 	// again here rather than left to be rediscovered as missing later.
 	client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org,
+		Sprite: spriteName, Org: globalOrg,
 		Command: []string{"sh", "-lc", t3Bin + " connect publish"},
 	})
 
 	fmt.Println("Starting the relay service...")
-	if err := hub.NewActions(t3Org).StartT3(spriteName, t3For); err != nil {
+	if err := hub.NewActions(globalOrg).StartT3(spriteName, t3For); err != nil {
 		return err
 	}
 
 	out, _ := client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org,
+		Sprite: spriteName, Org: globalOrg,
 		Command: []string{"sh", "-lc", t3Bin + " connect status"},
 	})
 	fmt.Printf("\n%s\n", out)
@@ -224,14 +221,14 @@ func lastLine(s string) string {
 // needs no global write.
 func ensureT3Installed(client *sprite.Client, spriteName string) error {
 	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org,
+		Sprite: spriteName, Org: globalOrg,
 		Command: []string{"sh", "-lc", "test -n \"" + t3Bin + "\""},
 	}); err == nil {
 		return nil
 	}
 	fmt.Println("Installing T3 on the sprite...")
 	if out, err := client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org,
+		Sprite: spriteName, Org: globalOrg,
 		Command: []string{"sh", "-lc", "npx -y t3 --version"},
 	}); err != nil {
 		return fmt.Errorf("installing T3 on %s: %w\n%s", spriteName, err, out)
@@ -255,7 +252,7 @@ func linkT3(client *sprite.Client, spriteName string) error {
 	// chained with ';' rather than '&&'.
 	script := t3Bin + " connect unlink; exec " + t3Bin + " connect link --headless"
 	args := client.BuildExecArgs(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org, TTY: true,
+		Sprite: spriteName, Org: globalOrg, TTY: true,
 		Command: []string{"sh", "-lc", script},
 	})
 
@@ -290,14 +287,14 @@ func setupT3OverTailnet(client *sprite.Client, spriteName string) error {
 	}
 
 	fmt.Printf("Joining %s to the tailnet...\n", spriteName)
-	if err := setup.JoinTailnet(client, spriteName, t3Org, setup.TailnetOptions{
+	if err := setup.JoinTailnet(client, spriteName, globalOrg, setup.TailnetOptions{
 		AuthKey: key,
 		Tags:    setup.TailscaleTags(),
 	}); err != nil {
 		return err
 	}
 
-	name, err := setup.TailnetName(client, spriteName, t3Org)
+	name, err := setup.TailnetName(client, spriteName, globalOrg)
 	if err != nil {
 		return err
 	}
@@ -316,14 +313,14 @@ func setupT3OverTailnet(client *sprite.Client, spriteName string) error {
 
 	fmt.Println("Starting T3 on the tailnet...")
 	if out, err := client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org, Command: []string{"sh", "-c", create},
+		Sprite: spriteName, Org: globalOrg, Command: []string{"sh", "-c", create},
 	}); err != nil {
 		return fmt.Errorf("starting T3 on %s: %w\n%s", spriteName, err, strings.TrimSpace(string(out)))
 	}
 
 	// Without a hold the sprite pauses within seconds of this returning and
 	// the tailnet address stops answering mid-pairing.
-	if err := hub.NewActions(t3Org).SetHold(spriteName, t3For, true); err != nil {
+	if err := hub.NewActions(globalOrg).SetHold(spriteName, t3For, true); err != nil {
 		return err
 	}
 
@@ -352,7 +349,7 @@ done
 exec %s pair --tailscale`, t3Bin, t3Bin)
 
 	args := client.BuildExecArgs(sprite.ExecOptions{
-		Sprite: spriteName, Org: t3Org, TTY: true,
+		Sprite: spriteName, Org: globalOrg, TTY: true,
 		Command: []string{"sh", "-lc", script},
 	})
 	run := exec.Command(binary, args...)
