@@ -318,9 +318,20 @@ func setupT3OverTailnet(client *sprite.Client, spriteName string) error {
 		return fmt.Errorf("starting T3 on %s: %w\n%s", spriteName, err, strings.TrimSpace(string(out)))
 	}
 
-	// Without a hold the sprite pauses within seconds of this returning and
-	// the tailnet address stops answering mid-pairing.
+	// Two different holds, for two different problems. This one covers
+	// pairing: without it the sprite pauses within seconds of this returning
+	// and the tailnet address stops answering mid-pairing. It is a deadline
+	// because pairing is a bounded, attended act.
 	if err := hub.NewActions(globalOrg).SetHold(spriteName, t3For, true); err != nil {
+		return err
+	}
+
+	// This one covers the unattended case the deadline cannot: an agent still
+	// working after the hold lapses and the phone has disconnected. It holds
+	// on evidence of work rather than on a clock, and releases when the work
+	// stops, so the sprite sleeps on its own.
+	fmt.Println("Installing the activity hold...")
+	if err := setup.InstallAwakeService(client, spriteName, globalOrg, setup.T3BusyProbe); err != nil {
 		return err
 	}
 
@@ -342,11 +353,19 @@ func pairT3(client *sprite.Client, spriteName string) error {
 
 	// The server has only just been registered as a service; wait for it to
 	// answer before asking it for a token, or pairing fails on a race.
-	script := fmt.Sprintf(`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-  %s auth pairing list >/dev/null 2>&1 && break
-  sleep 2
+	//
+	// The wait is on the runtime file rather than on a t3 subcommand because
+	// the subcommands that looked like readiness probes are not: `t3 auth
+	// pairing list` exits 0 with no server running at all, so the loop fell
+	// straight through and `pair` failed with NoRunningServerError about a
+	// second before the server finished starting. server-runtime.json is what
+	// `pair` itself looks for -- the error names it -- so waiting on it asks
+	// the same question pair is about to ask.
+	script := fmt.Sprintf(`for i in $(seq 30); do
+  [ -s "$HOME/.t3/userdata/server-runtime.json" ] && break
+  sleep 1
 done
-exec %s pair --tailscale`, t3Bin, t3Bin)
+exec %s pair --tailscale`, t3Bin)
 
 	args := client.BuildExecArgs(sprite.ExecOptions{
 		Sprite: spriteName, Org: globalOrg, TTY: true,
