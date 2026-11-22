@@ -23,14 +23,45 @@ const (
 	// agent finishing one tool call and starting the next.
 	awakeGrace = 3
 
-	// T3BusyProbe reports whether T3 has an agent running, by reading the
-	// files T3 keeps for its provider processes rather than asking the server.
+	// T3BusyProbe reports whether T3 has an agent working, from the state T3
+	// keeps on disk rather than by asking the server: a file read works while
+	// the server is saturated, needs no project (threads can have none), and
+	// survives the server restarting underneath it.
 	//
-	// A file read works while the server is saturated, needs no project (T3
-	// threads can exist with none, and `thread list` returns nothing for
-	// those), and survives the server restarting underneath it.
-	T3BusyProbe = `grep -l '"processes":\[[^]]' ` +
-		`"$HOME"/.t3/userdata/provider-processes/*.json >/dev/null 2>&1`
+	// Either of two things counts as working, and neither is enough alone:
+	//
+	//   - A run T3 has started and not finished. That covers the model
+	//     thinking with no command running.
+	//   - A provider process with a child other than its watchdog. That covers
+	//     a command running -- including one the agent sent to the background,
+	//     which T3 records as finished the moment it is launched. An agent told
+	//     to run something long does exactly that: each run lasts seconds and
+	//     the work happens between them, invisible to the first check.
+	//
+	// What does not count is the provider process merely existing. T3 keeps it
+	// alive between turns, so treating it as work held an idle sprite awake
+	// indefinitely.
+	//
+	// Known limit: anything else the provider keeps running as a child (an MCP
+	// server, say) reads as a command, and holds the sprite awake. That errs
+	// toward cost rather than toward losing work.
+	T3BusyProbe = `s="$HOME/.t3/userdata"
+[ "$(sqlite3 -readonly -batch -noheader -list -init /dev/null \
+  "$s/statev2.sqlite" '.timeout 2000' \
+  'select count(*) from orchestration_v2_projection_runs where completed_at is null' \
+  2>/dev/null)" -gt 0 ] 2>/dev/null && exit 0
+for f in "$s"/provider-processes/*.json; do
+  [ -f "$f" ] || continue
+  for pid in $(sed 's/.*"processes":\[//' "$f" | grep -o '"pid":[0-9]*' | cut -d: -f2); do
+    for c in $(pgrep -P "$pid" 2>/dev/null); do
+      case "$(ps -o args= -p "$c" 2>/dev/null)" in
+        "/bin/sh -c read -r _ <&4"*|"") ;;
+        *) exit 0 ;;
+      esac
+    done
+  done
+done
+exit 1`
 )
 
 // InstallAwakeService installs the hold loop on a sprite.
@@ -49,7 +80,7 @@ const (
 // releases it once there isn't -- which is what lets the sprite sleep
 // promptly instead of waiting out a timer someone guessed at.
 //
-// probe is any shell command; exit 0 means "working". It is a parameter
+// probe is any shell script; exit 0 means "working". It is a parameter
 // rather than a constant so a different harness only needs a different
 // probe, not a different service.
 func InstallAwakeService(client *sprite.Client, spriteName, org, probe string) error {
@@ -80,14 +111,15 @@ func InstallAwakeService(client *sprite.Client, spriteName, org, probe string) e
 //
 // The probe is spliced in as the loop's condition rather than handed to a
 // nested sh -c, so it passes through exactly one shell parse -- the one that
-// runs the loop.
+// runs the loop. It runs in a subshell so that a probe which exits to give its
+// answer ends the probe, not the loop.
 func awakeScript(probe string) string {
 	// Only the transition into idleness releases the hold (idle = grace, not
 	// >=), so a long quiet stretch costs one call rather than one per poll.
 	return fmt.Sprintf(`idle=0
 while true; do
-  if { %s
-  }; then
+  if ( %s
+  ); then
     idle=0
     sprite-env keep-awake --for %s >/dev/null 2>&1 || true
   else
