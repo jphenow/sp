@@ -178,6 +178,20 @@ func adoptExistingSprite(client *sprite.Client, resolved *setup.ResolvedTarget) 
 // positional argument, if present, is a free-form variant label that forks
 // the sprite identity (see connectCmd.Long).
 func resolveTarget(args []string) (*setup.ResolvedTarget, error) {
+	resolved, err := resolveTargetName(args)
+	if err != nil {
+		return nil, err
+	}
+	// Applied here rather than at each call site because every command that
+	// resolves a target reads resolved.Org, and one of them forgetting the
+	// override is a connect that silently lands in the wrong organization.
+	resolved.Org = orgFor(resolved.Org)
+	return resolved, nil
+}
+
+// resolveTargetName turns the positional arguments into a sprite name and
+// paths, without deciding the organization.
+func resolveTargetName(args []string) (*setup.ResolvedTarget, error) {
 	target := "."
 	variant := ""
 	if len(args) > 0 {
@@ -386,6 +400,26 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	parallel.Add("Configuring git", func() error {
 		return setup.SetupGitConfig(client, resolved.SpriteName)
 	})
+
+	// Only when a tailnet auth key is configured, which is how someone who
+	// does not want their sprites on a tailnet opts out: no key, no task, no
+	// round trips. Joining is idempotent and short-circuits on one call for a
+	// sprite that is already on, so the steady-state cost of being here is a
+	// single exec that runs alongside the others.
+	if tailnetKey := setup.TailscaleAuthKey(); tailnetKey != "" {
+		parallel.Add("Joining tailnet", func() error {
+			// Non-fatal on purpose. A sprite that could not reach the tailnet
+			// is still a sprite you can work in, and the session is worth more
+			// than the convenience of reaching it by name.
+			if err := setup.JoinTailnet(client, resolved.SpriteName, resolved.Org, setup.TailnetOptions{
+				AuthKey: tailnetKey,
+				Tags:    setup.TailscaleTags(),
+			}); err != nil {
+				progress.Warnf("Warning: %s did not join the tailnet: %v", resolved.SpriteName, err)
+			}
+			return nil
+		})
+	}
 
 	parallel.Add("Syncing Claude config", func() error {
 		// Non-fatal: this is preferences, skills and commands, not something

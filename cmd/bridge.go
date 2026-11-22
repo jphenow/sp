@@ -54,7 +54,6 @@ const (
 var (
 	bridgeListen     string
 	bridgeRemotePort int
-	bridgeOrg        string
 )
 
 // bridgeCmd forwards a local port to a port on a sprite, waking the sprite when
@@ -81,7 +80,6 @@ Everything after that is a normal forward.`,
 func init() {
 	bridgeCmd.Flags().StringVar(&bridgeListen, "listen", "127.0.0.1:3773", "local address to listen on")
 	bridgeCmd.Flags().IntVar(&bridgeRemotePort, "port", 3773, "port to forward to on the sprite")
-	bridgeCmd.Flags().StringVar(&bridgeOrg, "org", "", "Sprites organization (default: the CLI default)")
 	rootCmd.AddCommand(bridgeCmd)
 }
 
@@ -89,7 +87,7 @@ func init() {
 // until interrupted.
 func runBridge(cmd *cobra.Command, args []string) error {
 	spriteName := args[0]
-	org := bridgeOrg
+	org := globalOrg
 	client := sprite.NewClient(org)
 
 	if exists, err := client.Exists(spriteName); err != nil {
