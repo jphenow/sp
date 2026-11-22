@@ -34,6 +34,7 @@ Outcomes:
   dropped  the connection failed and the client said so
   stall    the connection stopped answering input and sp killed it
   killed   something outside sp killed the client; sp reconnects anyway
+  gone     the session had ended; sp stopped rather than create an empty one
   ended    the client exited non-zero for some other reason`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -69,14 +70,15 @@ func showDisconnects(sprite string, days int) error {
 	}
 
 	fmt.Printf("Session attempts, last %d days\n\n", days)
-	fmt.Printf("%-32s %8s %6s %8s %6s %7s %6s %10s %10s %8s\n",
-		"SPRITE", "ATTEMPTS", "CLEAN", "DROPPED", "STALL", "KILLED", "ENDED",
+	fmt.Printf("%-32s %8s %6s %8s %6s %7s %5s %6s %10s %10s %8s\n",
+		"SPRITE", "ATTEMPTS", "CLEAN", "DROPPED", "STALL", "KILLED", "GONE", "ENDED",
 		"MEDIAN UP", "LONGEST UP", "WAKE")
-	fmt.Println(strings.Repeat("-", 120))
+	fmt.Println(strings.Repeat("-", 126))
 	for _, s := range summarizeAttempts(attempts) {
-		fmt.Printf("%-32s %8d %6d %8d %6d %7d %6d %10s %10s %8s\n",
+		fmt.Printf("%-32s %8d %6d %8d %6d %7d %5d %6d %10s %10s %8s\n",
 			s.sprite, s.total, s.outcomes["clean"], s.outcomes["dropped"],
-			s.outcomes["stall"], s.outcomes["killed"], s.outcomes["ended"],
+			s.outcomes["stall"], s.outcomes["killed"], s.outcomes["gone"],
+			s.outcomes["ended"],
 			shortDuration(s.medianUptime), shortDuration(s.longestUptime),
 			shortDuration(s.medianWake))
 	}

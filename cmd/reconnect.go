@@ -44,6 +44,15 @@ const (
 	// the session listing reports nothing. Bounded, so a session that really
 	// has ended stops the loop instead of being recreated forever.
 	maxBlindReattach = 2
+	// sessionGoneExit is the exit code the reattach script uses to report that
+	// the session it was asked to attach to does not exist.
+	//
+	// A code rather than a message, and one no ordinary command returns. The
+	// alternative is matching tmux's "can't find session", and matching
+	// messages instead of exit statuses is precisely the mistake that once
+	// turned a remote command's own deliberate exit into seventeen reconnects
+	// and an empty tmux session.
+	sessionGoneExit = 86
 )
 
 // Both of these are variables only so tests can shrink them.
@@ -137,6 +146,13 @@ func isTransportFailure(stderr string) bool {
 
 // isTransportExit reports whether the client exited with the status it uses to
 // mean the transport failed.
+// isSessionGone reports whether the attempt ended because there was no
+// session left to attach to, which the reattach script reports with
+// sessionGoneExit.
+func isSessionGone(err error) bool {
+	return isTransportExit(err, sessionGoneExit)
+}
+
 func isTransportExit(err error, status int) bool {
 	if err == nil || status == 0 {
 		return false
@@ -342,6 +358,33 @@ func runWithReconnect(binary string, first attachTarget, nextAttach func() *atta
 		outcome, err := runProxied(binary, target.args, tail, pump)
 		resetTerminalForRetry()
 		uptime := time.Since(started)
+
+		// The reattach script found no session to attach to, and said so with
+		// an exit code of its own rather than leaving sp to infer it.
+		//
+		// There is nothing to reconnect to, and the one thing sp must not do
+		// is create an empty session and hand it over as though it were the
+		// old one: on screen those are identical, so the user cannot tell a
+		// recovered session from a fabricated one. Starting a fresh session is
+		// a decision for whoever lost the work, not for the reconnect loop.
+		if isSessionGone(err) {
+			recordAttempt(store.Attempt{
+				Sprite:      target.label,
+				Transport:   filepath.Base(binary),
+				Outcome:     "gone",
+				Uptime:      uptime,
+				FirstOutput: outcome.firstOutput,
+				Attempt:     attempt,
+			})
+			resetTerminal()
+			fmt.Fprintf(os.Stderr,
+				"\nSession on %s is gone -- the tmux server holding it is no longer running.\n"+
+					"sp has not started a replacement: an empty session is indistinguishable from lost work.\n"+
+					"Start one deliberately with: sp connect %s\n",
+				target.label, target.label)
+			return nil
+		}
+
 		dropped := outcome.stalled ||
 			(err != nil && (isTransportFailure(tail.String()) ||
 				isTransportExit(err, target.transportExit) ||
