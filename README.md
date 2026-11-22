@@ -58,6 +58,29 @@ sp tui                        # dashboard of every tracked sprite
 
 Directory names (for `local-`) and variant labels are lowercased, with spaces, `.`, `_` and `:` replaced by `-`.
 
+### Organizations
+
+Every command takes `-o`/`--org`, and reads `SP_ORG` when the flag is absent:
+
+```sh
+sp t3 setup jphenow/sp --org other-org   # one command, one organization
+SP_ORG=other-org sp .                    # one shell
+```
+
+Precedence is `--org` → `SP_ORG` → the `organization` in the directory's
+`.sprite` file → whatever `sprite org set-default` is set to. With none of the
+first three set, `sp` passes no `-o` at all, so the sprite CLI's default stands
+and nothing about everyday use changes.
+
+That is the point of the ordering: switching organizations for one command or
+one shell needs no configuration and leaves your default alone. Note that a
+`.sprite` file is only read when it names a `sprite` as well — an
+`organization` on its own is ignored.
+
+A sprite belongs to exactly one organization, so the same repo in two
+organizations is two sprites. If a command reports `no sprite found`, check
+which organization you are pointed at before anything else.
+
 ### What a connect does
 
 1. Checks whether the sprite exists, creating it if not, then probes it until it answers (up to 3 minutes; a cold sprite takes about 30s to wake).
@@ -513,6 +536,7 @@ Only sprites `sp` knows about appear: ones you've connected to, or added with `s
 | `--keep-warm DURATION` | Hold with idle-exit instead of the session-tied hold |
 | `--no-hold` | Don't hold the sprite Active |
 | `--web`, `--web-proxy`, `--web-dev-port N` | See [Web mode](#web-mode) |
+| `-o`, `--org ORG` | Sprites organization; see [Organizations](#organizations). Available on every command, not just connect. |
 | `-v`, `--verbose` | Line-by-line progress, clone output, and the timing profile on every connect |
 
 Session flags (`--name`, `--exec`, `--rc`) are ignored when reattaching to an existing session.

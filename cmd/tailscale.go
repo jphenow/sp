@@ -11,7 +11,6 @@ import (
 )
 
 var (
-	tailscaleOrg  string
 	tailscaleTags string
 )
 
@@ -59,7 +58,6 @@ awake first.`,
 }
 
 func init() {
-	tailscaleSetupCmd.Flags().StringVar(&tailscaleOrg, "org", "", "Sprites organization (default: the CLI default)")
 	tailscaleSetupCmd.Flags().StringVar(&tailscaleTags, "tags", "", `ACL tags to advertise, comma-separated; "none" for untagged (default: tag:sprite)`)
 	tailscaleCmd.AddCommand(tailscaleSetupCmd)
 	rootCmd.AddCommand(tailscaleCmd)
@@ -92,11 +90,18 @@ func resolvedTailnetTags(cmd *cobra.Command) string {
 // today's name and yesterday's, and adoptExistingSprite prefers whichever one
 // is really there. Taking the argument literally instead produces a 404 whose
 // text ("sprite not found") says nothing about the name being the problem.
-func resolveSpriteTarget(client *sprite.Client, arg string) (string, error) {
+// It also settles the organization for the rest of the run: with neither --org
+// nor SP_ORG given, a .sprite file in the target directory decides, exactly as
+// it does for connect. Resolving the sprite in one organization and then
+// talking to it in another is the mixed state this avoids.
+func resolveSpriteTarget(arg string) (string, error) {
 	resolved, err := resolveTarget([]string{arg})
 	if err != nil {
 		return "", err
 	}
+	globalOrg = resolved.Org
+
+	client := sprite.NewClient(resolved.Org)
 	_, exists, err := adoptExistingSprite(client, resolved)
 	if err != nil {
 		return "", err
@@ -111,11 +116,11 @@ func resolveSpriteTarget(client *sprite.Client, arg string) (string, error) {
 
 // runTailscaleSetup joins a sprite to the tailnet and prints its address.
 func runTailscaleSetup(cmd *cobra.Command, args []string) error {
-	client := sprite.NewClient(tailscaleOrg)
-	spriteName, err := resolveSpriteTarget(client, args[0])
+	spriteName, err := resolveSpriteTarget(args[0])
 	if err != nil {
 		return err
 	}
+	client := sprite.NewClient(globalOrg)
 
 	key := setup.TailscaleAuthKey()
 	if key == "" {
@@ -128,24 +133,24 @@ func runTailscaleSetup(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Waking %s...\n", spriteName)
 	if _, err := client.Exec(sprite.ExecOptions{
-		Sprite: spriteName, Org: tailscaleOrg, Command: []string{"true"},
+		Sprite: spriteName, Org: globalOrg, Command: []string{"true"},
 	}); err != nil {
 		return fmt.Errorf("waking %s: %w", spriteName, err)
 	}
 
-	if err := ensureRestartableServices(client, spriteName, tailscaleOrg); err != nil {
+	if err := ensureRestartableServices(client, spriteName, globalOrg); err != nil {
 		return err
 	}
 
 	fmt.Printf("Joining %s to the tailnet...\n", spriteName)
-	if err := setup.JoinTailnet(client, spriteName, tailscaleOrg, setup.TailnetOptions{
+	if err := setup.JoinTailnet(client, spriteName, globalOrg, setup.TailnetOptions{
 		AuthKey: key,
 		Tags:    resolvedTailnetTags(cmd),
 	}); err != nil {
 		return err
 	}
 
-	name, err := setup.TailnetName(client, spriteName, tailscaleOrg)
+	name, err := setup.TailnetName(client, spriteName, globalOrg)
 	if err != nil {
 		return err
 	}

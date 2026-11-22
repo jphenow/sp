@@ -178,6 +178,20 @@ func adoptExistingSprite(client *sprite.Client, resolved *setup.ResolvedTarget) 
 // positional argument, if present, is a free-form variant label that forks
 // the sprite identity (see connectCmd.Long).
 func resolveTarget(args []string) (*setup.ResolvedTarget, error) {
+	resolved, err := resolveTargetName(args)
+	if err != nil {
+		return nil, err
+	}
+	// Applied here rather than at each call site because every command that
+	// resolves a target reads resolved.Org, and one of them forgetting the
+	// override is a connect that silently lands in the wrong organization.
+	resolved.Org = orgFor(resolved.Org)
+	return resolved, nil
+}
+
+// resolveTargetName turns the positional arguments into a sprite name and
+// paths, without deciding the organization.
+func resolveTargetName(args []string) (*setup.ResolvedTarget, error) {
 	target := "."
 	variant := ""
 	if len(args) > 0 {

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -8,6 +9,14 @@ import (
 
 var (
 	verbose bool
+
+	// globalOrg is the Sprites organization every command works against.
+	//
+	// It is deliberately a persistent flag with no default: empty means sp
+	// passes no -o at all and the sprite CLI's own default org stands. That is
+	// what makes switching orgs for one invocation safe -- nothing has to be
+	// reconfigured, and nothing about the everyday case changes.
+	globalOrg string
 )
 
 // rootCmd is the base command for sp.
@@ -21,7 +30,13 @@ Quick start:
   sp .                Connect to a sprite for the current directory
   sp owner/repo       Connect to a sprite for a GitHub repository
   sp tui              Open the TUI dashboard
-  sp import <name>    Import an existing sprite into the dashboard`,
+  sp import <name>    Import an existing sprite into the dashboard
+
+Organizations:
+  Every command takes --org, or reads SP_ORG, to work against an organization
+  other than the sprite CLI's default. A directory can also bind itself to one
+  by naming it in a .sprite file. The flag wins over SP_ORG, which wins over
+  .sprite; with none of them set, the sprite CLI's default org applies.`,
 	// When called with positional args that don't match a subcommand,
 	// treat them as connect targets (sp . / sp owner/repo)
 	Args:               cobra.ArbitraryArgs,
@@ -89,6 +104,16 @@ func runDefault(cmd *cobra.Command, args []string) error {
 
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose output")
+	rootCmd.PersistentFlags().StringVarP(&globalOrg, "org", "o", "", "Sprites organization (default: SP_ORG, a .sprite file, then the CLI default)")
+
+	// Fold SP_ORG into the flag once, before any command runs, so that every
+	// later reader of globalOrg sees one resolved value and no one has to
+	// remember the precedence.
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		if globalOrg == "" {
+			globalOrg = strings.TrimSpace(os.Getenv("SP_ORG"))
+		}
+	}
 
 	// Allow connect-related flags on root too so `sp owner/repo --flag`
 	// works without the `connect` prefix. Each flag registered here must
@@ -140,4 +165,17 @@ func splitAtDash(args []string, dashAt int) (connectArgs []string, command strin
 		return args, ""
 	}
 	return args[:dashAt], strings.Join(args[dashAt:], " ")
+}
+
+// orgFor returns the organization to use for a target, given the org a
+// .sprite file bound to its directory.
+//
+// The explicit choice wins: --org (or SP_ORG, folded into it above) overrides
+// whatever a directory has been bound to, which is the point -- a repo pinned
+// to one org still has to be reachable in another for a single command.
+func orgFor(spriteFileOrg string) string {
+	if globalOrg != "" {
+		return globalOrg
+	}
+	return spriteFileOrg
 }
