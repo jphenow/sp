@@ -46,15 +46,15 @@ func TestTailscaleAuthKey(t *testing.T) {
 	}
 	// Trailing newline included deliberately: this file gets created by a
 	// shell redirect or an editor more often than not.
-	if err := os.WriteFile(keyPath, []byte("tskey-auth-from-file\n"), 0o600); err != nil {
+	if err := os.WriteFile(keyPath, []byte("test-key-from-file\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := TailscaleAuthKey(); got != "tskey-auth-from-file" {
-		t.Errorf("from file, got %q, want %q", got, "tskey-auth-from-file")
+	if got := TailscaleAuthKey(); got != "test-key-from-file" {
+		t.Errorf("from file, got %q, want %q", got, "test-key-from-file")
 	}
 
-	t.Setenv("TS_AUTHKEY", "tskey-auth-from-env")
-	if got := TailscaleAuthKey(); got != "tskey-auth-from-env" {
+	t.Setenv("TS_AUTHKEY", "test-key-from-env")
+	if got := TailscaleAuthKey(); got != "test-key-from-env" {
 		t.Errorf("the environment must win over the file, got %q", got)
 	}
 }
