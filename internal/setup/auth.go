@@ -429,6 +429,13 @@ func SetupGhAuth(client *sprite.Client, spriteName string) error {
 for RC in .bashrc .zshrc .profile; do
     sed -i '/# sp-gh-auth-begin/,/# sp-gh-auth-end/d' ~/$RC 2>/dev/null || true
 done
+# The --file upload creates the directories it needs as root, not as sprite
+# (the same quirk HomePermissionsScript papers over for ~/.claude). gh runs as
+# sprite, so without this it logs in successfully and then dies writing its
+# credentials: "open /home/sprite/.config/gh/hosts.yml: permission denied".
+# The chmods below would also silently do nothing, since they are the sprite
+# user trying to chmod root's directory.
+sudo -n chown -R sprite:sprite ~/.config/gh 2>/dev/null || true
 chmod 700 ~/.config/gh 2>/dev/null || true
 chmod 600 ~/.config/gh/config.yml 2>/dev/null || true
 `
