@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"encoding/base64"
 	"fmt"
 
 	"github.com/jphenow/sp/internal/sprite"
@@ -56,19 +57,7 @@ func InstallAwakeService(client *sprite.Client, spriteName, org, probe string) e
 		return fmt.Errorf("no busy probe given for %s", AwakeService)
 	}
 
-	// Only the transition into idleness releases the hold (idle = grace, not
-	// >=), so a long quiet stretch costs one call rather than one per poll.
-	loop := fmt.Sprintf(`idle=0
-while true; do
-  if sh -lc %s; then
-    idle=0
-    sprite-env keep-awake --for %s >/dev/null 2>&1 || true
-  else
-    idle=$((idle+1))
-    [ "$idle" = "%d" ] && { sprite-env keep-awake --release >/dev/null 2>&1 || true; }
-  fi
-  sleep %d
-done`, shellQuote(probe), awakeHold, awakeGrace, awakePoll)
+	script := awakeScript(probe)
 
 	// Recreate rather than reuse: the probe may have changed, and a service
 	// that already exists makes create fail rather than update.
@@ -78,11 +67,47 @@ done`, shellQuote(probe), awakeHold, awakeGrace, awakePoll)
 	})
 
 	create := fmt.Sprintf("sprite-env services create %s --restart always -- /bin/sh -lc %s",
-		AwakeService, shellQuote(loop))
+		AwakeService, shellQuote(awakeCommand(script)))
 	if out, err := client.Exec(sprite.ExecOptions{
 		Sprite: spriteName, Org: org, Command: []string{"sh", "-c", create},
 	}); err != nil {
 		return fmt.Errorf("installing %s on %s: %w\n%s", AwakeService, spriteName, err, string(out))
 	}
 	return nil
+}
+
+// awakeScript returns the hold loop for a probe.
+//
+// The probe is spliced in as the loop's condition rather than handed to a
+// nested sh -c, so it passes through exactly one shell parse -- the one that
+// runs the loop.
+func awakeScript(probe string) string {
+	// Only the transition into idleness releases the hold (idle = grace, not
+	// >=), so a long quiet stretch costs one call rather than one per poll.
+	return fmt.Sprintf(`idle=0
+while true; do
+  if { %s
+  }; then
+    idle=0
+    sprite-env keep-awake --for %s >/dev/null 2>&1 || true
+  else
+    idle=$((idle+1))
+    [ "$idle" = "%d" ] && { sprite-env keep-awake --release >/dev/null 2>&1 || true; }
+  fi
+  sleep %d
+done`, probe, awakeHold, awakeGrace, awakePoll)
+}
+
+// awakeCommand wraps a script so that it reaches the service intact.
+//
+// The script is shipped base64-encoded because the route to a service's
+// stored command does not preserve shell quoting: with the loop and its probe
+// quoted in the ordinary way, the escaped single quotes came back altered,
+// the probe's grep pattern lost its quotes, and the stored probe failed on
+// every poll. The hold therefore never engaged during real work, and the
+// sprite stopped half a minute after the phone disconnected, taking the
+// agent's work with it. Base64 has no quotes, backslashes or spaces for any
+// layer to reinterpret.
+func awakeCommand(script string) string {
+	return "echo " + base64.StdEncoding.EncodeToString([]byte(script)) + " | base64 -d | /bin/sh"
 }
