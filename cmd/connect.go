@@ -1488,7 +1488,7 @@ done
 	})
 
 	if useSSH {
-		return sshSession(client, resolved, tmuxSession, shellCmd)
+		return sshSession(client, resolved, tmuxSession, shellCmd, tokenRefresh)
 	}
 
 	binary, err := exec.LookPath("sprite")
@@ -1507,11 +1507,14 @@ done
 // sshSession runs the interactive session over SSH.
 //
 // The same script the exec path runs is put on the sprite first and then run
-// from there, which keeps the tokens it embeds out of every argv. Reconnecting
-// re-runs the identical command, because it ends in `tmux new-session -A`:
-// whatever is still running on the sprite is picked up, and nothing is
-// duplicated if it is not.
-func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSession, shellCmd string) error {
+// from there, which keeps the tokens it embeds out of every argv.
+//
+// A reconnect runs a *second* script, not this one. `new-session -A` is the
+// right command for opening a session and the wrong one for recovering it:
+// it cannot tell "attach to my work" from "make me an empty session", and
+// when the tmux server has died it silently does the second. That is what
+// once handed back a running tmux with none of the user's work in it.
+func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSession, shellCmd, tokenRefresh string) error {
 	org := resolved.Org
 	if org == "" {
 		// A sprite created during this run was never listed, so nothing has
@@ -1560,6 +1563,11 @@ func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSessi
 		logPath = ""
 	}
 
+	reattachScript := sprite.SSHRemoteScriptPath(tmuxSession + "-reattach")
+	if err := sprite.WriteRemoteScript(user, reattachScript, reattachShellCmd(tmuxSession, tokenRefresh)); err != nil {
+		return err
+	}
+
 	target := attachTarget{
 		args:  sprite.SSHInteractiveArgs(user, remoteScript, logPath),
 		label: resolved.SpriteName,
@@ -1567,8 +1575,14 @@ func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSessi
 		transportExit: 255,
 		transportLog:  logPath,
 	}
+	reattach := attachTarget{
+		args:          sprite.SSHInteractiveArgs(user, reattachScript, logPath),
+		label:         resolved.SpriteName,
+		transportExit: 255,
+		transportLog:  logPath,
+	}
 
-	return runWithReconnect(binary, target, spriteStillThere(client, resolved.SpriteName, &target))
+	return runWithReconnect(binary, target, spriteStillThere(client, resolved.SpriteName, &reattach))
 }
 
 // spriteStillThere decides, before each reconnect attempt, whether there is
@@ -1587,8 +1601,8 @@ func sshSession(client *sprite.Client, resolved *setup.ResolvedTarget, tmuxSessi
 // times first — which covers a listing that is wrong rather than merely
 // unavailable.
 //
-// The ssh target itself never changes: it ends in `tmux new-session -A`, which
-// attaches to whatever is running and creates it if nothing is.
+// The target returned is always the reattach script, which attaches to the
+// session that is there and reports its absence rather than inventing one.
 func spriteStillThere(client *sprite.Client, spriteName string, target *attachTarget) func() *attachTarget {
 	return func() *attachTarget {
 		info, err := client.Get(spriteName)
@@ -1597,6 +1611,23 @@ func spriteStillThere(client *sprite.Client, spriteName string, target *attachTa
 		}
 		return target
 	}
+}
+
+// reattachShellCmd is the script a reconnect runs on the sprite: attach to the
+// session that is already there, and report its absence rather than creating
+// one. It is deliberately not the connect script -- see sshSession.
+//
+// The token refresh comes along because a session is meant to outlive the
+// credentials it was opened with. Days of reconnects with no refresh leave a
+// stale CLAUDE_CODE_OAUTH_TOKEN in the tmux environment, which every new pane
+// inherits and which masks ~/.claude/.credentials.json.
+func reattachShellCmd(tmuxSession, tokenRefresh string) string {
+	quoted := shellQuote(tmuxSession)
+	return fmt.Sprintf(`%sif tmux has-session -t %s 2>/dev/null; then
+  exec tmux attach-session -t %s
+fi
+exit %d
+`, tokenRefresh, quoted, quoted, sessionGoneExit)
 }
 
 // localTerminalSize returns the local controlling terminal's size (rows,

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -428,4 +429,87 @@ func TestRemoteSignalDeath(t *testing.T) {
 			t.Errorf("exit %d: signalName = %q, want %q", tc.code, got, tc.wantSig)
 		}
 	}
+}
+
+// TestSessionGoneStopsWithoutRetrying covers the case that once handed back an
+// empty tmux session: the thing on the sprite is gone, and sp must say so
+// rather than make a new one and let it pass for the old one.
+func TestSessionGoneStopsWithoutRetrying(t *testing.T) {
+	isolateStore(t)
+
+	bin, counter := fakeClient(t, fmt.Sprintf("exit %d", sessionGoneExit))
+	// A nextAttach that would hand back a target forever: the point is that it
+	// is never consulted, because there is nothing left to attach to.
+	target := attachTarget{label: "test"}
+	if err := runWithReconnect(bin, target, func() *attachTarget { return &target }); err != nil {
+		t.Fatalf("a gone session is not an error to report: %v", err)
+	}
+	if n, err := os.ReadFile(counter); err != nil || strings.TrimSpace(string(n)) != "1" {
+		t.Fatalf("got %q attempts, want exactly 1 (err %v)", strings.TrimSpace(string(n)), err)
+	}
+
+	db, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	attempts, err := db.Attempts(time.Now().Add(-time.Minute), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].Outcome != "gone" {
+		t.Fatalf("got %d attempts, outcome %q; want 1 of \"gone\"", len(attempts), attempts[0].Outcome)
+	}
+}
+
+// TestReattachShellCmd checks the script a reconnect runs on the sprite: it
+// attaches to a session that exists and refuses to invent one that does not.
+func TestReattachShellCmd(t *testing.T) {
+	run := func(t *testing.T, hasSession bool) (int, string) {
+		t.Helper()
+		dir := t.TempDir()
+		log := filepath.Join(dir, "log")
+		exit := 0
+		if !hasSession {
+			exit = 1
+		}
+		tmux := "#!/bin/sh\necho \"$@\" >> " + log + "\n" +
+			fmt.Sprintf("case \"$1\" in has-session) exit %d ;; esac\nexit 0\n", exit)
+		if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(tmux), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("sh", "-c", reattachShellCmd("work", ""))
+		cmd.Env = append(os.Environ(), "PATH="+dir)
+		code := 0
+		if err := cmd.Run(); err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatal(err)
+			}
+			code = exitErr.ExitCode()
+		}
+		out, _ := os.ReadFile(log)
+		return code, string(out)
+	}
+
+	t.Run("session exists", func(t *testing.T) {
+		code, log := run(t, true)
+		if code != 0 {
+			t.Errorf("exit %d, want 0", code)
+		}
+		if !strings.Contains(log, "attach-session -t work") {
+			t.Errorf("did not attach to the existing session: %q", log)
+		}
+	})
+
+	t.Run("session gone", func(t *testing.T) {
+		code, log := run(t, false)
+		if code != sessionGoneExit {
+			t.Errorf("exit %d, want %d", code, sessionGoneExit)
+		}
+		// The whole point: nothing was created.
+		if strings.Contains(log, "new-session") || strings.Contains(log, "attach-session") {
+			t.Errorf("a gone session must not be recreated or attached: %q", log)
+		}
+	})
 }
