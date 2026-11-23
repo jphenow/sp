@@ -31,8 +31,9 @@ const (
 	t3ServiceName = "sp-t3"
 	// t3BinGlob finds the T3 executable. Its launcher installs a self-
 	// contained binary under a version directory, so the path moves with each
-	// upgrade and has to be resolved at run time rather than pinned.
-	t3BinGlob = "$(ls -1d $HOME/.t3/runtime/versions/*/t3 2>/dev/null | tail -1)"
+	// upgrade and has to be resolved at run time rather than pinned. sort -V
+	// because a plain sort puts 0.1.2 after 0.1.11.
+	t3BinGlob = "$(ls -1d $HOME/.t3/runtime/versions/*/t3 2>/dev/null | sort -V | tail -1)"
 	// agentHome is the home directory the agent reads Claude's transcripts
 	// from. Services start with no HOME, so it is passed in.
 	agentHome = "/home/sprite"

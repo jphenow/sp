@@ -19,8 +19,9 @@ import (
 const (
 	// t3Bin resolves the T3 executable at run time. Its launcher installs a
 	// self-contained binary under a version directory, so the path moves with
-	// every upgrade and cannot be pinned.
-	t3Bin = "$(ls -1d $HOME/.t3/runtime/versions/*/t3 2>/dev/null | tail -1)"
+	// every upgrade and cannot be pinned. sort -V because the names are
+	// versions: a plain sort puts 0.1.2 after 0.1.11 and runs the older one.
+	t3Bin = "$(ls -1d $HOME/.t3/runtime/versions/*/t3 2>/dev/null | sort -V | tail -1)"
 	// t3Service is the sprite-env service that keeps a sprite on the T3 relay.
 	// It matches the name the hub's button manages so the two don't collide.
 	t3Service = "sp-t3"
@@ -32,6 +33,7 @@ var (
 	t3PairURL   string
 	t3PairLabel string
 	t3PairTTL   string
+	t3PairSSH   bool
 )
 
 // t3Cmd groups the T3 Code commands.
@@ -92,12 +94,22 @@ the same list sp relay serves. Going through the relay is what lets a client
 wake a sleeping sprite. --url overrides the address.
 
 With no relay configured it falls back to pairing over the sprite's own
-tailnet address, which works only while the sprite is awake.`,
+tailnet address, which works only while the sprite is awake.
+
+The desktop app can skip the code entirely: its SSH environments log in
+through the sprites gateway, which wakes the sprite like the relay does, and
+start or reuse T3's server there. --ssh prints what to enter under Add
+environment -> SSH instead of minting a code:
+
+  sp t3 pair . --ssh`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		spriteName, err := resolveSpriteTarget(args[0])
 		if err != nil {
 			return err
+		}
+		if t3PairSSH {
+			return printT3SSH(spriteName, globalOrg)
 		}
 		client := sprite.NewClient(globalOrg)
 		if _, err := client.Exec(sprite.ExecOptions{
@@ -126,9 +138,24 @@ func init() {
 	t3PairCmd.Flags().StringVar(&t3PairURL, "url", "", "address the client should use (default: the sprite's relay port)")
 	t3PairCmd.Flags().StringVar(&t3PairLabel, "label", "sp", "name for this client in T3's connections list")
 	t3PairCmd.Flags().StringVar(&t3PairTTL, "ttl", "15m", "how long the code stays valid")
+	t3PairCmd.Flags().BoolVar(&t3PairSSH, "ssh", false, "print the desktop app's SSH environment settings instead of minting a code")
 	t3Cmd.AddCommand(t3SetupCmd)
 	t3Cmd.AddCommand(t3PairCmd)
 	rootCmd.AddCommand(t3Cmd)
+}
+
+// printT3SSH prints the fields of the desktop app's SSH environment form for
+// a sprite. Nothing is minted: the gateway authenticates with your ssh key,
+// and T3 sets up its own session on the first connect.
+func printT3SSH(spriteName, org string) error {
+	user, err := sprite.SSHUser(spriteName, org)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("In the T3 desktop app: Add environment -> SSH\n\n")
+	fmt.Printf("  SSH host:  %s\n  Username:  %s\n  Port:      22\n\n", sprite.SSHHost, user)
+	fmt.Printf("Check it first with: ssh %s@%s true\n", user, sprite.SSHHost)
+	return nil
 }
 
 // runT3Setup authorizes a sprite for T3 Connect and leaves it serving.
