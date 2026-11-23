@@ -257,6 +257,7 @@ sp t3 setup jphenow/sp --tailscale      # over your own tailnet instead
 sp t3 setup jphenow/sp --for 4h         # hold the sprite Active longer
 sp t3 pair jphenow/sp --label desktop   # a code for each client you connect
 sp t3 pair jphenow/sp --label phone
+sp t3 pair jphenow/sp --ssh             # desktop app: SSH settings, no code
 ```
 
 Targets are the same ones `sp` itself takes: `.`, `owner/repo`, or a sprite name.
