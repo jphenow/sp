@@ -1,0 +1,22 @@
+[Unit]
+Description=sp relay: wake sprites from the tailnet
+# The bind address belongs to tailscale0, which does not exist until tailscaled
+# is up. Restart covers the gap on boot rather than racing it.
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+DynamicUser=yes
+# TAILNET_ADDR, SP_ORG and SPRITE_RELAY_TOKEN. Root-owned, 0600: the token
+# never touches the unit file or a process argument list.
+EnvironmentFile=/etc/sp-relay/env
+ExecStart=/usr/local/bin/sp relay serve --bind ${TAILNET_ADDR} --list /etc/sp-relay/relay.list
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

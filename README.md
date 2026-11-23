@@ -387,14 +387,20 @@ credential, and forwards to the sprite's `sp-t3` service through the edge — so
 connecting is the wake. No login on the phone, nothing public, no manual step.
 
 ```bash
-# On the always-on machine
+# On your laptop: one port per sprite, and the relay's credential
 printf '8899 gh-owner-repo\n8900 gh-owner-other\n' > ~/.config/sp/relay.list
-SPRITE_RELAY_TOKEN=… sp relay serve --org my-org --bind "$(tailscale ip -4)"
+(umask 077; printf '%s' "$RELAY_TOKEN" > ~/.config/sp/relay.token)
 
-# On your laptop, so sp t3 pair hands out relay addresses
-printf 'relay-host.your-tailnet.ts.net' > ~/.config/sp/relay.host
-cp relay.list ~/.config/sp/relay.list
+# Install it on the always-on machine (any ssh host with Linux, systemd,
+# Tailscale and sudo). --src builds sp for it when its platform differs.
+sp relay deploy relay-box --org my-org --src ~/src/sp
 ```
+
+`deploy` installs sp there, runs `sp relay serve` as a systemd service bound to
+the machine's tailnet address, checks each sprite through it, and records the
+machine's tailnet name in `~/.config/sp/relay.host`. Re-run it after editing the
+list or to upgrade sp. To run the relay by hand instead:
+`SPRITE_RELAY_TOKEN=… sp relay serve --org my-org --bind "$(tailscale ip -4)"`.
 
 Then `sp t3 pair <sprite> --label phone` prints a code and the relay address to
 enter in the T3 app.

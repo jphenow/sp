@@ -15,8 +15,10 @@ import (
 )
 
 var (
-	relayBind string
-	relayList string
+	relayBind      string
+	relayList      string
+	relayTokenFile string
+	relaySrc       string
 )
 
 // relayCmd groups the relay commands.
@@ -63,16 +65,87 @@ func init() {
 	relayServeCmd.Flags().StringVar(&relayBind, "bind", "", "address to listen on: this machine's tailnet IP (required)")
 	relayServeCmd.Flags().StringVar(&relayList, "list", defaultRelayList(), "file of \"<port> <sprite>\" routes")
 	relayCmd.AddCommand(relayServeCmd)
+
+	relayDeployCmd.Flags().StringVar(&relayList, "list", defaultRelayList(), "file of \"<port> <sprite>\" routes")
+	relayDeployCmd.Flags().StringVar(&relayTokenFile, "token-file", spConfigPath("relay.token"), "file holding the relay's Sprites credential")
+	relayDeployCmd.Flags().StringVar(&relaySrc, "src", "", "sp checkout to build from when the relay machine's platform differs from this one's")
+	relayCmd.AddCommand(relayDeployCmd)
 	rootCmd.AddCommand(relayCmd)
+}
+
+// relayDeployCmd installs the relay on another machine.
+var relayDeployCmd = &cobra.Command{
+	Use:   "deploy <ssh host>",
+	Short: "Install sp relay serve on an always-on machine as a systemd service",
+	Long: `deploy installs sp on the relay machine over ssh and runs sp relay serve
+there as a systemd service, bound to the machine's tailnet address. Re-run it
+after editing the route list or to upgrade sp; each run replaces the last.
+
+It reads the routes from --list and the credential from --token-file (see
+sp relay serve for how to mint a narrow one), and records the machine's
+tailnet name in ~/.config/sp/relay.host so sp t3 pair hands out relay
+addresses.
+
+The machine needs Linux, systemd, Tailscale, curl and sudo. When its platform
+differs from this one's -- a Mac deploying to a Linux box -- sp is built for
+it from --src.
+
+  sp relay deploy relay-box --org my-org --src ~/src/sp`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRelayDeploy,
 }
 
 // defaultRelayList is where serve looks for routes when --list isn't given.
 func defaultRelayList() string {
+	return spConfigPath("relay.list")
+}
+
+// spConfigPath returns name's path in sp's configuration directory, or "" if
+// there is no home directory to put it in.
+func spConfigPath(name string) string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".config", "sp", "relay.list")
+	return filepath.Join(home, ".config", "sp", name)
+}
+
+// runRelayDeploy installs the relay on the named host and points sp t3 pair
+// at it.
+func runRelayDeploy(cmd *cobra.Command, args []string) error {
+	if globalOrg == "" {
+		return fmt.Errorf("--org (or SP_ORG) is required: the relay builds each sprite's address from it")
+	}
+	list, err := os.ReadFile(relayList)
+	if err != nil {
+		return fmt.Errorf("reading routes: %w", err)
+	}
+	token, err := os.ReadFile(relayTokenFile)
+	if err != nil {
+		return fmt.Errorf("reading the relay's credential: %w", err)
+	}
+
+	target, err := relay.Deploy(relay.DeployOptions{
+		Host:  args[0],
+		Org:   globalOrg,
+		Token: strings.TrimSpace(string(token)),
+		List:  list,
+		Src:   relaySrc,
+		Out:   os.Stdout,
+	})
+	if err != nil {
+		return err
+	}
+
+	hostFile := spConfigPath("relay.host")
+	if err := os.MkdirAll(filepath.Dir(hostFile), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(hostFile, []byte(target.DNSName+"\n"), 0o644); err != nil {
+		return fmt.Errorf("recording the relay's name in %s: %w", hostFile, err)
+	}
+	fmt.Printf("sp t3 pair now hands out addresses on %s.\n", target.DNSName)
+	return nil
 }
 
 // runRelayServe checks the configuration and serves until interrupted.
