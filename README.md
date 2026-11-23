@@ -255,15 +255,16 @@ behind, so a sprite that goes cold rejoins on its own when it is woken.
 sp t3 setup jphenow/sp                  # over T3 Connect, T3's hosted relay
 sp t3 setup jphenow/sp --tailscale      # over your own tailnet instead
 sp t3 setup jphenow/sp --for 4h         # hold the sprite Active longer
-sp t3 pair jphenow/sp                   # another pairing code (tailnet mode)
+sp t3 pair jphenow/sp --label desktop   # a code for each client you connect
+sp t3 pair jphenow/sp --label phone
 ```
 
 Targets are the same ones `sp` itself takes: `.`, `owner/repo`, or a sprite name.
 
 Both paths reach the sprite over a connection the sprite dials *out*, so neither
 needs port forwarding and neither exposes anything on the sprite's own URL.
-Neither can wake a sleeping sprite either — see [What this does not
-solve](#what-this-does-not-solve).
+Neither can wake a sleeping sprite either — that takes a relay; see [Waking a
+sprite from a phone](#waking-a-sprite-from-a-phone).
 
 **T3 Connect** is the default. Setup is interactive once per sprite: T3's device
 flow prints a URL and a code to approve in a browser. In exchange you get push
@@ -373,13 +374,65 @@ domains. Filtering is off unless a network policy exists, so ordinary sprites ar
 fine — but applying a network policy to a sprite will silently cut its tailnet
 connection.
 
-### What this does not solve
+### Waking a sprite from a phone
 
-Tailscale is outbound-only, exactly like T3's relay and like Remote Control. A
-paused sprite answers on your tailnet no more than it answered on the relay, so
-**waking still needs an inbound request to the sprite's own URL**, and a hold is
-still what keeps the connection up once you are on it (`--for`, default 1h).
-What the tailnet buys you is removing the third party, not sleep and wake.
+Tailscale is outbound-only, exactly like T3's relay and like Remote Control: a
+sleeping sprite answers on your tailnet no more than it answered on the relay.
+Waking needs an inbound request through Fly's edge to the sprite's own URL, and
+the edge wants an org login that a phone app cannot complete.
+
+`sp relay serve` closes that gap. Run it on a machine that stays awake and is on
+the same tailnet as your phone. It gives each sprite a port, holds a Sprites
+credential, and forwards to the sprite's `sp-t3` service through the edge — so
+connecting is the wake. No login on the phone, nothing public, no manual step.
+
+```bash
+# On the always-on machine
+printf '8899 gh-owner-repo\n8900 gh-owner-other\n' > ~/.config/sp/relay.list
+SPRITE_RELAY_TOKEN=… sp relay serve --org my-org --bind "$(tailscale ip -4)"
+
+# On your laptop, so sp t3 pair hands out relay addresses
+printf 'relay-host.your-tailnet.ts.net' > ~/.config/sp/relay.host
+cp relay.list ~/.config/sp/relay.list
+```
+
+Then `sp t3 pair <sprite> --label phone` prints a code and the relay address to
+enter in the T3 app.
+
+Three things matter:
+
+- **The credential should be narrow.** Mint a child token with `POST /v1/tokens`
+  and `privileges: ["service.proxy"]`, `services: {"sp-t3": []}`, and `sprites`
+  either named or `{"*": ["proxy"]}`. It reaches T3 and nothing else: no exec,
+  no reading or destroying sprites, no other services.
+- **The organization needs `target_header_routing`.** The relay sends the
+  credential as `X-Sprite-Authorization`, because T3 sends its own session
+  token as `Authorization` and overwriting it leaves T3 with no credential.
+  Without the feature the edge ignores the separate header and answers 302.
+- **`--bind` is required.** The relay lends its credential to anything that can
+  reach it, so it should listen on the tailnet address and nowhere else.
+
+The first request after a sprite sleeps is held while the sprite wakes, usually
+a few seconds, rather than failing. `sp bridge` does a similar job over the
+sprite CLI's port proxy, which the Sprites 2 runtime does not have.
+
+### Staying awake while the agent works
+
+A sprite stops 30 seconds after its last exec, shell or open connection, and
+running services do not count. An agent left working with the phone in a
+pocket has half a minute to live.
+
+`sp t3 setup --tailscale` therefore installs an `sp-awake` service that holds
+the sprite awake while T3 is working and lets it sleep once it stops. Working
+means either a run T3 has not finished (the model is thinking) or a provider
+process running a command, including one sent to the background — which is what
+an agent does with anything long, and which T3 records as finished the moment it
+is launched. T3's provider process merely existing does not count: T3 keeps it
+alive between turns.
+
+Anything else the provider keeps running as a child, such as an MCP server,
+reads as a command and holds the sprite awake. That errs toward cost rather than
+toward losing work.
 
 ---
 

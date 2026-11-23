@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/jphenow/sp/internal/hub"
+	"github.com/jphenow/sp/internal/relay"
 	"github.com/jphenow/sp/internal/setup"
 	"github.com/jphenow/sp/internal/sprite"
 )
@@ -27,6 +29,9 @@ const (
 var (
 	t3For       time.Duration
 	t3Tailscale bool
+	t3PairURL   string
+	t3PairLabel string
+	t3PairTTL   string
 )
 
 // t3Cmd groups the T3 Code commands.
@@ -74,8 +79,21 @@ which are a function of the relay.`,
 // than a repeat of setup.
 var t3PairCmd = &cobra.Command{
 	Use:   "pair <sprite>",
-	Short: "Print a new pairing QR code for a sprite serving T3 over the tailnet",
-	Args:  cobra.ExactArgs(1),
+	Short: "Mint a code for connecting a T3 client to a sprite",
+	Long: `pair mints a one-time code for adding a sprite as an environment in a T3
+client. Run it once per client -- a desktop and a phone each need their own:
+
+  sp t3 pair . --label desktop
+  sp t3 pair . --label phone
+
+The address it prints is the sprite's relay port when there is one: the host
+in ~/.config/sp/relay.host and the sprite's line in ~/.config/sp/relay.list,
+the same list sp relay serves. Going through the relay is what lets a client
+wake a sleeping sprite. --url overrides the address.
+
+With no relay configured it falls back to pairing over the sprite's own
+tailnet address, which works only while the sprite is awake.`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		spriteName, err := resolveSpriteTarget(args[0])
 		if err != nil {
@@ -87,13 +105,27 @@ var t3PairCmd = &cobra.Command{
 		}); err != nil {
 			return fmt.Errorf("waking %s: %w", spriteName, err)
 		}
-		return pairT3(client, spriteName)
+
+		address := t3PairURL
+		if address == "" {
+			if address, err = relayAddressFor(spriteName); err != nil {
+				return err
+			}
+		}
+		if address == "" {
+			fmt.Println("No relay route for this sprite; pairing over its tailnet address, which cannot wake it.")
+			return pairT3(client, spriteName)
+		}
+		return pairT3At(client, spriteName, address)
 	},
 }
 
 func init() {
 	t3SetupCmd.Flags().DurationVar(&t3For, "for", time.Hour, "how long to hold the sprite Active once it has joined")
 	t3SetupCmd.Flags().BoolVar(&t3Tailscale, "tailscale", false, "reach the sprite over your tailnet instead of T3 Connect")
+	t3PairCmd.Flags().StringVar(&t3PairURL, "url", "", "address the client should use (default: the sprite's relay port)")
+	t3PairCmd.Flags().StringVar(&t3PairLabel, "label", "sp", "name for this client in T3's connections list")
+	t3PairCmd.Flags().StringVar(&t3PairTTL, "ttl", "15m", "how long the code stays valid")
 	t3Cmd.AddCommand(t3SetupCmd)
 	t3Cmd.AddCommand(t3PairCmd)
 	rootCmd.AddCommand(t3Cmd)
@@ -377,4 +409,61 @@ exec %s pair --tailscale`, t3Bin)
 		return fmt.Errorf("pairing %s: %w", spriteName, err)
 	}
 	return nil
+}
+
+// pairT3At mints a pairing code whose link points at address, and prints the
+// code, the address and the link.
+//
+// It uses T3's pairing-token command rather than t3 pair because pair only
+// knows the server's own addresses; a relay is an address the server has
+// never heard of.
+func pairT3At(client *sprite.Client, spriteName, address string) error {
+	// Same readiness wait as pairT3: the runtime file is what the pairing
+	// commands look for.
+	script := fmt.Sprintf(`for i in $(seq 30); do
+  [ -s "$HOME/.t3/userdata/server-runtime.json" ] && break
+  sleep 1
+done
+exec %s auth pairing create --ttl %s --label %s --base-url %s`,
+		t3Bin, shellQuoteArg(t3PairTTL), shellQuoteArg(t3PairLabel), shellQuoteArg(address))
+	out, err := client.Exec(sprite.ExecOptions{
+		Sprite: spriteName, Org: globalOrg,
+		Command: []string{"sh", "-lc", script},
+	})
+	if err != nil {
+		return fmt.Errorf("minting a pairing code on %s: %w\n%s", spriteName, err, out)
+	}
+	fmt.Printf("\nAddress: %s\n%s", address, out)
+	return nil
+}
+
+// relayAddressFor returns the relay URL for a sprite from the local relay
+// configuration, or "" when there is none or it doesn't list the sprite.
+//
+// A list that exists but cannot be read is an error rather than "no relay":
+// falling back would hand out an address that cannot wake the sprite, with
+// nothing to say why.
+func relayAddressFor(spriteName string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", nil
+	}
+	dir := filepath.Join(home, ".config", "sp")
+	host, err := os.ReadFile(filepath.Join(dir, "relay.host"))
+	if err != nil || strings.TrimSpace(string(host)) == "" {
+		return "", nil
+	}
+	listPath := filepath.Join(dir, "relay.list")
+	f, err := os.Open(listPath)
+	if os.IsNotExist(err) {
+		return "", nil
+	} else if err != nil {
+		return "", fmt.Errorf("reading %s: %w", listPath, err)
+	}
+	defer f.Close()
+	routes, err := relay.ParseRoutes(f)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", listPath, err)
+	}
+	return relay.Address(strings.TrimSpace(string(host)), routes, spriteName), nil
 }
