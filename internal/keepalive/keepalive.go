@@ -118,9 +118,17 @@ fi
 `, GenFile, TaskName, deadlineEpoch, idleSession, watchSession)
 }
 
-// Start launches the heartbeat as a detached sprite-exec process so it
-// outlives the local sp process (same detach pattern as the keep-warm sentinel:
-// Setpgid + released so a terminal SIGHUP doesn't reach it).
+// Start launches the heartbeat detached on the sprite, so it outlives both the
+// local sp process and this machine's connection to the sprite.
+//
+// The local side is a sprite-exec process detached from the terminal (same
+// pattern as the keep-warm sentinel: Setpgid + released so a terminal SIGHUP
+// doesn't reach it). That alone was not enough: the guest ends an exec's
+// processes when its client goes away, so a loop run inside the exec held the
+// sprite only while this laptop stayed awake and online -- a "48h" hold ended
+// the first time the lid closed. Measured: a loop's last write was the second
+// its local client was killed. The exec now only starts the loop under
+// setsid/nohup and returns.
 func Start(opts Options) error {
 	var deadline int64
 	if opts.For > 0 {
@@ -137,7 +145,7 @@ func Start(opts Options) error {
 	// the session.
 	args := sprite.NewClient(opts.Org).BuildExecArgs(sprite.ExecOptions{
 		Sprite:  opts.Sprite,
-		Command: []string{"sh", "-c", script},
+		Command: DetachedCommand(script),
 	})
 
 	c := exec.Command("sprite", args...)
@@ -147,6 +155,15 @@ func Start(opts Options) error {
 		return fmt.Errorf("starting keepalive sentinel: %w", err)
 	}
 	return c.Process.Release()
+}
+
+// DetachedCommand returns the argv that starts script in the background in a
+// session of its own and exits at once, leaving script running after the
+// caller -- and the exec that ran it -- are gone. script travels as a
+// positional argument rather than inside the command string, so it needs no
+// quoting of its own.
+func DetachedCommand(script string) []string {
+	return []string{"sh", "-c", `setsid nohup sh -c "$1" >/dev/null 2>&1 </dev/null &`, "sh", script}
 }
 
 // Stop releases the hold: clearing the generation file makes any
@@ -161,6 +178,6 @@ func Stop(client *sprite.Client, spriteName, org string) {
 	client.Exec(sprite.ExecOptions{
 		Sprite:  spriteName,
 		Org:     org,
-		Command: []string{"sh", "-c", script},
+		Command: DetachedCommand(script),
 	})
 }
