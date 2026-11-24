@@ -31,3 +31,14 @@ func TestT3BinPicksNewestVersion(t *testing.T) {
 		t.Fatalf("picked %q, want 0.1.11", got)
 	}
 }
+
+// TestT3ServiceServesAnEndpoint checks the T3 service registers an HTTP
+// endpoint, and the same port T3 is told to serve on.
+func TestT3ServiceServesAnEndpoint(t *testing.T) {
+	create := t3ServiceCreate("HOME=/home/sprite")
+	for _, want := range []string{"--http-port 3773 ", "--port 3773"} {
+		if !strings.Contains(create, want) {
+			t.Errorf("missing %q in %s", want, create)
+		}
+	}
+}
