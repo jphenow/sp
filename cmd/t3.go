@@ -25,6 +25,10 @@ const (
 	// t3Service is the sprite-env service that keeps a sprite on the T3 relay.
 	// It matches the name the hub's button manages so the two don't collide.
 	t3Service = "sp-t3"
+	// t3Port is the port T3 serves on, pinned rather than left to T3's
+	// default because the service registers it as its HTTP endpoint: the
+	// edge routes the service's URL there, and sp relay reaches T3 that way.
+	t3Port = 3773
 )
 
 var (
@@ -156,6 +160,22 @@ func printT3SSH(spriteName, org string) error {
 	fmt.Printf("  SSH host:  %s\n  Username:  %s\n  Port:      22\n\n", sprite.SSHHost, user)
 	fmt.Printf("Check it first with: ssh %s@%s true\n", user, sprite.SSHHost)
 	return nil
+}
+
+// t3ServiceCreate returns the shell command that creates the T3 service with
+// env as its environment.
+//
+// --http-port is what gives the service a URL at the edge. Without it T3
+// serves on the tailnet and nowhere else, and a relay route to the sprite
+// answers 404.
+//
+// `yes` answers the prompt T3 raises when its relay client is missing; a
+// service has no terminal, and unanswered it defaults to no and exits having
+// done nothing, which looks exactly like a service that failed.
+func t3ServiceCreate(env string) string {
+	run := fmt.Sprintf("yes y | %s serve --no-browser --tailscale-serve --port %d", t3Bin, t3Port)
+	return fmt.Sprintf("sprite-env services create %s --restart always --http-port %d --env %s -- /bin/sh -lc %s",
+		t3Service, t3Port, shellQuote(env), shellQuote(run))
 }
 
 // runT3Setup authorizes a sprite for T3 Connect and leaves it serving.
@@ -363,12 +383,7 @@ func setupT3OverTailnet(client *sprite.Client, spriteName string) error {
 	// the tailscale binary, which lives in /usr/local/bin.
 	env := "HOME=/home/sprite,PATH=/home/sprite/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
-	// `yes` answers the prompt T3 raises when its relay client is missing; a
-	// service has no terminal, and unanswered it defaults to no and exits
-	// having done nothing, which looks exactly like a service that failed.
-	run := fmt.Sprintf("yes y | %s serve --no-browser --tailscale-serve", t3Bin)
-	create := fmt.Sprintf("sprite-env services create %s --restart always --env %s -- /bin/sh -lc %s",
-		t3Service, shellQuote(env), shellQuote(run))
+	create := t3ServiceCreate(env)
 
 	fmt.Println("Starting T3 on the tailnet...")
 	if out, err := client.Exec(sprite.ExecOptions{
